@@ -14,7 +14,9 @@ def check_for_updates() -> dict:
     """
     try:
         # We fetch the raw version.py from the main branch
-        url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/src/shop_bot/version.py"
+        # Added timestamp to bypass GitHub/proxies cache
+        import time
+        url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/src/shop_bot/version.py?t={int(time.time())}"
         response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
