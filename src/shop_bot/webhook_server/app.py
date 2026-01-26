@@ -8,9 +8,11 @@ import sqlite3
 import tempfile
 import zipfile
 import shutil
+import sys
 from hmac import compare_digest
 from datetime import datetime
-from shop_bot.utils import time_utils
+from shop_bot.utils import time_utils, update_manager
+from shop_bot.version import APP_VERSION
 from functools import wraps
 from math import ceil
 from pathlib import Path
@@ -610,6 +612,37 @@ def create_webhook_app(bot_controller_instance):
         result = _bot_controller.stop_support_bot()
         flash(result.get('message', 'An error occurred.'), 'success' if result.get('status') == 'success' else 'danger')
         return redirect(request.referrer or url_for('dashboard_page'))
+
+    # ==========================
+    # UPDATE SYSTEM ROUTES
+    # ==========================
+    @flask_app.route('/updates', methods=['GET'])
+    @login_required
+    def updates_page():
+        common_data = get_common_template_data()
+        current_version = APP_VERSION
+        return render_template('updates.html', current_version=current_version, **common_data)
+
+    @flask_app.route('/api/updates/check', methods=['POST'])
+    @login_required
+    def check_updates_route():
+        result = update_manager.check_for_updates()
+        if "error" in result:
+             return {"status": "error", "message": result["error"]}, 500
+        return {"status": "success", "data": result}
+
+    @flask_app.route('/api/updates/perform', methods=['POST'])
+    @login_required
+    def perform_update_route():
+        # This is a potentially long running task, ideally should be async.
+        # But since it restarts the app, we can just return and let it die.
+        result = update_manager.perform_update()
+        if result["status"] == "error":
+            return {"status": "error", "message": result["message"]}, 500
+        
+        # On success, the container will likely restart shortly, so the frontend might see a network error or reload.
+        return {"status": "success", "message": result["message"]}
+
 
     @flask_app.route('/users/ban/<int:user_id>', methods=['POST'])
     @login_required

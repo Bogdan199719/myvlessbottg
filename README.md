@@ -1,71 +1,73 @@
-# MyVlessBot - Professional VLESS Sales Solution
+# MyVlessBot - Решение для Продажи VPN
+<div align="center">
+  <img src="https://img.shields.io/badge/Python-3.10-blue?style=for-the-badge&logo=python" alt="Python">
+  <img src="https://img.shields.io/badge/Docker-Enabled-blue?style=for-the-badge&logo=docker" alt="Docker">
+</div>
 
-**MyVlessBot** is a robust, production-ready Telegram bot for automating the sale and management of VLESS VPN configurations. Integrated seamlessly with **3x-ui Panel**, it offers a complete billing and user management system.
+**MyVlessBot** — это готовое к работе решение для автоматизированной продажи VLESS-конфигураций через Telegram. Бот полностью интегрирован с панелью **3x-ui** и предоставляет мощную админ-панель для управления вашим бизнесом.
 
-## 🚀 Key Features
+## 🚀 Возможности
 
-*   **Automated Sales**: Instant key issuance upon payment.
-*   **Web Dashboard**: Full control over plans, servers, and users.
-*   **Multi-Server Support**: Scale your business with unlimited nodes.
-*   **Flexible Billing**: Recurring subscriptions, trial periods, and referral system.
-*   **Payment & Support**:
-    *   **Gateways**: YooKassa, CryptoBot, Heleket, TonConnect.
-    *   **Support**: Built-in ticket system (Support Bot).
+*   **Автоматические продажи**: Мгновенная выдача ключей после оплаты.
+*   **Веб-панель**: Управление тарифами, серверами и пользователями через браузер.
+*   **Мульти-серверность**: Подключайте неограниченное количество серверов с панелью 3x-ui.
+*   **Гибкие тарифы**: Подписки на месяц, год, пробные периоды и реферальная система.
+*   **Оплата и Поддержка**:
+    *   **Шлюзы**: YooKassa, CryptoBot, Heleket, TonConnect.
+    *   **Поддержка**: Встроенная тикет-система (Бот техподдержки).
 
 ---
 
-## 🛠 One-Line Installation
+## 🛠 Установка одной командой
 
-Run this command on your **Ubuntu/Debian** server to set up everything automatically:
+Выполните эту команду на вашем сервере (Ubuntu/Debian), чтобы автоматически установить и настроить всё (Docker, SSL, Бот):
 
 ```bash
-git clone https://github.com/Bogdan199719/myvlessbottg.git && cd myvlessbottg && bash install.sh
+curl -sSL https://raw.githubusercontent.com/Bogdan199719/myvlessbottg/main/install.sh | sudo bash
 ```
 
-The installer will:
-1.  Check for dependencies (Docker, Git).
-2.  Clone the repository.
-3.  **Interactively ask** for your Bot Token and settings.
-4.  Generate a secure `.env` file.
-5.  Launch the application.
+**Что сделает скрипт:**
+1.  Проверит и установит зависимости (Docker, Nginx, Certbot).
+2.  Скачает проект (потребуются данные от аккаунта GitHub, так как репозиторий приватный).
+3.  **Интерактивно** запросит Токен бота и настройки.
+4.  Сгенерирует безопасный `.env` файл.
+5.  Настроит SSL сертификаты.
+6.  Запустит проект.
 
 ---
 
-## 🔧 Environment Variables
+## 🔧 Переменные Окружения
 
-The project uses a `.env` file for configuration. Below are the available options:
+Проект использует файл `.env` для конфигурации. Основные параметры:
 
-| Variable | Description | Required | Default |
-| :--- | :--- | :---: | :--- |
-| `TELEGRAM_BOT_TOKEN` | Your Telegram Bot API Token | ✅ | - |
-| `ADMIN_TELEGRAM_ID` | Telegram ID of the Super Admin | ✅ | - |
-| `DOMAIN` | Domain name for the Web Panel | ✅ | - |
-| `PANEL_LOGIN` | Web Panel Login | ❌ | `admin` |
-| `PANEL_PASSWORD` | Web Panel Password | ❌ | `admin` |
-| `YOOKASSA_ENABLED` | Enable YooKassa Payments | ❌ | `false` |
-| `CRYPTOBOT_ENABLED` | Enable CryptoBot Payments | ❌ | `false` |
-| `TONCONNECT_ENABLED` | Enable TON Wallet Payments | ❌ | `false` |
+| Переменная | Описание | Обязательно |
+| :--- | :--- | :---: |
+| `TELEGRAM_BOT_TOKEN` | Токен вашего бота (от @BotFather) | ✅ |
+| `ADMIN_TELEGRAM_ID` | Ваш Telegram ID | ✅ |
+| `DOMAIN` | Домен для веб-панели | ✅ |
+| `PANEL_LOGIN` | Логин веб-панели (по умолчанию `admin`) | ❌ |
+| `PANEL_PASSWORD` | Пароль веб-панели (по умолчанию `admin`) | ❌ |
 
-*(See `.env.example` for the full list)*
+*(Полный список см. в файле `.env.example`)*
 
 ---
 
-## 📦 Deployment via Docker
+## 📦 Ручная установка (через Docker)
 
-If you prefer manual deployment:
+Если вы предпочитаете настраивать всё сами:
 
 ```bash
-# 1. Clone
+# 1. Скачать
 git clone https://github.com/Bogdan199719/myvlessbottg.git
 cd myvlessbottg
 
-# 2. Configure
+# 2. Настроить
 cp .env.example .env
-nano .env  # Edit your settings
+nano .env  # Впишите ваши данные
 
-# 3. Launch
+# 3. Запустить
 docker-compose up -d --build
 ```
 
-## 📄 License
-This project is proprietary software maintained by **Bogdan199719**. All rights reserved.
+## 📄 Лицензия
+MyVlessBot © 2024 Bogdan199719. Все права защищены.

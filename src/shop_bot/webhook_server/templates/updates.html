@@ -1,0 +1,130 @@
+{% extends 'base.html' %}
+
+{% block title %}Обновления{% endblock %}
+
+{% block content %}
+<section class="content-header">
+    <h1><i class="fas fa-sync-alt"></i> Центр обновлений</h1>
+    <p>Управление версией бота</p>
+</section>
+
+<div class="card">
+    <div class="card-body update-container">
+        <div class="current-version">
+            <h3>Текущая версия</h3>
+            <span class="badge badge-primary">{{ current_version }}</span>
+        </div>
+
+        <div class="update-actions">
+            <button id="checkUpdatesBtn" class="button button-primary">
+                <i class="fas fa-search"></i> Проверить обновления
+            </button>
+        </div>
+
+        <div id="updateStatusArea" class="update-status hidden">
+            <!-- Dynamic Content -->
+        </div>
+        
+        <div id="updateLog" class="terminal-log hidden">
+            <!-- Logs -->
+        </div>
+    </div>
+</div>
+
+<script>
+document.getElementById('checkUpdatesBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('checkUpdatesBtn');
+    const statusArea = document.getElementById('updateStatusArea');
+    const logArea = document.getElementById('updateLog');
+    
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Проверка...';
+    statusArea.classList.add('hidden');
+    
+    try {
+        const response = await fetch("{{ url_for('check_updates_route') }}", {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': '{{ csrf_token() }}'
+            }
+        });
+        const json = await response.json();
+        
+        statusArea.classList.remove('hidden');
+        
+        if (json.status === 'success') {
+            const data = json.data;
+            if (data.update_available) {
+                statusArea.innerHTML = `
+                    <div class="alert alert-info">
+                        <h4>🔥 Доступно обновление: ${data.latest_version}</h4>
+                        <p>${data.release_notes || 'Нет описания релиза.'}</p>
+                        <button id="performUpdateBtn" class="button button-success">
+                            <i class="fas fa-cloud-download-alt"></i> Обновить сейчас
+                        </button>
+                    </div>
+                `;
+                
+                document.getElementById('performUpdateBtn').addEventListener('click', performUpdate);
+            } else {
+                statusArea.innerHTML = `
+                    <div class="alert alert-success">
+                        <i class="fas fa-check-circle"></i> У вас установлена последняя версия.
+                    </div>
+                `;
+            }
+        } else {
+            statusArea.innerHTML = `<div class="alert alert-danger">Ошибка: ${json.message}</div>`;
+        }
+    } catch (e) {
+        statusArea.innerHTML = `<div class="alert alert-danger">Ошибка сети: ${e}</div>`;
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-search"></i> Проверить снова';
+    }
+});
+
+async function performUpdate() {
+    if (!confirm('Вы уверены? Это действие перезапустит бота.')) return;
+    
+    const statusArea = document.getElementById('updateStatusArea');
+    statusArea.innerHTML = '<div class="alert alert-warning"><i class="fas fa-cog fa-spin"></i> Выполняется обновление... Пожалуйста, подождите. Страница может перезагрузиться.</div>';
+    
+    try {
+        const response = await fetch("{{ url_for('perform_update_route') }}", {
+            method: 'POST',
+            headers: { 'X-CSRFToken': '{{ csrf_token() }}' }
+        });
+        const json = await response.json();
+        
+        if (json.status === 'success') {
+            statusArea.innerHTML = '<div class="alert alert-success">Обновление успешно! Бот перезагружается...</div>';
+            setTimeout(() => window.location.reload(), 10000);
+        } else {
+            statusArea.innerHTML = `<div class="alert alert-danger">Ошибка обновления: ${json.message}</div>`;
+        }
+    } catch (e) {
+         statusArea.innerHTML = '<div class="alert alert-warning">Команда отправлена. Возможно, сервер уже перезагружается. Попробуйте обновить страницу через минуту.</div>';
+    }
+}
+</script>
+
+<style>
+    .update-container {
+        text-align: center;
+        padding: 40px;
+    }
+    .current-version h3 { margin-bottom: 10px; }
+    .badge { padding: 5px 10px; border-radius: 4px; font-weight: bold; }
+    .badge-primary { background: #007bff; color: white; }
+    .update-actions { margin: 30px 0; }
+    .hidden { display: none; }
+    .alert { padding: 15px; border-radius: 5px; margin-top: 20px; text-align: left; }
+    .alert-info { background: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; }
+    .alert-success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
+    .alert-danger { background: #ffebee; color: #b71c1c; border: 1px solid #ef9a9a; }
+    .alert-warning { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
+    .terminal-log { background: #1e1e1e; color: #00e676; font-family: monospace; padding: 15px; text-align: left; margin-top: 20px; border-radius: 5px; }
+</style>
+{% endblock %}

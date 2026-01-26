@@ -6,8 +6,9 @@ LABEL maintainer="Bogdan199719"
 WORKDIR /app
 
 # Install system dependencies if needed (e.g., for building wheels)
+# Install docker.io client to allow self-restart if socket is mounted
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+    gcc docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
