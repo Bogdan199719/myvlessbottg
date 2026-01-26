@@ -9,30 +9,36 @@ logger = logging.getLogger(__name__)
 
 def check_for_updates() -> dict:
     """
-    Checks for updates via GitHub API.
+    Checks for updates via GitHub RAW content from main branch.
     Returns: {"update_available": bool, "latest_version": str, "current_version": str, "release_notes": str}
     """
     try:
-        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
+        # We fetch the raw version.py from the main branch
+        url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/src/shop_bot/version.py"
         response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
-            data = response.json()
-            latest_tag = data.get("tag_name", "").lstrip("v")
+            content = response.text
+            # Simple parsing for APP_VERSION = "..."
+            import re
+            match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', content)
+            if not match:
+                return {"error": "Could not parse version from remote version.py"}
+            
+            latest_version = match.group(1).lstrip("v")
             current = APP_VERSION.lstrip("v")
             
-            # Simple string comparison or semver? Assuming simple string for now or exact match
-            update_available = latest_tag != current
+            update_available = latest_version != current
             
             return {
                 "update_available": update_available,
-                "latest_version": latest_tag,
+                "latest_version": latest_version,
                 "current_version": current,
-                "release_notes": data.get("body", "No release notes.")
+                "release_notes": "Обновление функционала и исправление ошибок."
             }
         else:
             logger.warning(f"Failed to check for updates: {response.status_code}")
-            return {"error": f"GitHub API Check Failed: {response.status_code}"}
+            return {"error": f"GitHub Check Failed: {response.status_code}"}
     except Exception as e:
         logger.error(f"Error checking updates: {e}")
         return {"error": str(e)}
@@ -48,34 +54,24 @@ def perform_update() -> dict:
         if result.returncode != 0:
             return {"status": "error", "message": f"Git Pull Failed: {result.stderr}"}
         
-        # 2. Pip Install
+        # 2. Pip Install (using current directory where pyproject.toml is)
         logger.info("Updating dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=False)
+        subprocess.run([sys.executable, "-m", "pip", "install", "."], check=False)
         
-        # 3. Trigger Restart
-        # Since we are likely in Docker, simply exiting with 0 or 1 will cause restart 
-        # IF restart policy is set. 
-        # But to be safer and ensure we "trigger docker-compose up -d --build", 
-        # we need access to the host docker socket.
-        # If socket is NOT available, we fallback to sys.exit().
+        logger.info("Update successful. Triggering restart in 3 seconds...")
         
-        logger.info("Update successful. Triggering restart...")
-        
-        # Determine restart strategy
-        if os.path.exists("/var/run/docker.sock"):
-            # Try to trigger docker-compose build via a sidecar or raw docker command if docker executable exists
-            # NOTE: Installing docker CLI inside container is needed for this.
-            # Assuming we added it to Dockerfile.
-            try:
-                # We can't easily run 'docker-compose' if it's not installed. 
-                # Let's try to just kill the python process, Docker will restart it.
-                # If dependencies changed, we rely on the pip install above.
-                pass 
-            except Exception:
-                pass
+        # We use a thread to exit after a delay, allowing the Flask response to be sent
+        import threading
+        import time
+        def delayed_restart():
+            time.sleep(3)
+            logger.info("Restarting process now...")
+            os._exit(0) # Forced exit to trigger Docker restart
+            
+        threading.Thread(target=delayed_restart).start()
 
-        # Return success, the server will restart momentarily
-        return {"status": "success", "message": "Update downloaded. Restarting application..."}
+        return {"status": "success", "message": "Обновление скачано. Бот перезагрузится через несколько секунд..."}
+
 
     except Exception as e:
         logger.error(f"Update failed: {e}")

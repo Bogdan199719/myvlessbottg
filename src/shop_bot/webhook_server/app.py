@@ -242,8 +242,9 @@ def create_webhook_app(bot_controller_instance):
             if request.path.startswith('/cryptobot-webhook/'):
                 return
                 
+            target_token = request.form.get('csrf_token') or request.headers.get('X-CSRFToken')
             token = session.get('_csrf_token')
-            if not token or token != request.form.get('csrf_token'):
+            if not token or token != target_token:
                 return "CSRF Token missing or invalid!", 403
 
     def generate_csrf_token():

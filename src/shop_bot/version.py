@@ -1,3 +1,3 @@
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.6"
 REPO_OWNER = "Bogdan199719"
 REPO_NAME = "myvlessbottg"

@@ -7,7 +7,7 @@ WORKDIR /app/project
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc docker.io \
+    gcc docker.io git \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
