@@ -6,4 +6,10 @@ services:
       - '1488:1488'
     volumes:
       - .:/app/project
-      - /app/.venv
+    environment:
+      - TZ=Europe/Moscow
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

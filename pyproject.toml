@@ -13,8 +13,13 @@ dependencies = [
     "aiosend==2.1.2",
     "aiohttp==3.9.5",
     "aiohttp-sse-client==0.2.1",
-    "pytonconnect==0.3.2"
+    "pytonconnect==0.3.2",
+    "pytz==2024.1"
 ]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 dev = [

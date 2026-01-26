@@ -5,24 +5,24 @@ block content %}
 
 <section class="stats-section">
 	<div class="stats-grid">
-		<div class="stat-card">
+		<a href="{{ url_for('users_page') }}" class="stat-card">
 			<h3>Пользователей</h3>
 			<p class="stat-number">{{ stats.user_count }}</p>
-		</div>
-		<div class="stat-card">
+		</a>
+		<a href="{{ url_for('keys_page') }}" class="stat-card">
 			<h3>Всего ключей</h3>
 			<p class="stat-number">{{ stats.total_keys }}</p>
-		</div>
+		</a>
 		<div class="stat-card">
 			<h3>Всего потрачено</h3>
 			<p class="stat-number">
 				{{ stats.total_spent | round(2) }} <small>RUB</small>
 			</p>
 		</div>
-		<div class="stat-card">
+		<a href="{{ url_for('settings_page') }}#hosts" class="stat-card">
 			<h3>Активных хостов</h3>
 			<p class="stat-number">{{ stats.host_count }}</p>
-		</div>
+		</a>
 	</div>
 </section>
 
@@ -52,6 +52,7 @@ block content %}
 							<th>Пользователь</th>
 							<th>Хост</th>
 							<th>План</th>
+							<th>Активна до</th>
 							<th>Цена</th>
 							<th>Дата</th>
 						</tr>
@@ -64,6 +65,7 @@ block content %}
 							</td>
 							<td>{{ tx.host_name }}</td>
 							<td>{{ tx.plan_name }}</td>
+							<td>{% if tx.subscription_expires_at %}{{ tx.subscription_expires_at.split(' ')[0] }}{% else %}—{% endif %}</td>
 							<td>{{ tx.amount_rub | round(2) }} RUB</td>
 							<td>{{ tx.created_date.split(' ')[0] }}</td>
 						</tr>
@@ -101,8 +103,6 @@ block content %}
 	</div>
 </div>
 
-<script>
-	const CHART_DATA = {{ chart_data | tojson }};
-</script>
+<script id="chart-data" type="application/json">{{ chart_data | tojson }}</script>
 
 {% endblock %}

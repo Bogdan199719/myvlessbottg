@@ -1,0 +1,120 @@
+{% extends "base.html" %} {% block title %}Управление ключами{% endblock %} {% block
+content %}
+
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+    <h1>Управление ключами</h1>
+    <div style="display: flex; gap: 10px;">
+        <form action="{{ url_for('sync_keys_configs') }}" method="POST"
+            onsubmit="return confirm('Это действие обновит строки подключения для ВСЕХ ключей из панели XUI. Это может занять время. Продолжить?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="button button-primary">↻ Синхронизировать конфиги</button>
+        </form>
+        <form action="{{ url_for('fix_client_parameters') }}" method="POST"
+            onsubmit="return confirm('Это действие исправит параметры flow и encryption для ВСЕХ клиентов на панелях XUI. Продолжить?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="button button-warning">🔧 Исправить параметры клиентов</button>
+        </form>
+    </div>
+</div>
+
+<section class="keys-section">
+    <div style="overflow-x: auto">
+        <table class="users-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <!-- User column removed, using group header -->
+                    <th>Хост</th>
+                    <th>Email</th>
+                    <th>Истекает</th>
+                    <th>Статус (дней)</th>
+                    <th style="text-align: right">Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in grouped_users %}
+                <tr style="background-color: #3b4250; border-bottom: 2px solid var(--border-color);">
+                    <td colspan="6" style="padding: 10px 15px;">
+                        <strong style="font-size: 1.1em; color: var(--primary-color);">
+                            <a href="{{ url_for('users_page') }}#user-{{ user.user_id }}"
+                                style="text-decoration: none; color: inherit;">
+                                {{ user.username }}
+                            </a>
+                        </strong>
+                        <small style="color: #adb5bd; margin-left: 10px;">ID: {{ user.user_id }}</small>
+                    </td>
+                </tr>
+                {% for key in user.user_keys %}
+                <tr style="background-color: #2d3238;">
+                    <td>{{ key.key_id }}</td>
+                    <td>{{ key.host_name }}</td>
+                    <td>
+                        <small>{{ key.key_email }}</small>
+                    </td>
+                    <td>
+                        {% if key.expiry_date %}
+                        {{ key.expiry_date.split('T')[0] }}
+                        {% else %}
+                        ∞
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if key.days_left is defined %}
+                        {% if key.days_left < 0 %} <span class="status-badge status-banned">Просрочен</span>
+                            {% elif key.days_left < 3 %} <span class="status-badge status-warning">{{ key.days_left }}
+                                дн.</span>
+                                {% else %}
+                                <span class="status-badge status-active">{{ key.days_left }} дн.</span>
+                                {% endif %}
+                                {% endif %}
+                    </td>
+                    <td class="actions-cell">
+                        <form action="{{ url_for('adjust_key_duration', key_id=key.key_id) }}" method="POST"
+                            class="form-inline"
+                            onsubmit="var d = parseInt(this.days.value) || 0; var h = parseInt(this.hours.value) || 0; if(d === 0 && h === 0) { alert('Укажите количество дней или часов'); return false; } var txt = (d >= 0 && h >= 0) ? 'продлить' : 'уменьшить срок'; return confirm('Вы уверены, что хотите ' + txt + ' ключ #{{ key.key_id }}?');"
+                            style="display: flex; gap: 5px; justify-content: flex-end; align-items: center;">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                            <div style="display: flex; gap: 5px; align-items: center;">
+                                <div style="display: flex; flex-direction: column; align-items: center;">
+                                    <span style="font-size: 0.7em; color: #adb5bd;">Дней</span>
+                                    <input type="number" name="days" value="0" min="-365" max="365"
+                                        style="width: 50px; padding: 2px; text-align: center;"
+                                        oninput="checkChanges(this.form)" />
+                                </div>
+                                <div style="display: flex; flex-direction: column; align-items: center;">
+                                    <span style="font-size: 0.7em; color: #adb5bd;">Часов</span>
+                                    <input type="number" name="hours" value="0" min="-23" max="23"
+                                        style="width: 50px; padding: 2px; text-align: center;"
+                                        oninput="checkChanges(this.form)" />
+                                </div>
+                                <button type="submit" class="button button-small button-success"
+                                    style="display: none; margin-left: 5px;" title="Применить изменения">
+                                    OK
+                                </button>
+                            </div>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<script>
+    function checkChanges(form) {
+        const days = parseInt(form.days.value) || 0;
+        const hours = parseInt(form.hours.value) || 0;
+        const btn = form.querySelector('button[type="submit"]');
+
+        if (days !== 0 || hours !== 0) {
+            btn.style.display = 'block';
+        } else {
+            btn.style.display = 'none';
+        }
+    }
+</script>
+
+
+{% endblock %}

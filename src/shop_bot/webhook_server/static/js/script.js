@@ -23,7 +23,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
 	function setupBotControlForms() {
 		const controlForms = document.querySelectorAll(
-			'form[action*="start-bot"], form[action*="stop-bot"]'
+			'form[action*="start-shop-bot"], form[action*="stop-shop-bot"], form[action*="start-support-bot"], form[action*="stop-support-bot"]'
 		)
 
 		controlForms.forEach(form => {
@@ -32,9 +32,9 @@ document.addEventListener('DOMContentLoaded', function () {
 				if (button) {
 					button.disabled = true
 					if (form.action.includes('start')) {
-						button.textContent = 'Запускаем...'
+						button.textContent = 'Запускаю...'
 					} else if (form.action.includes('stop')) {
-						button.textContent = 'Останавливаем...'
+						button.textContent = 'Останавливаю...'
 					}
 				}
 				setTimeout(function () {
@@ -56,9 +56,91 @@ document.addEventListener('DOMContentLoaded', function () {
 		})
 	}
 
+	function setupToggleSections() {
+		const sections = document.querySelectorAll('[data-toggle-section]')
+		if (!sections.length) return
+
+		function applyToggle(section) {
+			const checkboxId = section.getAttribute('data-toggle-section')
+			if (!checkboxId) return
+			const checkbox = document.getElementById(checkboxId)
+			if (!checkbox) return
+			section.style.display = checkbox.checked ? '' : 'none'
+		}
+
+		sections.forEach(section => {
+			applyToggle(section)
+			const checkboxId = section.getAttribute('data-toggle-section')
+			const checkbox = checkboxId ? document.getElementById(checkboxId) : null
+			if (!checkbox) return
+			checkbox.addEventListener('change', () => applyToggle(section))
+		})
+	}
+
+	function setupCopyButtons() {
+		const copyButtons = document.querySelectorAll('button.copy-button[data-copy-target]')
+		if (!copyButtons.length) return
+
+		async function copyText(text) {
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				await navigator.clipboard.writeText(text)
+				return
+			}
+			const textarea = document.createElement('textarea')
+			textarea.value = text
+			textarea.style.position = 'fixed'
+			textarea.style.top = '-1000px'
+			document.body.appendChild(textarea)
+			textarea.focus()
+			textarea.select()
+			try {
+				document.execCommand('copy')
+			} finally {
+				document.body.removeChild(textarea)
+			}
+		}
+
+		copyButtons.forEach(button => {
+			button.addEventListener('click', async function () {
+				const targetId = button.getAttribute('data-copy-target')
+				if (!targetId) return
+				const input = document.getElementById(targetId)
+				if (!input) return
+				const value = input.value || ''
+				if (!value) return
+
+				const oldText = button.textContent
+				try {
+					await copyText(value)
+					button.textContent = '✓'
+					setTimeout(() => {
+						button.textContent = oldText
+					}, 800)
+				} catch (e) {
+					button.textContent = '×'
+					setTimeout(() => {
+						button.textContent = oldText
+					}, 800)
+				}
+			})
+		})
+	}
+
 	function initializeDashboardCharts() {
 		const usersChartCanvas = document.getElementById('newUsersChart')
-		if (!usersChartCanvas || typeof CHART_DATA === 'undefined') {
+		const chartDataEl = document.getElementById('chart-data')
+		if (!usersChartCanvas || !chartDataEl) {
+			return
+		}
+
+		let CHART_DATA
+		try {
+			CHART_DATA = JSON.parse(chartDataEl.textContent || '{}')
+		} catch (e) {
+			return
+		}
+
+		if (!CHART_DATA || !CHART_DATA.users || !CHART_DATA.keys) {
 			return
 		}
 
@@ -225,5 +307,7 @@ document.addEventListener('DOMContentLoaded', function () {
 	initializePasswordToggles()
 	setupBotControlForms()
 	setupConfirmationForms()
+	setupToggleSections()
+	setupCopyButtons()
 	initializeDashboardCharts()
 })

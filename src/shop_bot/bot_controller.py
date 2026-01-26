@@ -84,33 +84,50 @@ class BotController:
 
             self.shop_is_running = True
 
+            yookassa_enabled_setting = database.get_setting("yookassa_enabled") == "true"
             yookassa_shop_id = database.get_setting("yookassa_shop_id")
             yookassa_secret_key = database.get_setting("yookassa_secret_key")
-            yookassa_enabled = bool(yookassa_shop_id and yookassa_secret_key)
+            yookassa_enabled = yookassa_enabled_setting and bool(yookassa_shop_id and yookassa_secret_key)
 
+            cryptobot_enabled_setting = database.get_setting("cryptobot_enabled") == "true"
             cryptobot_token = database.get_setting("cryptobot_token")
-            cryptobot_enabled = bool(cryptobot_token)
+            cryptobot_enabled = cryptobot_enabled_setting and bool(cryptobot_token)
 
+            heleket_enabled_setting = database.get_setting("heleket_enabled") == "true"
             heleket_shop_id = database.get_setting("heleket_merchant_id")
             heleket_api_key = database.get_setting("heleket_api_key")
-            heleket_enabled = bool(heleket_api_key and heleket_shop_id)
+            heleket_enabled = heleket_enabled_setting and bool(heleket_api_key and heleket_shop_id)
             
+            tonconnect_enabled_setting = database.get_setting("tonconnect_enabled") == "true"
             ton_wallet_address = database.get_setting("ton_wallet_address")
             tonapi_key = database.get_setting("tonapi_key")
-            tonconnect_enabled = bool(ton_wallet_address and tonapi_key)
+            tonconnect_enabled = tonconnect_enabled_setting and bool(ton_wallet_address and tonapi_key)
+
+            stars_enabled_setting = database.get_setting("stars_enabled") == "true"
+            stars_rate_setting = database.get_setting("stars_rub_per_star")
+            try:
+                stars_rub_per_star = float(stars_rate_setting) if stars_rate_setting else 0.0
+            except (TypeError, ValueError):
+                stars_rub_per_star = 0.0
+            
+            # Auto-rate: if 0 or not set, use 1.6 RUB per star
+            if stars_rub_per_star == 0.0 and stars_enabled_setting:
+                stars_rub_per_star = 1.6
+                logger.info("Telegram Stars: using auto-rate (1.6 RUB per star)")
+            
+            stars_enabled = bool(stars_enabled_setting and stars_rub_per_star > 0)
 
             if yookassa_enabled:
                 Configuration.account_id = yookassa_shop_id
                 Configuration.secret_key = yookassa_secret_key
             
-            handlers.PAYMENT_METHODS = {
-                "yookassa": yookassa_enabled,
-                "heleket": heleket_enabled,
-                "cryptobot": cryptobot_enabled,
-                "tonconnect": tonconnect_enabled
-            }
+
             handlers.TELEGRAM_BOT_USERNAME = bot_username
             handlers.ADMIN_ID = admin_id
+            
+            logger.info(f"Payment methods initialized: YooKassa={yookassa_enabled}, Stars={stars_enabled}, Heleket={heleket_enabled}, CryptoBot={cryptobot_enabled}, TON={tonconnect_enabled}")
+            if stars_enabled:
+                logger.info(f"Telegram Stars rate: {stars_rub_per_star} RUB per star")
 
             self.shop_task = asyncio.run_coroutine_threadsafe(self._start_polling(self.shop_bot, self.shop_dp, "ShopBot"), self._loop)
             logger.info("BotController: Start command sent to event loop.")
@@ -181,7 +198,22 @@ class BotController:
 
         return {"status": "success", "message": "Команда на остановку бота отправлена."}
 
+    def stop(self):
+        shop_result = None
+        support_result = None
+        if self.shop_is_running:
+            shop_result = self.stop_shop_bot()
+        if self.support_is_running:
+            support_result = self.stop_support_bot()
+        return {
+            "shop": shop_result,
+            "support": support_result,
+        }
+
     def get_status(self):
-        return {"shop_bot_running": self.shop_is_running,
-                "support_bot_running": self.support_is_running
-            }
+        is_running = bool(self.shop_is_running or self.support_is_running)
+        return {
+            "shop_bot_running": self.shop_is_running,
+            "support_bot_running": self.support_is_running,
+            "is_running": is_running,
+        }

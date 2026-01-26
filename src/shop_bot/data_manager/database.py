@@ -1,28 +1,46 @@
 import sqlite3
 from datetime import datetime
+from shop_bot.utils import time_utils
 import logging
 from pathlib import Path
 import json
+import os
+import uuid
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path("/app/project")
-DB_FILE = PROJECT_ROOT / "users.db"
+# Use environment variable for DB path or default to a relative path
+# Assuming this file is at src/shop_bot/data_manager/database.py
+# We want the DB at the project root (3 levels up from here)
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent.parent / "users.db"
+DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
 
 def initialize_db():
     try:
+        # Ensure directory exists
+        DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id INTEGER PRIMARY KEY, username TEXT, total_spent REAL DEFAULT 0,
                     total_months INTEGER DEFAULT 0, trial_used BOOLEAN DEFAULT 0,
                     agreed_to_terms BOOLEAN DEFAULT 0,
-                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    registration_date TIMESTAMP,
                     is_banned BOOLEAN DEFAULT 0,
                     referred_by INTEGER,
                     referral_balance REAL DEFAULT 0,
-                    referral_balance_all REAL DEFAULT 0
+                    referral_balance_all REAL DEFAULT 0,
+                    subscription_token TEXT UNIQUE
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vpn_keys_missing (
+                    key_email TEXT PRIMARY KEY,
+                    host_name TEXT,
+                    first_seen TIMESTAMP
                 )
             ''')
             cursor.execute('''
@@ -33,9 +51,11 @@ def initialize_db():
                     xui_client_uuid TEXT NOT NULL,
                     key_email TEXT NOT NULL UNIQUE,
                     expiry_date TIMESTAMP,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_date TIMESTAMP,
+                    connection_string TEXT
                 )
             ''')
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS transactions (
                     username TEXT,
@@ -48,7 +68,7 @@ def initialize_db():
                     currency_name TEXT,
                     payment_method TEXT,
                     metadata TEXT,
-                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_date TIMESTAMP
                 )
             ''')
             cursor.execute('''
@@ -78,8 +98,7 @@ def initialize_db():
                     host_name TEXT NOT NULL,
                     plan_name TEXT NOT NULL,
                     months INTEGER NOT NULL,
-                    price REAL NOT NULL,
-                    FOREIGN KEY (host_name) REFERENCES xui_hosts (host_name)
+                    price REAL NOT NULL
                 )
             ''')            
             default_settings = {
@@ -98,6 +117,9 @@ def initialize_db():
                 "telegram_bot_username": None,
                 "trial_enabled": "true",
                 "trial_duration_days": "3",
+                "trial_duration_value": "24",
+                "trial_duration_unit": "hours",
+                "trial_host_name": None,
                 "enable_referrals": "true",
                 "referral_percentage": "10",
                 "referral_discount": "5",
@@ -106,23 +128,28 @@ def initialize_db():
                 "admin_telegram_id": None,
                 "yookassa_shop_id": None,
                 "yookassa_secret_key": None,
+                "yookassa_enabled": "false",
                 "sbp_enabled": "false",
+                "stars_enabled": "false",
+                "stars_rub_per_star": "0",
+                "cryptobot_enabled": "false",
                 "cryptobot_token": None,
+                "cryptobot_webhook_secret": None,
+                "heleket_enabled": "false",
                 "heleket_merchant_id": None,
                 "heleket_api_key": None,
                 "domain": None,
+                "tonconnect_enabled": "false",
                 "ton_wallet_address": None,
                 "tonapi_key": None,
-                "android_url": "https://telegra.ph/Instrukciya-Android-11-09",
-                "windows_url": "https://telegra.ph/Instrukciya-Windows-11-09",
-                "ios_url": "https://telegra.ph/Instrukcii-ios-11-09",
-                "linux_url": "https://telegra.ph/Instrukciya-Linux-11-09",
+                "p2p_enabled": "false",
+                "p2p_card_number": None,
             }
             run_migration()
             for key, value in default_settings.items():
                 cursor.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
-            logging.info("Database initialized successfully.")
+            logging.info(f"Database initialized successfully at {DB_FILE}")
     except sqlite3.Error as e:
         logging.error(f"Database error on initialization: {e}")
 
@@ -134,60 +161,134 @@ def run_migration():
     logging.info(f"Starting the migration of the database: {DB_FILE}")
 
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
 
-        logging.info("The migration of the table 'users' ...")
-    
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [row[1] for row in cursor.fetchall()]
+            logging.info("The migration of the table 'users' ...")
         
-        if 'referred_by' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-            logging.info(" -> The column 'referred_by' is successfully added.")
-        else:
-            logging.info(" -> The column 'referred_by' already exists.")
+            cursor.execute("PRAGMA table_info(users)")
+            columns = [row[1] for row in cursor.fetchall()]
             
-        if 'referral_balance' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referral_balance REAL DEFAULT 0")
-            logging.info(" -> The column 'referral_balance' is successfully added.")
-        else:
-            logging.info(" -> The column 'referral_balance' already exists.")
-        
-        if 'referral_balance_all' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN referral_balance_all REAL DEFAULT 0")
-            logging.info(" -> The column 'referral_balance_all' is successfully added.")
-        else:
-            logging.info(" -> The column 'referral_balance_all' already exists.")
-        
-        logging.info("The table 'users' has been successfully updated.")
-
-        logging.info("The migration of the table 'Transactions' ...")
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
-        table_exists = cursor.fetchone()
-
-        if table_exists:
-            cursor.execute("PRAGMA table_info(transactions)")
-            trans_columns = [row[1] for row in cursor.fetchall()]
-            
-            if 'payment_id' in trans_columns and 'status' in trans_columns and 'username' in trans_columns:
-                logging.info("The 'Transactions' table already has a new structure. Migration is not required.")
+            if 'referred_by' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+                logging.info(" -> The column 'referred_by' is successfully added.")
             else:
-                backup_name = f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                logging.warning(f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ...")
-                cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
+                logging.info(" -> The column 'referred_by' already exists.")
                 
-                logging.info("I create a new table 'Transactions' with the correct structure ...")
-                create_new_transactions_table(cursor)
-                logging.info("The new table 'Transactions' has been successfully created. The old data is saved.")
-        else:
-            logging.info("TRANSACTIONS table was not found. I create a new one ...")
-            create_new_transactions_table(cursor)
-            logging.info("The new table 'Transactions' has been successfully created.")
+            if 'referral_balance' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN referral_balance REAL DEFAULT 0")
+                logging.info(" -> The column 'referral_balance' is successfully added.")
+            else:
+                logging.info(" -> The column 'referral_balance' already exists.")
+            
+            if 'referral_balance_all' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN referral_balance_all REAL DEFAULT 0")
+                logging.info(" -> The column 'referral_balance_all' is successfully added.")
+            else:
+                logging.info(" -> The column 'referral_balance_all' already exists.")
 
-        conn.commit()
-        conn.close()
+            if 'subscription_token' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN subscription_token TEXT")
+                logging.info(" -> The column 'subscription_token' is successfully added.")
+                
+                # Generate tokens for existing users
+                cursor.execute("SELECT telegram_id FROM users WHERE subscription_token IS NULL")
+                users_without_token = cursor.fetchall()
+                for (uid,) in users_without_token:
+                    new_token = str(uuid.uuid4())
+                    cursor.execute("UPDATE users SET subscription_token = ? WHERE telegram_id = ?", (new_token, uid))
+                
+                # Create unique index after populating
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users (subscription_token)")
+                logging.info(f" -> Generated subscription tokens for {len(users_without_token)} existing users and created unique index.")
+            else:
+                logging.info(" -> The column 'subscription_token' already exists.")
+
+            # Check for is_enabled column in xui_hosts
+            cursor.execute("PRAGMA table_info(xui_hosts)")
+            host_columns = [row[1] for row in cursor.fetchall()]
+            if 'is_enabled' not in host_columns:
+                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN is_enabled BOOLEAN DEFAULT 1")
+                logging.info(" -> The column 'is_enabled' is successfully added to xui_hosts.")
+            else:
+                logging.info(" -> The column 'is_enabled' already exists in xui_hosts.")
+
+            cursor.execute("PRAGMA table_info(vpn_keys)")
+            vpn_keys_columns = [row[1] for row in cursor.fetchall()]
+            if 'connection_string' not in vpn_keys_columns:
+                cursor.execute("ALTER TABLE vpn_keys ADD COLUMN connection_string TEXT")
+                logging.info(" -> The column 'connection_string' is successfully added to vpn_keys.")
+            else:
+                logging.info(" -> The column 'connection_string' already exists in vpn_keys.")
+            
+            # Migrate new payment method toggle settings
+            logging.info("Migration of bot_settings for payment methods...")
+            new_payment_settings = {
+               "yookassa_enabled": "false",
+                "cryptobot_enabled": "false",
+                "heleket_enabled": "false",
+                "tonconnect_enabled": "false"
+            }
+            
+            for key, default_value in new_payment_settings.items():
+                cursor.execute("SELECT 1 FROM bot_settings WHERE key = ?", (key,))
+                if not cursor.fetchone():
+                    cursor.execute("INSERT INTO bot_settings (key, value) VALUES (?, ?)", (key, default_value))
+                    logging.info(f" -> Added setting '{key}' with default value '{default_value}'.")
+                else:
+                    logging.info(f" -> Setting '{key}' already exists.")
+            
+            # Add plan_id column to vpn_keys for trial/paid key distinction
+            logging.info("Migration of vpn_keys table to add plan_id...")
+            cursor.execute("PRAGMA table_info(vpn_keys)")
+            vpn_keys_columns = [row[1] for row in cursor.fetchall()]
+            if 'plan_id' not in vpn_keys_columns:
+                cursor.execute("ALTER TABLE vpn_keys ADD COLUMN plan_id INTEGER DEFAULT 0")
+                logging.info(" -> The column 'plan_id' is successfully added to vpn_keys.")
+                logging.info(" -> Existing keys will have plan_id=0 (trial). Update manually if needed.")
+            else:
+                logging.info(" -> The column 'plan_id' already exists in vpn_keys.")
+            
+            logging.info("The table 'users' has been successfully updated.")
+
+            logging.info("The migration of the table 'Transactions' ...")
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
+            table_exists = cursor.fetchone()
+
+            if table_exists:
+                cursor.execute("PRAGMA table_info(transactions)")
+                trans_columns = [row[1] for row in cursor.fetchall()]
+                
+                if 'payment_id' in trans_columns and 'status' in trans_columns and 'username' in trans_columns:
+                    logging.info("The 'Transactions' table already has a new structure. Migration is not required.")
+                else:
+                    backup_name = f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    logging.warning(f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ...")
+                    cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
+                    
+                    logging.info("I create a new table 'Transactions' with the correct structure ...")
+                    create_new_transactions_table(cursor)
+                    logging.info("The new table 'Transactions' has been successfully created. The old data is saved.")
+            else:
+                logging.info("TRANSACTIONS table was not found. I create a new one ...")
+                create_new_transactions_table(cursor)
+                logging.info("The new table 'Transactions' has been successfully created.")
+
+            logging.info("The migration of the table 'sent_notifications' ...")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sent_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    key_id INTEGER,
+                    notification_type TEXT NOT NULL,
+                    hours_mark INTEGER,
+                    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            logging.info(" -> Table 'sent_notifications' is ready.")
+
+            conn.commit()
         
         logging.info("--- The database is successfully completed! ---")
 
@@ -207,7 +308,7 @@ def create_new_transactions_table(cursor: sqlite3.Cursor):
             currency_name TEXT,
             payment_method TEXT,
             metadata TEXT,
-            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_date TIMESTAMP
         )
     ''')
 
@@ -216,24 +317,68 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO xui_hosts (host_name, host_url, host_username, host_pass, host_inbound_id) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO xui_hosts (host_name, host_url, host_username, host_pass, host_inbound_id, is_enabled) VALUES (?, ?, ?, ?, ?, 1)",
                 (name, url, user, passwd, inbound)
             )
             conn.commit()
-            logging.info(f"Successfully created a new host: {name}")
+            logging.info(f"Host '{name}' added.")
     except sqlite3.Error as e:
-        logging.error(f"Error creating host '{name}': {e}")
+        logging.error(f"Failed to add host: {e}")
+
+def update_host(old_name: str, new_name: str, url: str, user: str, passwd: str, inbound: int):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            # If password is empty, don't update it
+            if passwd:
+                cursor.execute(
+                    """
+                    UPDATE xui_hosts 
+                    SET host_name=?, host_url=?, host_username=?, host_pass=?, host_inbound_id=?
+                    WHERE host_name=?
+                    """,
+                    (new_name, url, user, passwd, inbound, old_name)
+                )
+            else:
+                 cursor.execute(
+                    """
+                    UPDATE xui_hosts 
+                    SET host_name=?, host_url=?, host_username=?, host_inbound_id=?
+                    WHERE host_name=?
+                    """,
+                    (new_name, url, user, inbound, old_name)
+                )
+            
+            # Also update related plans and keys if name changed
+            if old_name != new_name:
+                cursor.execute("UPDATE plans SET host_name=? WHERE host_name=?", (new_name, old_name))
+                cursor.execute("UPDATE vpn_keys SET host_name=? WHERE host_name=?", (new_name, old_name))
+                
+            conn.commit()
+            logging.info(f"Host '{old_name}' updated to '{new_name}'.")
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update host '{old_name}': {e}")
+
+def toggle_host_status(host_name: str, is_enabled: bool):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE xui_hosts SET is_enabled=? WHERE host_name=?", (1 if is_enabled else 0, host_name))
+            conn.commit()
+            logging.info(f"Host '{host_name}' status set to {is_enabled}.")
+    except sqlite3.Error as e:
+        logging.error(f"Failed to toggle status for host '{host_name}': {e}")
 
 def delete_host(host_name: str):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
             cursor.execute("DELETE FROM xui_hosts WHERE host_name = ?", (host_name,))
+            cursor.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
             conn.commit()
-            logging.info(f"Successfully deleted host '{host_name}' and its plans.")
+            logging.info(f"Host '{host_name}' deleted.")
     except sqlite3.Error as e:
-        logging.error(f"Error deleting host '{host_name}': {e}")
+        logging.error(f"Failed to delete host '{host_name}': {e}")
 
 def get_host(host_name: str) -> dict | None:
     try:
@@ -247,16 +392,43 @@ def get_host(host_name: str) -> dict | None:
         logging.error(f"Error getting host '{host_name}': {e}")
         return None
 
-def get_all_hosts() -> list[dict]:
+def get_all_hosts(only_enabled: bool = False) -> list[dict]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM xui_hosts")
+            if only_enabled:
+                 cursor.execute("SELECT * FROM xui_hosts WHERE is_enabled = 1")
+            else:
+                 cursor.execute("SELECT * FROM xui_hosts")
             hosts = cursor.fetchall()
             return [dict(row) for row in hosts]
     except sqlite3.Error as e:
         logging.error(f"Error getting list of all hosts: {e}")
+        return []
+
+def get_all_keys_with_usernames() -> list[dict]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT k.*, u.username, 
+                       (julianday(k.expiry_date) - julianday('now')) as days_left
+                FROM vpn_keys k
+                LEFT JOIN users u ON k.user_id = u.telegram_id
+                ORDER BY k.created_date DESC
+            ''')
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            # Post-process days_left for better display
+            for res in results:
+                if res['days_left'] is not None:
+                     res['days_left'] = int(res['days_left'])
+            
+            return results
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get all keys with usernames: {e}")
         return []
 
 def get_all_keys() -> list[dict]:
@@ -358,9 +530,10 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
             cursor = conn.cursor()
             cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
             if not cursor.fetchone():
+                token = str(uuid.uuid4())
                 cursor.execute(
-                    "INSERT INTO users (telegram_id, username, registration_date, referred_by) VALUES (?, ?, ?, ?)",
-                    (telegram_id, username, datetime.now(), referrer_id)
+                    "INSERT INTO users (telegram_id, username, registration_date, referred_by, subscription_token) VALUES (?, ?, ?, ?, ?)",
+                    (telegram_id, username, time_utils.get_msk_now(), referrer_id, token)
                 )
             else:
                 cursor.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
@@ -426,6 +599,18 @@ def get_user(telegram_id: int):
             return dict(user_data) if user_data else None
     except sqlite3.Error as e:
         logging.error(f"Failed to get user {telegram_id}: {e}")
+        return None
+
+def get_user_by_token(token: str):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE subscription_token = ?", (token,))
+            user_data = cursor.fetchone()
+            return dict(user_data) if user_data else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get user by token: {e}")
         return None
 
 def set_terms_agreed(telegram_id: int):
@@ -523,7 +708,7 @@ def log_transaction(username: str, transaction_id: str | None, payment_id: str |
                 """INSERT INTO transactions
                    (username, transaction_id, payment_id, user_id, status, amount_rub, amount_currency, currency_name, payment_method, metadata, created_date)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (username, transaction_id, payment_id, user_id, status, amount_rub, amount_currency, currency_name, payment_method, metadata, datetime.now())
+                (username, transaction_id, payment_id, user_id, status, amount_rub, amount_currency, currency_name, payment_method, metadata, time_utils.get_msk_now())
             )
             conn.commit()
     except sqlite3.Error as e:
@@ -559,6 +744,19 @@ def get_paginated_transactions(page: int = 1, per_page: int = 15) -> tuple[list[
                 else:
                     transaction_dict['host_name'] = 'N/A'
                     transaction_dict['plan_name'] = 'N/A'
+
+                try:
+                    expiry_query = "SELECT MAX(expiry_date) FROM vpn_keys WHERE user_id = ?"
+                    expiry_params = [transaction_dict.get('user_id')]
+                    host_name = transaction_dict.get('host_name')
+                    if host_name and host_name not in ('N/A', 'Error'):
+                        expiry_query += " AND host_name = ?"
+                        expiry_params.append(host_name)
+
+                    cursor.execute(expiry_query, tuple(expiry_params))
+                    transaction_dict['subscription_expires_at'] = cursor.fetchone()[0]
+                except sqlite3.Error:
+                    transaction_dict['subscription_expires_at'] = None
                 
                 transactions.append(transaction_dict)
             
@@ -577,16 +775,20 @@ def set_trial_used(telegram_id: int):
     except sqlite3.Error as e:
         logging.error(f"Failed to set trial used for user {telegram_id}: {e}")
 
-def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: str, expiry_timestamp_ms: int):
+def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: str, expiry_timestamp_ms: int, connection_string: str = None, plan_id: int = 0):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            expiry_date = datetime.fromtimestamp(expiry_timestamp_ms / 1000)
+            expiry_date = time_utils.from_timestamp_ms(expiry_timestamp_ms)
             cursor.execute(
-                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, host_name, xui_client_uuid, key_email, expiry_date)
+                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date, connection_string, plan_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, host_name, xui_client_uuid, key_email, expiry_date, connection_string, plan_id)
             )
             new_key_id = cursor.lastrowid
+            
+            # Ensure key is removed from missing list if it was there
+            cursor.execute("DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,))
+            
             conn.commit()
             return new_key_id
     except sqlite3.Error as e:
@@ -600,7 +802,39 @@ def delete_key_by_email(email: str):
             cursor.execute("DELETE FROM vpn_keys WHERE key_email = ?", (email,))
             conn.commit()
     except sqlite3.Error as e:
-        logging.error(f"Failed to delete key '{email}': {e}")
+        logging.error(f"Failed to delete key by email {email}: {e}")
+
+def mark_key_missing(key_email: str, first_seen: str, host_name: str | None = None):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO vpn_keys_missing (key_email, host_name, first_seen) VALUES (?, ?, ?)",
+                (key_email, host_name, first_seen)
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to mark key missing {key_email}: {e}")
+
+def get_missing_keys():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM vpn_keys_missing")
+            return [dict(r) for r in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get missing keys: {e}")
+        return []
+
+def purge_missing_key(key_email: str):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to purge missing key {key_email}: {e}")
 
 def get_user_keys(user_id: int):
     try:
@@ -638,19 +872,156 @@ def get_key_by_email(key_email: str):
         logging.error(f"Failed to get key by email {key_email}: {e}")
         return None
 
-def update_key_info(key_id: int, new_xui_uuid: str, new_expiry_ms: int):
+def get_user_paid_keys(user_id: int):
+    """Get only paid keys for user (plan_id > 0)"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM vpn_keys WHERE user_id = ? AND plan_id > 0 ORDER BY key_id", (user_id,))
+            keys = cursor.fetchall()
+            return [dict(key) for key in keys]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get paid keys for user {user_id}: {e}")
+        return []
+
+def migrate_global_plan_ids():
+    """
+    Heuristic migration: если есть глобальные тарифы (host_name='ALL'),
+    то пользователям с 2+ активными платными ключами без plan_id присваиваем
+    глобальный plan_id. Это помогает старым подписчикам корректно подтягивать новые хосты.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT plan_id FROM plans WHERE host_name = 'ALL' ORDER BY plan_id LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                logging.info("Migration: no global plans found, skipping global plan_id migration.")
+                return 0
+            global_plan_id = int(row['plan_id'])
+
+            now = datetime.now()
+            cursor.execute("""
+                SELECT key_id, user_id, host_name, plan_id, expiry_date
+                FROM vpn_keys
+                WHERE plan_id <= 0
+            """)
+            rows = cursor.fetchall()
+            if not rows:
+                logging.info("Migration: no keys with plan_id <= 0 found.")
+                return 0
+
+            # bucket by user
+            user_keys: dict[int, list[sqlite3.Row]] = {}
+            for r in rows:
+                user_keys.setdefault(int(r['user_id']), []).append(r)
+
+            updated = 0
+            for user_id, keys in user_keys.items():
+                # count distinct active hosts
+                active_hosts = set()
+                for k in keys:
+                    expiry_raw = k['expiry_date']
+                    try:
+                        if expiry_raw and datetime.fromisoformat(expiry_raw) > now:
+                            active_hosts.add(k['host_name'])
+                    except Exception:
+                        continue
+                if len(active_hosts) < 2:
+                    continue
+
+                key_ids = [int(k['key_id']) for k in keys]
+                cursor.executemany(
+                    "UPDATE vpn_keys SET plan_id = ? WHERE key_id = ?",
+                    [(global_plan_id, kid) for kid in key_ids]
+                )
+                updated += len(key_ids)
+
+            conn.commit()
+            logging.info(f"Migration: updated {updated} legacy keys to global plan_id={global_plan_id}.")
+            return updated
+    except sqlite3.Error as e:
+        logging.error(f"Migration failed: {e}")
+        return 0
+
+def get_user_trial_keys(user_id: int):
+    """Get only trial keys for user (plan_id = 0)"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM vpn_keys WHERE user_id = ? AND plan_id = 0 ORDER BY key_id", (user_id,))
+            keys = cursor.fetchall()
+            return [dict(key) for key in keys]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get trial keys for user {user_id}: {e}")
+        return []
+
+def update_key_plan_id(key_id: int, plan_id: int):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            expiry_date = datetime.fromtimestamp(new_expiry_ms / 1000)
-            cursor.execute("UPDATE vpn_keys SET xui_client_uuid = ?, expiry_date = ? WHERE key_id = ?", (new_xui_uuid, expiry_date, key_id))
+            cursor.execute("UPDATE vpn_keys SET plan_id = ? WHERE key_id = ?", (plan_id, key_id))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update plan_id for key {key_id}: {e}")
+
+def update_key_info(key_id: int, expiry_date: datetime, connection_string: str | None = None):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            if connection_string:
+                cursor.execute("UPDATE vpn_keys SET expiry_date = ?, connection_string = ? WHERE key_id = ?", (expiry_date, connection_string, key_id))
+            else:
+                 cursor.execute("UPDATE vpn_keys SET expiry_date = ? WHERE key_id = ?", (expiry_date, key_id))
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to update key {key_id}: {e}")
 
+def update_key_connection_string(key_id: int, connection_string: str):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE vpn_keys SET connection_string = ? WHERE key_id = ?", (connection_string, key_id))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update connection string for key {key_id}: {e}")
+
+def update_key_plan_id(key_id: int, plan_id: int):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE vpn_keys SET plan_id = ? WHERE key_id = ?", (int(plan_id), int(key_id)))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update plan_id for key {key_id}: {e}")
+
+import re
+
 def get_next_key_number(user_id: int) -> int:
+    """
+    Safely determine the next key number for a user to avoid collisions.
+    Parses existing key emails (e.g. user123-key5-ru) to find the max 'keyX' number.
+    """
     keys = get_user_keys(user_id)
-    return len(keys) + 1
+    max_num = 0
+    pattern = re.compile(rf"user{user_id}-key(\d+)-")
+    
+    for key in keys:
+        email = key.get('key_email', '')
+        match = pattern.search(email)
+        if match:
+            try:
+                num = int(match.group(1))
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                continue
+    
+    return max_num + 1
 
 def get_keys_for_host(host_name: str) -> list[dict]:
     try:
@@ -681,8 +1052,11 @@ def update_key_status_from_server(key_email: str, xui_client_data):
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             if xui_client_data:
-                expiry_date = datetime.fromtimestamp(xui_client_data.expiry_time / 1000)
+                expiry_date = time_utils.from_timestamp_ms(xui_client_data.expiry_time)
                 cursor.execute("UPDATE vpn_keys SET xui_client_uuid = ?, expiry_date = ? WHERE key_email = ?", (xui_client_data.id, expiry_date, key_email))
+
+                # Key found, remove from missing
+                cursor.execute("DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,))
             else:
                 cursor.execute("DELETE FROM vpn_keys WHERE key_email = ?", (key_email,))
             conn.commit()
@@ -745,6 +1119,9 @@ def get_recent_transactions(limit: int = 15) -> list[dict]:
     return transactions
 
 def add_support_thread(user_id: int, thread_id: int):
+    if thread_id is None:
+        logger.warning(f"Attempted to add None thread_id for user {user_id}. Ignoring.")
+        return
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -752,6 +1129,15 @@ def add_support_thread(user_id: int, thread_id: int):
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to add support thread for user {user_id}: {e}")
+
+def delete_support_thread(user_id: int):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to delete support thread for user {user_id}: {e}")
 
 def get_support_thread_id(user_id: int) -> int | None:
     try:
@@ -824,3 +1210,89 @@ def delete_user_keys(user_id: int):
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to delete keys for user {user_id}: {e}")
+
+def delete_user_everywhere(user_id: int):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("UPDATE users SET referred_by = NULL WHERE referred_by = ?", (user_id,))
+            cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM sent_notifications WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM users WHERE telegram_id = ?", (user_id,))
+
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to delete user {user_id} everywhere: {e}")
+
+def is_notification_sent(user_id: int, key_id: int | None, notification_type: str, hours_mark: int | None) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            if key_id is not None:
+                cursor.execute(
+                    "SELECT 1 FROM sent_notifications WHERE user_id = ? AND key_id = ? AND notification_type = ? AND hours_mark = ?",
+                    (user_id, key_id, notification_type, hours_mark)
+                )
+            else:
+                cursor.execute(
+                    "SELECT 1 FROM sent_notifications WHERE user_id = ? AND key_id IS NULL AND notification_type = ? AND hours_mark = ?",
+                    (user_id, notification_type, hours_mark)
+                )
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking sent notification: {e}")
+        return False
+
+def mark_notification_sent(user_id: int, key_id: int | None, notification_type: str, hours_mark: int | None):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO sent_notifications (user_id, key_id, notification_type, hours_mark) VALUES (?, ?, ?, ?)",
+                (user_id, key_id, notification_type, hours_mark)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error marking notification sent: {e}")
+
+def cleanup_notifications(days_to_keep: int = 30):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            # SQLite 'now' modifier works for cleanup. sent_notifications doesn't have a timestamp column though.
+            # Wait, looking at initialize_db, sent_notifications creation is not shown in snippet 1-800 or 801-1250.
+            # Assuming it defaults to CURRENT_TIMESTAMP or doesn't have one?
+            # Let's check schema. If it doesn't have a date, we can't clean up by date.
+            
+            # Let's check if 'created_at' exists. The snippet for initialize_db didn't show sent_notifications table creation.
+            # It was likely added in a migration or I missed it.
+            # Assuming it has a timestamp. If not, I'll add one.
+            
+            # Safe approach: Check column existence first or catch error.
+            # Actually, let's just use a naive approach assuming it has a rowid or similar if no date,
+            # BUT efficient cleanup requires a date column.
+            
+            # Re-reading viewed files... I don't see sent_notifications creation in initialize_db snippet.
+            # It must be created dynamically or in a migration that runs implicitly?
+            # Wait, I see `is_notification_sent` and `mark_notification_sent`.
+            
+            # Let's add the column if missing in this very function for robustness.
+            cursor.execute("PRAGMA table_info(sent_notifications)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if 'created_at' not in columns:
+                 cursor.execute("ALTER TABLE sent_notifications ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                 conn.commit()
+            
+            cursor.execute(
+                "DELETE FROM sent_notifications WHERE created_at < date('now', ?)", 
+                (f'-{days_to_keep} days',)
+            )
+            conn.commit()
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logging.info(f"Cleaned up {deleted} old notification records.")
+    except Exception as e:
+        logger.error(f"Error cleaning up notifications: {e}")

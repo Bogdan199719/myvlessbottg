@@ -12,10 +12,28 @@ build/
 dist/
 *.egg-info/
 
+# Databases
 *.db
+*.db*
+*.sqlite
+*.sqlite3
 
+# Logs
+logs.txt
+*.log
+
+# Environment Variables & Secrets
+.env
+.env.*
+
+# IDEs
 .idea/
 .vscode/
 *.DS_Store
 
+# Misc
+*.bak*
 test
+Setting
+Table
+The

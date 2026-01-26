@@ -2,6 +2,10 @@ import logging
 import threading
 import asyncio
 import signal
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from shop_bot.webhook_server.app import create_webhook_app
 from shop_bot.data_manager.scheduler import periodic_subscription_check
@@ -38,7 +42,12 @@ def main():
         flask_app.config['EVENT_LOOP'] = loop
         
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(shutdown(sig, loop)))
+            try:
+                loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(shutdown(sig, loop)))
+            except NotImplementedError:
+                # Windows ProactorEventLoop does not support add_signal_handler
+                logger.warning("Signal handlers are not supported on this platform/event loop.")
+                break
         
         flask_thread = threading.Thread(
             target=lambda: flask_app.run(host='0.0.0.0', port=1488, use_reloader=False, debug=False),

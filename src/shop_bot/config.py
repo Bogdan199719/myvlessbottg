@@ -23,8 +23,8 @@ def get_key_info_text(key_number, expiry_date, created_date, connection_string):
     
     return (
         f"<b>🔑 Информация о ключе #{key_number}</b>\n\n"
-        f"<b>➕ Приобретён:</b> {created_formatted}\n"
-        f"<b>⏳ Действителен до:</b> {expiry_formatted}\n\n"
+        f"<b>➕ Приобретён:</b> {created_formatted} (МСК)\n"
+        f"<b>⏳ Действителен до:</b> {expiry_formatted} (МСК)\n\n"
         f"<code>{connection_string}</code>"
     )
 

@@ -8,71 +8,139 @@
 		<section class="settings-section">
 			<h2>Управление Хостами (Серверами)</h2>
 
+			<div class="host-card" style="border: 2px solid #ff9800;">
+				<div class="host-header">
+					<h3>🌍 Глобальные тарифы (Все серверы + Подписка)</h3>
+					<form action="{{ url_for('toggle_global_plans_route') }}" method="post">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						{% if settings.enable_global_plans == 'true' %}
+						<button type="submit" class="button button-warning button-small" title="Отключить">⏸️</button>
+						{% else %}
+						<button type="submit" class="button button-success button-small" title="Включить">▶️</button>
+						{% endif %}
+					</form>
+				</div>
+				<p>Тарифы, действующие для всех серверов сразу. Пользователь получает ссылку-подписку.</p>
+				<div class="plans-section">
+					<h4>Тарифы:</h4>
+					{% if global_plans %}
+					<ul class="plan-list">
+						{% for plan in global_plans %}
+						<li>
+							<span>
+								{{ plan.plan_name }} - {{ plan.price|round(0) }} RUB
+							</span>
+							<form action="{{ url_for('delete_plan_route', plan_id=plan.plan_id) }}" method="post"
+								data-confirm="Вы уверены, что хотите удалить этот тариф?">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-danger button-tiny">
+									×
+								</button>
+							</form>
+						</li>
+						{% endfor %}
+					</ul>
+					{% else %}
+					<p>Глобальные тарифы не добавлены.</p>
+					{% endif %}
+					<h5>Добавить новый глобальный тариф:</h5>
+					<form action="{{ url_for('add_plan_route') }}" method="post" class="form-inline">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<input type="hidden" name="host_name" value="ALL" />
+						<input type="text" name="plan_name" placeholder="Название" required />
+						<input type="number" name="months" placeholder="Мес." required />
+						<input type="number" step="0.01" name="price" placeholder="Цена" required />
+						<button type="submit" class="button button-primary button-small">
+							+
+						</button>
+					</form>
+				</div>
+			</div>
+
 			<div class="host-card">
-				<h4>Добавить новый хост</h4>
-				<form action="{{ url_for('add_host_route') }}" method="post">
+				<h4>{% if edit_host %}Редактировать хост{% else %}Добавить новый хост{% endif %}</h4>
+				<form action="{{ url_for('update_host_route') if edit_host else url_for('add_host_route') }}"
+					method="post">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					{% if edit_host %}
+					<input type="hidden" name="old_host_name" value="{{ edit_host.host_name }}">
+					{% endif %}
 					<div class="form-group">
 						<label for="host_name">Название хоста:</label>
-						<input
-							type="text"
-							id="host_name"
-							name="host_name"
-							required
-							maxlength="26"
-						/>
+						<input type="text" id="host_name" name="host_name" required maxlength="26"
+							value="{{ edit_host.host_name if edit_host else '' }}" />
 					</div>
 					<div class="form-group">
 						<label for="host_url">URL панели XUI:</label>
-						<input
-							type="url"
-							id="host_url"
-							name="host_url"
-							placeholder="http://123.45.67.89:54321"
-							required
-						/>
+						<input type="url" id="host_url" name="host_url" placeholder="http://123.45.67.89:54321" required
+							value="{{ edit_host.host_url if edit_host else '' }}" />
 					</div>
 					<div class="form-group">
 						<label for="host_username">Логин XUI:</label>
-						<input
-							type="text"
-							id="host_username"
-							name="host_username"
-							required
-						/>
+						<input type="text" id="host_username" name="host_username" required
+							value="{{ edit_host.host_username if edit_host else '' }}" />
 					</div>
 					<div class="form-group password-wrapper">
-						<label for="host_pass">Пароль XUI:</label>
-						<input type="password" id="host_pass" name="host_pass" required />
+						<label for="host_pass">Пароль XUI {% if edit_host %}(оставьте пустым, чтобы не менять){% endif
+							%}:</label>
+						<input type="password" id="host_pass" name="host_pass" {% if not edit_host %}required{% endif
+							%} />
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
 					<div class="form-group">
 						<label for="host_inbound_id">ID входящего подключения:</label>
-						<input
-							type="number"
-							id="host_inbound_id"
-							name="host_inbound_id"
-							required
-						/>
+						<input type="number" id="host_inbound_id" name="host_inbound_id" required
+							value="{{ edit_host.host_inbound_id if edit_host else '' }}" />
 					</div>
-					<button type="submit" class="button button-primary">Добавить</button>
+					<button type="submit" class="button button-primary">{% if edit_host %}Сохранить изменения{% else
+						%}Добавить{% endif %}</button>
+					{% if edit_host %}
+					<a href="{{ url_for('settings_page') }}" class="button button-secondary">Отмена</a>
+					{% endif %}
 				</form>
 			</div>
 
 			{% if hosts %} {% for host in hosts %}
 			<div class="host-card">
 				<div class="host-header">
-					<h3>{{ host.host_name }}</h3>
-					<form
-						action="{{ url_for('delete_host_route', host_name=host.host_name) }}"
-						method="post"
-						data-confirm="Вы уверены, что хотите удалить этот хост и все его тарифы?"
-					>
-						<button type="submit" class="button button-danger button-small">
-							Удалить
-						</button>
-					</form>
+					<h3>
+						{{ host.host_name }}
+						<span
+							class="status-badge {% if host.is_enabled %}status-active{% else %}status-stopped{% endif %}"
+							style="margin-left: 10px; font-size: 0.7em;">
+							{% if host.is_enabled %}Активен{% else %}Отключен{% endif %}
+						</span>
+					</h3>
+					<div class="host-actions" style="display: flex; gap: 5px;">
+						<form action="{{ url_for('toggle_host_route', host_name=host.host_name) }}" method="post">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							{% if host.is_enabled %}
+							<button type="submit" class="button button-warning button-small"
+								title="Отключить">⏸️</button>
+							{% else %}
+							<button type="submit" class="button button-success button-small"
+								title="Включить">▶️</button>
+							{% endif %}
+						</form>
+
+						<form action="{{ url_for('edit_host_page', host_name=host.host_name) }}" method="get">
+							<button type="submit" class="button button-primary button-small"
+								title="Редактировать">✏️</button>
+						</form>
+
+						<form action="{{ url_for('delete_host_route', host_name=host.host_name) }}" method="post"
+							data-confirm="Вы уверены, что хотите удалить этот хост и все его тарифы?">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<button type="submit" class="button button-danger button-small" title="Удалить">
+								🗑️
+							</button>
+						</form>
+					</div>
 				</div>
-				<p><strong>URL:</strong> {{ host.host_url }}</p>
+				<p><strong>URL:</strong> {{ host.host_url }}
+					{% if not host.is_enabled %} <span style="color: red; font-weight: bold;">(ОТКЛЮЧЕН)</span>{% endif
+					%}
+				</p>
 				<div class="plans-section">
 					<h4>Тарифы:</h4>
 					{% if host.plans %}
@@ -82,10 +150,9 @@
 							<span>
 								{{ plan.plan_name }} - {{ plan.price|round(0) }} RUB
 							</span>
-							<form
-								action="{{ url_for('delete_plan_route', plan_id=plan.plan_id) }}"
-								method="post"
-							>
+							<form action="{{ url_for('delete_plan_route', plan_id=plan.plan_id) }}" method="post"
+								data-confirm="Вы уверены, что хотите удалить этот тариф?">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<button type="submit" class="button button-danger button-tiny">
 									×
 								</button>
@@ -97,30 +164,12 @@
 					<p>Тарифы не добавлены.</p>
 					{% endif %}
 					<h5>Добавить новый тариф:</h5>
-					<form
-						action="{{ url_for('add_plan_route') }}"
-						method="post"
-						class="form-inline"
-					>
-						<input
-							type="hidden"
-							name="host_name"
-							value="{{ host.host_name }}"
-						/>
-						<input
-							type="text"
-							name="plan_name"
-							placeholder="Название"
-							required
-						/>
+					<form action="{{ url_for('add_plan_route') }}" method="post" class="form-inline">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<input type="hidden" name="host_name" value="{{ host.host_name }}" />
+						<input type="text" name="plan_name" placeholder="Название" required />
 						<input type="number" name="months" placeholder="Мес." required />
-						<input
-							type="number"
-							step="0.01"
-							name="price"
-							placeholder="Цена"
-							required
-						/>
+						<input type="number" step="0.01" name="price" placeholder="Цена" required />
 						<button type="submit" class="button button-primary button-small">
 							+
 						</button>
@@ -134,23 +183,46 @@
 	</div>
 
 	<div class="settings-column-right">
+		<section class="settings-section backup-card">
+			<div class="backup-header">
+				<div>
+					<h2>Резервное копирование</h2>
+					<p>Полный бэкап (БД, настройки, .env) и восстановление в один клик.</p>
+				</div>
+				<span class="chip chip-safe">Безопасно</span>
+			</div>
+
+			<div class="backup-actions">
+				<form id="backup-form" action="{{ url_for('backup_route') }}" method="post">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					<button type="submit" class="button button-primary button-wide">⬇️ Скачать бэкап</button>
+				</form>
+
+				<form action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data"
+					class="import-form">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					<label class="file-drop">
+						<input type="file" id="backup_file" name="backup_file" accept=".zip" required />
+						<span>Перетащите .zip сюда или нажмите для выбора</span>
+					</label>
+					<p class="warning-text">Импорт остановит ботов, заменит всю базу и .env. Продолжайте только если
+						уверены.</p>
+					<button type="submit" class="button button-danger button-wide">⬆️ Импортировать бэкап</button>
+				</form>
+			</div>
+		</section>
+
 		<form action="{{ url_for('settings_page') }}" method="post">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 			<section class="settings-section">
 				<h2>Настройки Панели</h2>
 				<div class="form-group">
 					<label for="panel_login">Логин для входа в панель:</label>
-					<input
-						type="text"
-						id="panel_login"
-						name="panel_login"
-						value="{{ settings.panel_login or '' }}"
-						required
-					/>
+					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}"
+						required />
 				</div>
 				<div class="form-group password-wrapper">
-					<label for="panel_password"
-						>Новый пароль (оставьте пустым, чтобы не менять):</label
-					>
+					<label for="panel_password">Новый пароль (оставьте пустым, чтобы не менять):</label>
 					<input type="password" id="panel_password" name="panel_password" />
 					<button type="button" class="toggle-password">👁️</button>
 				</div>
@@ -160,231 +232,245 @@
 				<h2>Настройка Бота</h2>
 				<div class="form-group password-wrapper">
 					<label for="telegram_bot_token">Токен бота:</label>
-					<input
-						type="password"
-						id="telegram_bot_token"
-						name="telegram_bot_token"
-						value="{{ settings.telegram_bot_token or '' }}"
-						required
-					/>
+					<input type="password" id="telegram_bot_token" name="telegram_bot_token"
+						value="{{ settings.telegram_bot_token or '' }}" required />
+					<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
 					<button type="button" class="toggle-password">👁️</button>
 				</div>
 				<div class="form-group">
 					<label for="telegram_bot_username">Username бота (без @):</label>
-					<input
-						type="text"
-						id="telegram_bot_username"
-						name="telegram_bot_username"
-						value="{{ settings.telegram_bot_username or '' }}"
-						required
-					/>
+					<input type="text" id="telegram_bot_username" name="telegram_bot_username"
+						value="{{ settings.telegram_bot_username or '' }}" required />
 				</div>
 				<div class="form-group">
-					<label for="admin_telegram_id">Telegram ID Администратора:</label>
-					<input
-						type="text"
-						id="admin_telegram_id"
-						name="admin_telegram_id"
-						value="{{ settings.admin_telegram_id or '' }}"
-						required
-					/>
+					<input type="text" id="admin_telegram_id" name="admin_telegram_id"
+						value="{{ settings.admin_telegram_id or '' }}" required />
+				</div>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="enable_admin_payment_notifications" value="false" />
+					<input type="checkbox" id="enable_admin_payment_notifications"
+						name="enable_admin_payment_notifications" value="true" {% if
+						settings.enable_admin_payment_notifications=='true' %}checked{% endif %}>
+					<label for="enable_admin_payment_notifications">Включить уведомления о покупках</label>
+				</div>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="email_prompt_enabled" value="false" />
+					<input type="checkbox" id="email_prompt_enabled" name="email_prompt_enabled" value="true" {% if
+						settings.email_prompt_enabled=='true' %}checked{% endif %}>
+					<label for="email_prompt_enabled">Спрашивать Email перед оплатой</label>
+				</div>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="enable_admin_trial_notifications" value="false" />
+					<input type="checkbox" id="enable_admin_trial_notifications" name="enable_admin_trial_notifications"
+						value="true" {% if settings.enable_admin_trial_notifications=='true' %}checked{% endif %}>
+					<label for="enable_admin_trial_notifications">Включить уведомления о пробных ключах</label>
 				</div>
 			</section>
 			<section class="settings-section">
 				<h2>Настройки Поддержки и Бота-Саппорта</h2>
 				<div class="form-group">
 					<label for="support_user">URL поддержки или Бота-Саппорта:</label>
-					<input
-						type="text"
-						id="support_user"
-						name="support_user"
-						value="{{ settings.support_user or '' }}"
-					/>
+					<input type="text" id="support_user" name="support_user"
+						value="{{ settings.support_user or '' }}" />
 				</div>
 				<div class="form-group password-wrapper">
-					<label for="support_bot_token"
-						>Токен Support-бота (если используется):</label
-					>
-					<input
-						type="password"
-						id="support_bot_token"
-						name="support_bot_token"
-						value="{{ settings.support_bot_token or '' }}"
-					/>
+					<label for="support_bot_token">Токен Support-бота (если используется):</label>
+					<input type="password" id="support_bot_token" name="support_bot_token"
+						value="{{ settings.support_bot_token or '' }}" />
+					<button type="button" class="copy-button" data-copy-target="support_bot_token">📋</button>
 					<button type="button" class="toggle-password">👁️</button>
 				</div>
 				<div class="form-group">
-					<label for="support_group_id"
-						>ID Группы поддержки (должна быть включена функция форума
-						(Topics)):</label
-					>
-					<input
-						type="text"
-						id="support_group_id"
-						name="support_group_id"
-						value="{{ settings.support_group_id or '' }}"
-					/>
+					<label for="support_group_id">ID Группы поддержки (должна быть включена функция форума
+						(Topics)):</label>
+					<input type="text" id="support_group_id" name="support_group_id"
+						value="{{ settings.support_group_id or '' }}" />
 				</div>
 			</section>
 			<section class="settings-section">
 				<h2>Настройки Реферальной программы</h2>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_referrals" value="false" />
-					<input type="checkbox" id="enable_referrals" name="enable_referrals"
-					value="true" {% if settings.enable_referrals == 'true' %}checked{%
-					endif %}>
+					<input type="checkbox" id="enable_referrals" name="enable_referrals" value="true" {% if
+						settings.enable_referrals=='true' %}checked{% endif %}>
 					<label for="enable_referrals">Включить реферальную систему</label>
 				</div>
 				<div class="form-group">
 					<label for="minimum_withdrawal">Минимальная сумма для вывода:</label>
-					<input
-						type="number"
-						id="minimum_withdrawal"
-						name="minimum_withdrawal"
-						value="{{ settings.minimum_withdrawal or '10' }}"
-					/>
+					<input type="number" id="minimum_withdrawal" name="minimum_withdrawal"
+						value="{{ settings.minimum_withdrawal or '10' }}" />
 				</div>
 				<div class="form-group">
-					<label for="referral_percentage"
-						>Процент вознаграждения пригласившему (%):</label
-					>
-					<input
-						type="number"
-						id="referral_percentage"
-						name="referral_percentage"
-						value="{{ settings.referral_percentage or '10' }}"
-					/>
+					<label for="referral_percentage">Процент вознаграждения пригласившему (%):</label>
+					<input type="number" id="referral_percentage" name="referral_percentage"
+						value="{{ settings.referral_percentage or '10' }}" />
 				</div>
 				<div class="form-group">
-					<label for="referral_discount"
-						>Скидка для нового пользователя на первую покупку (%):</label
-					>
-					<input
-						type="number"
-						id="referral_discount"
-						name="referral_discount"
-						value="{{ settings.referral_discount or '5' }}"
-					/>
+					<label for="referral_discount">Скидка для нового пользователя на первую покупку (%):</label>
+					<input type="number" id="referral_discount" name="referral_discount"
+						value="{{ settings.referral_discount or '5' }}" />
 				</div>
 			</section>
 			<section class="settings-section">
 				<h2>Настройки Пробного периода</h2>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="trial_enabled" value="false" />
-					<input type="checkbox" id="trial_enabled" name="trial_enabled"
-					value="true" {% if settings.trial_enabled == 'true' %}checked{% endif
-					%}>
+					<input type="checkbox" id="trial_enabled" name="trial_enabled" value="true" {% if
+						settings.trial_enabled=='true' %}checked{% endif %}>
 					<label for="trial_enabled">Включить пробный период</label>
 				</div>
 				<div class="form-group">
-					<label for="trial_duration_days"
-						>Длительность пробного периода (в днях):</label
-					>
-					<input
-						type="number"
-						id="trial_duration_days"
-						name="trial_duration_days"
-						value="{{ settings.trial_duration_days or '3' }}"
-					/>
+					<label for="trial_duration_days">Длительность пробного периода (в днях):</label>
+					<input type="number" id="trial_duration_days" name="trial_duration_days"
+						value="{{ settings.trial_duration_days or '3' }}" />
 				</div>
 			</section>
 			<section class="settings-section">
 				<h2>Настройки Платежных Систем</h2>
 				<h2>Настройка YooKassa</h2>
-				<div class="form-group">
-					<label for="receipt_email">Почта для чеков:</label>
-					<input
-						type="text"
-						id="receipt_email"
-						name="receipt_email"
-						value="{{ settings.receipt_email or '' }}"
-					/>
-				</div>
-				<div class="form-group">
-					<label for="yookassa_shop_id">YooKassa Shop ID:</label>
-					<input
-						type="text"
-						id="yookassa_shop_id"
-						name="yookassa_shop_id"
-						value="{{ settings.yookassa_shop_id or '' }}"
-					/>
-				</div>
-				<div class="form-group password-wrapper">
-					<label for="yookassa_secret_key">YooKassa Secret Key:</label>
-					<input
-						type="password"
-						id="yookassa_secret_key"
-						name="yookassa_secret_key"
-						value="{{ settings.yookassa_secret_key or '' }}"
-					/>
-					<button type="button" class="toggle-password">👁️</button>
-				</div>
 				<div class="form-group form-group-checkbox">
-					<input type="hidden" name="sbp_enabled" value="false" />
-					<input type="checkbox" id="sbp_enabled" name="sbp_enabled"
-					value="true" {% if settings.sbp_enabled == 'true' %}checked{% endif
-					%}>
-					<label for="sbp_enabled">Включить оплату через СБП</label>
+					<input type="hidden" name="yookassa_enabled" value="false" />
+					<input type="checkbox" id="yookassa_enabled" name="yookassa_enabled" value="true" {% if
+						settings.yookassa_enabled=='true' %}checked{% endif %}>
+					<label for="yookassa_enabled">Включить оплату YooKassa</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="yookassa_enabled">
+					<div class="form-group">
+						<label for="receipt_email">Почта для чеков:</label>
+						<input type="text" id="receipt_email" name="receipt_email"
+							value="{{ settings.receipt_email or '' }}" />
+					</div>
+					<div class="form-group">
+						<label for="yookassa_shop_id">YooKassa Shop ID:</label>
+						<input type="text" id="yookassa_shop_id" name="yookassa_shop_id"
+							value="{{ settings.yookassa_shop_id or '' }}" />
+					</div>
+					<div class="form-group password-wrapper">
+						<label for="yookassa_secret_key">YooKassa Secret Key:</label>
+						<input type="password" id="yookassa_secret_key" name="yookassa_secret_key"
+							value="{{ settings.yookassa_secret_key or '' }}" />
+						<button type="button" class="copy-button" data-copy-target="yookassa_secret_key">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
+					<div class="form-group form-group-checkbox">
+						<input type="hidden" name="sbp_enabled" value="false" />
+						<input type="checkbox" id="sbp_enabled" name="sbp_enabled" value="true" {% if
+							settings.sbp_enabled=='true' %}checked{% endif %}>
+						<label for="sbp_enabled">Включить оплату через СБП</label>
+					</div>
+				</div>
+
+				<h2>Настройка P2P</h2>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="p2p_enabled" value="false" />
+					<input type="checkbox" id="p2p_enabled" name="p2p_enabled" value="true" {% if
+						settings.p2p_enabled=='true' %}checked{% endif %}>
+					<label for="p2p_enabled">Включить оплату по карте (P2P)</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="p2p_enabled">
+					<div class="form-group">
+						<label for="p2p_card_number">Карта/реквизиты для P2P оплаты:</label>
+						<input type="text" id="p2p_card_number" name="p2p_card_number"
+							value="{{ settings.p2p_card_number or '' }}"
+							placeholder="Например: 5536 9137 23XX 4567, Иван Иванов" />
+					</div>
+				</div>
+				<h2>Настройка Telegram Stars</h2>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="stars_enabled" value="false" />
+					<input type="checkbox" id="stars_enabled" name="stars_enabled" value="true" {% if
+						settings.stars_enabled=='true' %}checked{% endif %}>
+					<label for="stars_enabled">Включить оплату Telegram Stars</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="stars_enabled">
+					<div class="form-group">
+						<label for="stars_rub_per_star">Курс (RUB за 1 Star):</label>
+						<input type="number" step="0.01" id="stars_rub_per_star" name="stars_rub_per_star"
+							value="{{ settings.stars_rub_per_star or '2.5' }}" />
+						<small style="color: #666; display: block; margin-top: 4px;">Рекомендуемый курс: 1.6-2.5 RUB.
+							Оставьте 0 для автоматического курса (1.6 RUB).</small>
+					</div>
 				</div>
 				<h2>Настройка CryptoBot</h2>
-				<div class="form-group password-wrapper">
-					<label for="cryptobot_token">CryptoBot Token:</label>
-					<input
-						type="password"
-						id="cryptobot_token"
-						name="cryptobot_token"
-						value="{{ settings.cryptobot_token or '' }}"
-					/>
-					<button type="button" class="toggle-password">👁️</button>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="cryptobot_enabled" value="false" />
+					<input type="checkbox" id="cryptobot_enabled" name="cryptobot_enabled" value="true" {% if
+						settings.cryptobot_enabled=='true' %}checked{% endif %}>
+					<label for="cryptobot_enabled">Включить оплату CryptoBot</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="cryptobot_enabled">
+					<div class="form-group password-wrapper">
+						<label for="cryptobot_token">CryptoBot Token:</label>
+						<input type="password" id="cryptobot_token" name="cryptobot_token"
+							value="{{ settings.cryptobot_token or '' }}" />
+						<button type="button" class="copy-button" data-copy-target="cryptobot_token">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
+					<div class="form-group password-wrapper">
+						<label for="cryptobot_webhook_secret">CryptoBot Webhook Secret (URL token):</label>
+						<input type="password" id="cryptobot_webhook_secret" name="cryptobot_webhook_secret"
+							autocomplete="off" value="{{ settings.cryptobot_webhook_secret or '' }}"
+							placeholder="Например: my-super-secret-token" />
+						<button type="button" class="copy-button"
+							data-copy-target="cryptobot_webhook_secret">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 				</div>
 				<h2>Настройка Heleket</h2>
-				<div class="form-group">
-					<label for="heleket_merchant_id">Heleket Merchant ID:</label>
-					<input
-						type="text"
-						id="heleket_merchant_id"
-						name="heleket_merchant_id"
-						value="{{ settings.heleket_merchant_id or '' }}"
-					/>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="heleket_enabled" value="false" />
+					<input type="checkbox" id="heleket_enabled" name="heleket_enabled" value="true" {% if
+						settings.heleket_enabled=='true' %}checked{% endif %}>
+					<label for="heleket_enabled">Включить оплату Heleket (Криптовалюта)</label>
 				</div>
-				<div class="form-group password-wrapper">
-					<label for="heleket_api_key">Heleket API Key:</label>
-					<input
-						type="password"
-						id="heleket_api_key"
-						name="heleket_api_key"
-						value="{{ settings.heleket_api_key or '' }}"
-					/>
-					<button type="button" class="toggle-password">👁️</button>
+				<div class="toggle-section" data-toggle-section="heleket_enabled">
+					<div class="form-group">
+						<label for="heleket_merchant_id">Heleket Merchant ID:</label>
+						<input type="text" id="heleket_merchant_id" name="heleket_merchant_id"
+							value="{{ settings.heleket_merchant_id or '' }}" />
+					</div>
+					<div class="form-group password-wrapper">
+						<label for="heleket_api_key">Heleket API Key:</label>
+						<input type="password" id="heleket_api_key" name="heleket_api_key"
+							value="{{ settings.heleket_api_key or '' }}" />
+						<button type="button" class="copy-button" data-copy-target="heleket_api_key">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 				</div>
 				<div class="form-group">
 					<label for="domain">Ваш домен (например, my-shop.com):</label>
-					<input
-						type="text"
-						id="domain"
-						name="domain"
-						value="{{ settings.domain or '' }}"
-					/>
+					<input type="text" id="domain" name="domain" value="{{ settings.domain or '' }}"
+						placeholder="IP адрес сервера (напр. 45.12.34.56) или Домен" />
+					<small style="color: #666; display: block; margin-top: 4px;">Укажите IP-адрес этого сервера, где
+						установлен бот.</small>
+				</div>
+				<div class="form-group">
+					<label for="subscription_name">Название подписки (в приложении):</label>
+					<input type="text" id="subscription_name" name="subscription_name"
+						value="{{ settings.subscription_name or 'AresVPN' }}" placeholder="Например: AresVPN" />
+					<small style="color: #666; display: block; margin-top: 4px;">Это имя будет отображаться при импорте
+						подписки.</small>
 				</div>
 				<h2>Настройка TonConnect</h2>
-				<div class="form-group">
-					<label for="ton_wallet_address">Ton Wallet:</label>
-					<input
-						type="text"
-						id="ton_wallet_address"
-						name="ton_wallet_address"
-						value="{{ settings.ton_wallet_address or '' }}"
-					/>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="tonconnect_enabled" value="false" />
+					<input type="checkbox" id="tonconnect_enabled" name="tonconnect_enabled" value="true" {% if
+						settings.tonconnect_enabled=='true' %}checked{% endif %}>
+					<label for="tonconnect_enabled">Включить оплату TON Connect</label>
 				</div>
-				<div class="form-group password-wrapper">
-					<label for="tonapi_key">TonAPI Key:</label>
-					<input
-						type="password"
-						id="tonapi_key"
-						name="tonapi_key"
-						value="{{ settings.tonapi_key or '' }}"
-					/>
-					<button type="button" class="toggle-password">👁️</button>
+				<div class="toggle-section" data-toggle-section="tonconnect_enabled">
+					<div class="form-group">
+						<label for="ton_wallet_address">Ton Wallet:</label>
+						<input type="text" id="ton_wallet_address" name="ton_wallet_address"
+							value="{{ settings.ton_wallet_address or '' }}" />
+					</div>
+					<div class="form-group password-wrapper">
+						<label for="tonapi_key">TonAPI Key:</label>
+						<input type="password" id="tonapi_key" name="tonapi_key"
+							value="{{ settings.tonapi_key or '' }}" />
+						<button type="button" class="copy-button" data-copy-target="tonapi_key">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 				</div>
 			</section>
 
@@ -395,90 +481,32 @@
 					<textarea id="about_text" name="about_text" rows="3">
 {{
 							settings.about_text or ""
-						}}</textarea
-					>
+						}}</textarea>
 				</div>
 				<div class="form-group">
 					<label for="support_text">Текст в разделе "Поддержка":</label>
 					<textarea id="support_text" name="support_text" rows="3">
 {{
 							settings.support_text or ""
-						}}</textarea
-					>
+						}}</textarea>
 				</div>
 				<div class="form-group">
 					<label for="terms_url">URL "Условия использования":</label>
-					<input
-						type="url"
-						id="terms_url"
-						name="terms_url"
-						value="{{ settings.terms_url or '' }}"
-					/>
+					<input type="url" id="terms_url" name="terms_url" value="{{ settings.terms_url or '' }}" />
 				</div>
 				<div class="form-group">
 					<label for="privacy_url">URL "Политика конфиденциальности":</label>
-					<input
-						type="url"
-						id="privacy_url"
-						name="privacy_url"
-						value="{{ settings.privacy_url or '' }}"
-					/>
+					<input type="url" id="privacy_url" name="privacy_url" value="{{ settings.privacy_url or '' }}" />
 				</div>
 				<div class="form-group">
-					<label for="channel_url"
-						>URL Telegram-канала (напр. https://t.me/nnstorenews):</label
-					>
-					<input
-						type="url"
-						id="channel_url"
-						name="channel_url"
-						value="{{ settings.channel_url or '' }}"
-					/>
+					<label for="channel_url">URL Telegram-канала (напр. https://t.me/nnstorenews):</label>
+					<input type="url" id="channel_url" name="channel_url" value="{{ settings.channel_url or '' }}" />
 				</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="force_subscription" value="false" />
-					<input type="checkbox" id="force_subscription"
-					name="force_subscription" value="true" {% if
-					settings.force_subscription == 'true' %}checked{% endif %}>
-					<label for="force_subscription"
-						>Требовать обязательную подписку на канал</label
-					>
-				</div>
-			    <div class="form-group">
-					<label for="android_url">URL "Инструкция Андроид":</label>
-					<input
-						type="url"
-						id="android_url"
-						name="android_url"
-						value="{{ settings.android_url or '' }}"
-					/>
-				</div>
-				<div class="form-group">
-					<label for="ios_url">URL "Инструкция ios":</label>
-					<input
-						type="url"
-						id="ios_url"
-						name="ios_url"
-						value="{{ settings.ios_url or '' }}"
-					/>
-				</div>
-				<div class="form-group">
-					<label for="windows_url">URL "Инструкция Windows":</label>
-					<input
-						type="url"
-						id="windows_url"
-						name="windows_url"
-						value="{{ settings.windows_url or '' }}"
-					/>
-				</div>
-				<div class="form-group">
-					<label for="linux_url">URL "Инструкция Linux":</label>
-					<input
-						type="url"
-						id="linux_url"
-						name="linux_url"
-						value="{{ settings.linux_url or '' }}"
-					/>
+					<input type="checkbox" id="force_subscription" name="force_subscription" value="true" {% if
+						settings.force_subscription=='true' %}checked{% endif %}>
+					<label for="force_subscription">Требовать обязательную подписку на канал</label>
 				</div>
 			</section>
 

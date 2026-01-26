@@ -33,36 +33,49 @@
 						0 {% endif %}
 					</td>
 					<td class="actions-cell">
-						{% if user.is_banned %}
-						<form
-							action="{{ url_for('unban_user_route', user_id=user.telegram_id) }}"
-							method="post"
-						>
-							<button type="submit" class="button button-start button-small">
-								Разбанить
+						<div class="actions-wrapper">
+							<button type="button" class="button button-success button-small"
+								onclick="openIssueModal('{{ user.telegram_id }}', '{{ user.username }}')">
+								Выдать
 							</button>
-						</form>
-						{% else %}
-						<form
-							action="{{ url_for('ban_user_route', user_id=user.telegram_id) }}"
-							method="post"
-							data-confirm="Вы уверены, что хотите забанить этого пользователя? Он не сможет пользоваться ботом."
-						>
-							<button type="submit" class="button button-warning button-small">
-								Бан
-							</button>
-						</form>
-						{% endif %} {% if user.user_keys %}
-						<form
-							action="{{ url_for('revoke_keys_route', user_id=user.telegram_id) }}"
-							method="post"
-							data-confirm="ВНИМАНИЕ! Это действие удалит ВСЕ ключи пользователя с серверов. Вы уверены?"
-						>
-							<button type="submit" class="button button-danger button-small">
-								Отозвать
-							</button>
-						</form>
-						{% endif %}
+
+							{% if user.is_banned %}
+							<form action="{{ url_for('unban_user_route', user_id=user.telegram_id) }}" method="post"
+								style="display:inline;">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-start button-small">
+									Разбан
+								</button>
+							</form>
+							{% else %}
+							<form action="{{ url_for('ban_user_route', user_id=user.telegram_id) }}" method="post"
+								data-confirm="Вы уверены, что хотите забанить этого пользователя? Он не сможет пользоваться ботом."
+								style="display:inline;">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-warning button-small">
+									Бан
+								</button>
+							</form>
+							{% endif %}
+							<form action="{{ url_for('delete_user_route', user_id=user.telegram_id) }}" method="post"
+								data-confirm="ВНИМАНИЕ! Это действие полностью удалит пользователя и все его данные (включая оплаты/историю) и попытается удалить ключи с серверов. Продолжить?"
+								style="display:inline;">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-danger button-small">
+									Удалить
+								</button>
+							</form>
+							{% if user.user_keys %}
+							<form action="{{ url_for('revoke_keys_route', user_id=user.telegram_id) }}" method="post"
+								data-confirm="ВНИМАНИЕ! Это действие удалит ВСЕ ключи пользователя с серверов. Вы уверены?"
+								style="display:inline;">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-danger button-small">
+									Отозвать
+								</button>
+							</form>
+							{% endif %}
+						</div>
 					</td>
 				</tr>
 				{% endfor %}
@@ -70,5 +83,141 @@
 		</table>
 	</div>
 </section>
+
+<!-- Issue Key Modal -->
+<div id="issueKeyModal" class="modal">
+	<div class="modal-content">
+		<span class="close" onclick="closeIssueModal()">&times;</span>
+		<h2>Выдать подписку</h2>
+		<p>Пользователь: <span id="modalUsername"></span> (ID: <span id="modalUserIdDisplay"></span>)</p>
+
+		<form id="issueKeyForm" method="post" action="">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+			<div class="form-group">
+				<label for="planSelect">Выберите тариф:</label>
+				<select name="plan_id" id="planSelect" required class="form-control">
+					<option value="" disabled selected>-- Выберите тариф --</option>
+
+					{% if issuance_data.global_plans %}
+					<optgroup label="🌍 Глобальные подписки (Все серверы)">
+						{% for plan in issuance_data.global_plans %}
+						<option value="{{ plan.plan_id }}">
+							{{ plan.plan_name }} ({{ plan.months }} мес.) - {{ plan.price }}₽
+						</option>
+						{% endfor %}
+					</optgroup>
+					{% endif %}
+
+					{% for host_name, plans in issuance_data.host_plans.items() %}
+					<optgroup label="{{ host_name }}">
+						{% for plan in plans %}
+						<option value="{{ plan.plan_id }}">
+							{{ plan.plan_name }} ({{ plan.months }} мес.) - {{ plan.price }}₽
+						</option>
+						{% endfor %}
+					</optgroup>
+					{% endfor %}
+				</select>
+			</div>
+
+			<div class="form-actions">
+				<button type="submit" class="button button-success">Выдать</button>
+				<button type="button" class="button button-secondary" onclick="closeIssueModal()">Отмена</button>
+			</div>
+		</form>
+	</div>
+</div>
+
+<script>
+	function openIssueModal(userId, username) {
+		var modal = document.getElementById("issueKeyModal");
+		var form = document.getElementById("issueKeyForm");
+
+		document.getElementById("modalUsername").textContent = username ? "@" + username : "Без юзернейма";
+		document.getElementById("modalUserIdDisplay").textContent = userId;
+
+		// Set form action dynamically
+		form.action = "/users/issue-key/" + userId;
+
+		modal.style.display = "block";
+	}
+
+	function closeIssueModal() {
+		var modal = document.getElementById("issueKeyModal");
+		modal.style.display = "none";
+	}
+
+	// Close modal if clicked outside
+	window.onclick = function (event) {
+		var modal = document.getElementById("issueKeyModal");
+		if (event.target == modal) {
+			modal.style.display = "none";
+		}
+	}
+</script>
+
+<style>
+	/* Simple Modal Styles */
+	.modal {
+		display: none;
+		position: fixed;
+		z-index: 1000;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		overflow: auto;
+		background-color: rgb(0, 0, 0);
+		background-color: rgba(0, 0, 0, 0.4);
+	}
+
+	.modal-content {
+		background-color: #2c2f33;
+		/* Dark theme match */
+		color: #fff;
+		margin: 15% auto;
+		padding: 20px;
+		border: 1px solid #888;
+		width: 500px;
+		border-radius: 8px;
+		box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+	}
+
+	.close {
+		color: #aaa;
+		float: right;
+		font-size: 28px;
+		font-weight: bold;
+	}
+
+	.close:hover,
+	.close:focus {
+		color: #fff;
+		text-decoration: none;
+		cursor: pointer;
+	}
+
+	.form-group {
+		margin-bottom: 20px;
+	}
+
+	.form-control {
+		width: 100%;
+		padding: 10px;
+		border-radius: 5px;
+		border: 1px solid #444;
+		background-color: #23272a;
+		color: white;
+	}
+
+	.actions-wrapper {
+		display: flex;
+		gap: 5px;
+		flex-wrap: wrap;
+		justify-content: flex-start;
+		align-items: center;
+	}
+</style>
 
 {% endblock %}
