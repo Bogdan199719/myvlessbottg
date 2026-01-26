@@ -209,10 +209,13 @@ def create_webhook_app(bot_controller_instance):
 
     _ensure_processed_webhooks_table()
     
+    # Ensure template and static folder relative to this file's location
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
     flask_app = Flask(
         __name__,
-        template_folder='templates',
-        static_folder='static'
+        template_folder=os.path.join(base_dir, 'templates'),
+        static_folder=os.path.join(base_dir, 'static')
     )
     
     flask_app.register_blueprint(subscription_bp)

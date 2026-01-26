@@ -9,10 +9,9 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-# Use environment variable for DB path or default to a relative path
-# Assuming this file is at src/shop_bot/data_manager/database.py
-# We want the DB at the project root (3 levels up from here)
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent.parent / "users.db"
+# Use environment variable for DB path or default to the current working directory
+# In Docker, os.getcwd() will be /app/project
+DEFAULT_DB_PATH = Path(os.getcwd()) / "users.db"
 DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
 
 def initialize_db():

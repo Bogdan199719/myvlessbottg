@@ -31,3 +31,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.html", "*.css", "*.js", "*.png", "*.jpg", "*.json"]
