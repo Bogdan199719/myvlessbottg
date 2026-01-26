@@ -1,6 +1,6 @@
-[project]
-name = "vles-shopbot"
-version = "2.1.0"
+name = "vless-shopbot"
+version = "2.2.0"
+authors = [{name = "Bogdan", email = "bogdan123456789101@gmail.com"}]
 description = "Бот для автоматической продажи VLESS VPN"
 dependencies = [
     "aiogram==3.21.0",

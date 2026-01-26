@@ -6,6 +6,8 @@ services:
       - '1488:1488'
     volumes:
       - .:/app/project
+    env_file:
+      - .env
     environment:
       - TZ=Europe/Moscow
     logging:
