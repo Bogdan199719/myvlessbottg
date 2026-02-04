@@ -39,10 +39,75 @@ content %}
                         <small style="color: #adb5bd; margin-left: 10px;">ID: {{ user.user_id }}</small>
                     </td>
                 </tr>
+                
+                {# Separate keys into Global and Regular #}
+                {% set global_keys = [] %}
+                {% set regular_keys = [] %}
                 {% for key in user.user_keys %}
+                    {# Heuristic: if key has plan_id > 0 and it's marked as global in your logic #}
+                    {# In app.py we will pre-calculate this or use plan_id check #}
+                    {% if key.is_global %}
+                        {% set _ = global_keys.append(key) %}
+                    {% else %}
+                        {% set _ = regular_keys.append(key) %}
+                    {% endif %}
+                {% endfor %}
+
+                {# Show Global Subscription as ONE row if it exists #}
+                {% if global_keys %}
+                <tr style="background-color: #2d3238; border-left: 4px solid var(--primary-color);">
+                    <td>—</td>
+                    <td><strong>🌍 Глобальная подписка</strong><br><small>Серверов: {{ global_keys|length }}</small></td>
+                    <td><small>Multi-link</small></td>
+                    <td>
+                        {% set first_key = global_keys[0] %}
+                        {{ first_key.expiry_date.split('T')[0] if first_key.expiry_date else '∞' }}
+                    </td>
+                    <td>
+                        {% if first_key.days_left is defined %}
+                            {% if first_key.days_left < 0 %} 
+                                <span class="status-badge status-banned">Просрочена</span>
+                            {% elif first_key.days_left < 3 %} 
+                                <span class="status-badge status-warning">{{ first_key.days_left }} дн.</span>
+                            {% else %}
+                                <span class="status-badge status-active">{{ first_key.days_left }} дн.</span>
+                            {% endif %}
+                        {% endif %}
+                    </td>
+                    <td class="actions-cell">
+                        <form action="{{ url_for('adjust_key_duration', key_id=first_key.key_id) }}" method="POST"
+                            class="form-inline"
+                            onsubmit="return confirm('Вы уверены, что хотите изменить срок ГЛОБАЛЬНОЙ подписки сразу на всех серверах?');"
+                            style="display: flex; gap: 5px; justify-content: flex-end; align-items: center;">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                            <div style="display: flex; gap: 5px; align-items: center;">
+                                <div style="display: flex; flex-direction: column; align-items: center;">
+                                    <span style="font-size: 0.7em; color: #adb5bd;">Дней</span>
+                                    <input type="number" name="days" value="0" min="-365" max="365"
+                                        style="width: 50px; padding: 2px; text-align: center;"
+                                        oninput="checkChanges(this.form)" />
+                                </div>
+                                <div style="display: flex; flex-direction: column; align-items: center;">
+                                    <span style="font-size: 0.7em; color: #adb5bd;">Часов</span>
+                                    <input type="number" name="hours" value="0" min="-23" max="23"
+                                        style="width: 50px; padding: 2px; text-align: center;"
+                                        oninput="checkChanges(this.form)" />
+                                </div>
+                                <button type="submit" class="button button-small button-success"
+                                    style="display: none; margin-left: 5px;" title="Изменить срок всей подписки">
+                                    OK
+                                </button>
+                            </div>
+                        </form>
+                    </td>
+                </tr>
+                {% endif %}
+
+                {# Show Regular/Trial keys as they were #}
+                {% for key in regular_keys %}
                 <tr style="background-color: #2d3238;">
                     <td>{{ key.key_id }}</td>
-                    <td>{{ key.host_name }}</td>
+                    <td>{{ '🎁 ' if key.plan_id == 0 }}{{ key.host_name }}</td>
                     <td>
                         <small>{{ key.key_email }}</small>
                     </td>

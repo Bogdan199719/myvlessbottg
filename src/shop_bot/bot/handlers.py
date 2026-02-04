@@ -448,7 +448,7 @@ def get_user_router() -> Router:
             await callback.answer("Не удалось получить данные профиля.", show_alert=True)
             return
         username = html.bold(user_db_data.get('username', 'Пользователь'))
-        total_spent, total_months = user_db_data.get('total_spent', 0), user_db_data.get('total_months', 0)
+        total_spent = user_db_data.get('total_spent', 0)
         now = time_utils.get_msk_now()
         active_paid_keys = []
         for key in paid_keys:
@@ -472,7 +472,7 @@ def get_user_router() -> Router:
 
         if is_global_active and active_paid_keys:
             # Для глобальной подписки берем минимальную дату истечения (самый «короткий» хост)
-            min_expiry_date = min(time_utils.parse_iso_to_msk(k['expiry_date']) for k in active_paid_keys)
+            min_expiry_date = min(time_utils.parse_iso_to_msk(k['expiry_date']) for k in active_paid_keys if k.get('expiry_date'))
             time_left = min_expiry_date - now
             vpn_status_text = get_vpn_active_text(time_left.days, time_left.seconds // 3600)
         else:
@@ -512,13 +512,13 @@ def get_user_router() -> Router:
             
             if is_global_active:
                 subscription_text += (
-                    "\n\n💳 <b>Платная подписка:</b> Активна"
+                    "\n\n💳 <b>Глобальная подписка:</b> Активна"
                     f"\n🌍 <b>Серверов:</b> {len(active_paid_keys)}"
                     f"\n📅 <b>Истекает:</b> {min_expiry_str}"
                     "\n\nПродление глобальной подписки продлевает доступ сразу на всех серверах."
                     "\nИспользуйте кнопки ниже для получения ссылки и QR-кода подписки."
                 )
-                if domain and subscription_token:
+                if subscription_token:
                     profile_kb.button(text="🔗 Показать ссылку", callback_data=f"global_link_{subscription_token}")
                     profile_kb.button(text="📱 Показать QR", callback_data=f"global_qr_{subscription_token}")
                     profile_kb.button(text="📖 Инструкция", callback_data="global_howto")
@@ -530,7 +530,10 @@ def get_user_router() -> Router:
                     f"\n📅 <b>Истекает:</b> {min_expiry_str}"
                 )
 
-        final_text = get_profile_text(username, total_spent, total_months, vpn_status_text) + subscription_text
+        final_text = get_profile_text(username, total_spent, vpn_status_text) + subscription_text
+        profile_kb.button(text="⬅️ Назад в меню", callback_data="back_to_main_menu")
+        profile_kb.adjust(1)
+        await callback.message.edit_text(final_text, reply_markup=profile_kb.as_markup())
         profile_kb.button(text="⬅️ Назад в меню", callback_data="back_to_main_menu")
         profile_kb.adjust(1)
         await callback.message.edit_text(final_text, reply_markup=profile_kb.as_markup())

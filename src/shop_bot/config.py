@@ -3,11 +3,10 @@ CHOOSE_PAYMENT_METHOD_MESSAGE = "Выберите удобный способ о
 VPN_INACTIVE_TEXT = "❌ <b>Статус VPN:</b> Неактивен (срок истек)"
 VPN_NO_DATA_TEXT = "ℹ️ <b>Статус VPN:</b> У вас пока нет активных ключей."
 
-def get_profile_text(username, total_spent, total_months, vpn_status_text):
+def get_profile_text(username, total_spent, vpn_status_text):
     return (
         f"👤 <b>Профиль:</b> {username}\n\n"
-        f"💰 <b>Потрачено всего:</b> {total_spent:.0f} RUB\n"
-        f"📅 <b>Приобретено месяцев:</b> {total_months}\n\n"
+        f"💰 <b>Потрачено всего:</b> {total_spent:.0f} RUB\n\n"
         f"{vpn_status_text}"
     )
 

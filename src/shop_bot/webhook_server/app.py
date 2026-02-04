@@ -380,7 +380,17 @@ def create_webhook_app(bot_controller_instance):
     def keys_page():
         all_keys = get_all_keys_with_usernames()
         
-        # Group keys by user
+        # Identify global plan IDs
+        try:
+            global_plan_ids = {
+                int(p['plan_id'])
+                for p in get_plans_for_host('ALL')
+                if p.get('plan_id') is not None
+            }
+        except Exception:
+            global_plan_ids = set()
+
+        # Group keys by user and mark global ones
         users_map = {}
         for key in all_keys:
             uid = key['user_id']
@@ -390,6 +400,9 @@ def create_webhook_app(bot_controller_instance):
                     'user_id': uid,
                     'user_keys': []
                 }
+            
+            # Mark if key is part of a global subscription
+            key['is_global'] = bool(key.get('plan_id') and int(key['plan_id']) in global_plan_ids)
             users_map[uid]['user_keys'].append(key)
         
         grouped_users = sorted(users_map.values(), key=lambda u: u['username'])
