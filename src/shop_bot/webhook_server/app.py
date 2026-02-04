@@ -28,6 +28,7 @@ from yookassa import Payment
 from shop_bot.modules import xui_api
 from shop_bot.bot import handlers 
 from shop_bot.webhook_server.subscription_api import subscription_bp
+from shop_bot.data_manager import scheduler
 from shop_bot.data_manager.database import (
     get_all_settings, update_setting, get_all_hosts, get_plans_for_host,
     create_host, delete_host, create_plan, delete_plan, get_user_count,
@@ -955,6 +956,15 @@ def create_webhook_app(bot_controller_instance):
             passwd=request.form['host_pass'], # Can be empty
             inbound=int(request.form['host_inbound_id'])
         )
+        
+        # Trigger background sync to update connection strings (flags)
+        try:
+            loop = current_app.config.get('EVENT_LOOP')
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(scheduler.sync_keys_with_panels(), loop)
+        except Exception as e:
+            logger.error(f"Failed to trigger background sync after host update: {e}")
+
         flash(f"Хост '{old_host_name}' успешно обновлен.", 'success')
         return redirect(url_for('settings_page'))
 

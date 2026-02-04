@@ -273,15 +273,41 @@ async def sync_keys_with_panels():
                 server_client = clients_on_server.pop(key_email, None)
 
                 if server_client:
+                    # Determine country flag based on server name
+                    country_flag = xui_api.get_country_flag_by_host(host_name)
+                    # Clean server name
+                    clean_server_name = host_name.replace(' ', '').encode('ascii', 'ignore').decode('ascii')
+                    clean_server_name = ''.join(c for c in clean_server_name if c.isalnum() or c == '_').lstrip('_')
+                    server_remark = f"{country_flag}{clean_server_name}"
+                    
+                    # Generate fresh connection string
+                    new_connection_string = xui_api.get_connection_string(
+                        full_inbound_details, 
+                        server_client.id, 
+                        host['host_url'], 
+                        remark=server_remark
+                    )
+
                     # Compare expiry times directly (no reset field logic)
                     server_expiry_ms = server_client.expiry_time
                     local_expiry_dt = expiry_date
                     local_expiry_ms = int(local_expiry_dt.timestamp() * 1000)
+                    
+                    # Update if expiry changed OR connection string needs update (e.g. flag changed)
+                    current_db_string = db_key.get('connection_string')
+                    
+                    if (abs(server_expiry_ms - local_expiry_ms) > 1000) or (new_connection_string and new_connection_string != current_db_string):
+                        # Use update_key_info to update both expiry and string if needed
+                        # Convert server expiry to datetime
+                        new_expiry_date_dt = time_utils.from_timestamp_ms(server_expiry_ms)
+                        await asyncio.to_thread(database.update_key_info, db_key['key_id'], new_expiry_date_dt, new_connection_string)
+                        
+                        # Also sync UUID if changed (rare but possible)
+                        if db_key['xui_client_uuid'] != server_client.id:
+                             await asyncio.to_thread(database.update_key_status_from_server, key_email, server_client)
 
-                    if abs(server_expiry_ms - local_expiry_ms) > 1000:
-                        await asyncio.to_thread(database.update_key_status_from_server, key_email, server_client)
                         total_affected_records += 1
-                        logger.info(f"Scheduler: Synced (updated) key '{key_email}' for host '{host_name}'.")
+                        logger.info(f"Scheduler: Synced key '{key_email}' for host '{host_name}'.")
                 else:
                     # Soft-delete: mark missing, recheck next cycle before removal
                     now_ts = time_utils.get_msk_now().isoformat()

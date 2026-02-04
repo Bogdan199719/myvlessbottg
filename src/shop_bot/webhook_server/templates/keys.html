@@ -4,11 +4,6 @@ content %}
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
     <h1>Управление ключами</h1>
     <div style="display: flex; gap: 10px;">
-        <form action="{{ url_for('sync_keys_configs') }}" method="POST"
-            onsubmit="return confirm('Это действие обновит строки подключения для ВСЕХ ключей из панели XUI. Это может занять время. Продолжить?');">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button type="submit" class="button button-primary">↻ Синхронизировать конфиги</button>
-        </form>
         <form action="{{ url_for('fix_client_parameters') }}" method="POST"
             onsubmit="return confirm('Это действие исправит параметры flow и encryption для ВСЕХ клиентов на панелях XUI. Продолжить?');">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
