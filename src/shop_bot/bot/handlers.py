@@ -534,9 +534,6 @@ def get_user_router() -> Router:
         profile_kb.button(text="⬅️ Назад в меню", callback_data="back_to_main_menu")
         profile_kb.adjust(1)
         await callback.message.edit_text(final_text, reply_markup=profile_kb.as_markup())
-        profile_kb.button(text="⬅️ Назад в меню", callback_data="back_to_main_menu")
-        profile_kb.adjust(1)
-        await callback.message.edit_text(final_text, reply_markup=profile_kb.as_markup())
 
     @user_router.callback_query(F.data == "start_broadcast")
     @registration_required
