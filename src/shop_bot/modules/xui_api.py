@@ -146,12 +146,12 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
         if hasattr(stream_settings, 'reality_settings') and stream_settings.reality_settings:
             # Reality always uses port 443 for client connections (HTTPS)
             port = 443
-            logger.info(f"Using port 443 for Reality protocol instead of inbound port {inbound.port}")
+            logger.debug(f"Using port 443 for Reality protocol instead of inbound port {inbound.port}")
 
     # Keep original remark (including Unicode flag)
     safe_remark = remark
 
-    logger.info(f"Generating connection string - protocol: {protocol}, port: {port}, hostname: {parsed_url.hostname}, remark: {safe_remark}")
+    logger.debug(f"Generating connection string - protocol: {protocol}, port: {port}, hostname: {parsed_url.hostname}, remark: {safe_remark}")
 
     # Определяем тип протокола
     protocol_lower = protocol.lower()
@@ -170,7 +170,7 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
     """Generate VLESS connection string with automatic parameter detection"""
 
     stream_settings = inbound.stream_settings
-    logger.info(f"Generating VLESS connection string for inbound protocol: {getattr(inbound, 'protocol', 'unknown')}, port: {port}")
+    logger.debug(f"Generating VLESS connection string for inbound protocol: {getattr(inbound, 'protocol', 'unknown')}, port: {port}")
 
     # Проверяем Reality настройки (основной случай)
     if hasattr(stream_settings, 'reality_settings') and stream_settings.reality_settings:
@@ -184,7 +184,7 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
         server_names = stream_settings.reality_settings.get("serverNames")
         short_ids = stream_settings.reality_settings.get("shortIds")
 
-        logger.info(f"Reality params - public_key: {bool(public_key)}, server_names: {bool(server_names)}, short_ids: {bool(short_ids)}")
+        logger.debug(f"Reality params - public_key: {bool(public_key)}, server_names: {bool(server_names)}, short_ids: {bool(short_ids)}")
 
         if not all([public_key, server_names, short_ids]):
             logger.warning("Missing required Reality parameters")
