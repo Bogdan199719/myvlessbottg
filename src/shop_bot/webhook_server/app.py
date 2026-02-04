@@ -750,7 +750,7 @@ def create_webhook_app(bot_controller_instance):
                                 telegram_id=str(user_id)
                             ))
                             if result:
-                                expiry_dt = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
+                                expiry_dt = time_utils.from_timestamp_ms(result['expiry_timestamp_ms'])
                                 update_key_info(existing_key_db['key_id'], expiry_dt, result['connection_string'])
                                 issued_count += 1
                         else:
