@@ -18,6 +18,7 @@ _host_error_cache: dict[str, tuple[str, float]] = {}
 _ERROR_LOG_INTERVAL = 300  # Log same error once per 5 minutes
 
 COUNTRY_FLAGS = {
+    "🇱🇻": ["latvia", "latvija", "riga", "рига", "latvian"],
     "🇺🇸": ["usa", "united states", "america"],
     "🇨🇦": ["canada"],
     "🇲🇽": ["mexico"],
@@ -50,7 +51,6 @@ COUNTRY_FLAGS = {
     "🇦🇪": ["uae", "emirates"],
     "🇦🇺": ["australia"],
     "🇧🇷": ["brazil", "brasil"],
-    "🇱🇻": ["latvia", "latvija", "riga", "рига"],
     "🇪🇪": ["estonia", "eesti", "tallinn"],
     "🇱🇹": ["lithuania", "lietuva", "vilnius"],
     "🇺🇦": ["ukraine", "україна", "kyiv", "kiev"],
@@ -66,6 +66,7 @@ def get_country_flag_by_host(host_name: str) -> str:
     Checks if any alias in the dictionary is a substring of the host name.
     """
     host_lower = host_name.lower()
+    logger.debug(f"Detecting flag for host: '{host_name}'")
     
     # Check for direct flag match in name first
     for flag in COUNTRY_FLAGS.keys():
@@ -78,6 +79,7 @@ def get_country_flag_by_host(host_name: str) -> str:
             if alias in host_lower:
                 return flag
                 
+    logger.warning(f"No flag detected for host '{host_name}', defaulting to USA.")
     return "🇺🇸"  # Default to USA
 
 
