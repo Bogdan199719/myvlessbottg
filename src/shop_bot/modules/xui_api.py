@@ -1,4 +1,5 @@
 import uuid
+import time
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
@@ -10,6 +11,101 @@ from py3xui import Api, Client, Inbound
 from shop_bot.data_manager.database import get_host, get_key_by_email
 
 logger = logging.getLogger(__name__)
+
+
+# Error rate limiting: track last error per host to avoid log spam
+_host_error_cache: dict[str, tuple[str, float]] = {}
+_ERROR_LOG_INTERVAL = 300  # Log same error once per 5 minutes
+
+COUNTRY_FLAGS = {
+    "🇺🇸": ["usa", "united states", "america"],
+    "🇨🇦": ["canada"],
+    "🇲🇽": ["mexico"],
+    "🇩🇪": ["germany", "deutschland"],
+    "🇳🇱": ["netherlands", "nederland"],
+    "🇫🇷": ["france", "french"],
+    "🇬🇧": ["uk", "united kingdom", "britain", "england"],
+    "🇮🇹": ["italy", "italia"],
+    "🇪🇸": ["spain", "españa"],
+    "🇸🇪": ["sweden", "sverige"],
+    "🇳🇴": ["norway", "norge"],
+    "🇩🇰": ["denmark", "danmark"],
+    "🇫🇮": ["finland", "suomi"],
+    "🇨🇭": ["switzerland", "schweiz"],
+    "🇦🇹": ["austria", "österreich"],
+    "🇵🇱": ["poland", "polska"],
+    "🇨🇿": ["czech", "česká"],
+    "🇭🇺": ["hungary", "magyarország"],
+    "🇷🇴": ["romania", "românia"],
+    "🇧🇬": ["bulgaria", "българия"],
+    "🇬🇷": ["greece", "ελλάδα"],
+    "🇹🇷": ["turkey", "türkiye"],
+    "🇵🇹": ["portugal"],
+    "🇯🇵": ["japan", "nihon"],
+    "🇸🇬": ["singapore"],
+    "🇰🇷": ["south korea", "korea"],
+    "🇹🇼": ["taiwan", "中華民國"],
+    "🇭🇰": ["hong kong"],
+    "🇮🇳": ["india", "भारत"],
+    "🇦🇪": ["uae", "emirates"],
+    "🇦🇺": ["australia"],
+    "🇧🇷": ["brazil", "brasil"],
+    "🇱🇻": ["latvia", "latvija", "riga", "рига"],
+    "🇪🇪": ["estonia", "eesti", "tallinn"],
+    "🇱🇹": ["lithuania", "lietuva", "vilnius"],
+    "🇺🇦": ["ukraine", "україна", "kyiv", "kiev"],
+    "🇰🇿": ["kazakhstan", "казахстан"],
+    "🇲🇩": ["moldova", "молдова"],
+    "🇧🇾": ["belarus", "беларусь"],
+    "🇮🇱": ["israel", "израиль"]
+}
+
+def get_country_flag_by_host(host_name: str) -> str:
+    """
+    Determine country flag based on host name using a dictionary lookup.
+    Checks if any alias in the dictionary is a substring of the host name.
+    """
+    host_lower = host_name.lower()
+    
+    # Check for direct flag match in name first
+    for flag in COUNTRY_FLAGS.keys():
+        if flag in host_name:
+            return flag
+            
+    # Check for aliases
+    for flag, aliases in COUNTRY_FLAGS.items():
+        for alias in aliases:
+            if alias in host_lower:
+                return flag
+                
+    return "🇺🇸"  # Default to USA
+
+
+def _log_host_error(host_url: str, error: Exception) -> None:
+    """Log host connection errors with rate limiting to reduce log spam."""
+    error_type = type(error).__name__
+    error_key = f"{host_url}:{error_type}"
+    error_msg = str(error)[:150]  # Truncate long messages
+    now = time.time()
+    
+    # Check if we've logged this error recently
+    last_error = _host_error_cache.get(error_key)
+    if last_error:
+        _, last_time = last_error
+        if now - last_time < _ERROR_LOG_INTERVAL:
+            return  # Skip duplicate error within interval
+    
+    _host_error_cache[error_key] = (error_msg, now)
+    
+    # Log concise message without full traceback for known error types
+    if "SSL" in error_type or "SSL" in error_msg:
+        logger.error(f"SSL error for '{host_url}': {error_msg}")
+    elif "Connection" in error_type:
+        logger.error(f"Connection failed to '{host_url}': {error_msg}")
+    else:
+        # Only log full traceback for unexpected errors
+        logger.error(f"Error connecting to '{host_url}': {error_msg}", exc_info=True)
+
 
 def login_to_host(host_url: str, username: str, password: str, inbound_id: int) -> tuple[Api | None, Inbound | None]:
     try:
@@ -27,10 +123,10 @@ def login_to_host(host_url: str, username: str, password: str, inbound_id: int) 
         logger.error(f"Configuration error for host '{host_url}': {ve}")
         return None, None
     except ConnectionError as ce:
-        logger.error(f"Connection failed to host '{host_url}': {ce}")
+        _log_host_error(host_url, ce)
         return None, None
     except Exception as e:
-        logger.error(f"Login or inbound retrieval failed for host '{host_url}': {e}", exc_info=True)
+        _log_host_error(host_url, e)
         return None, None
 
 def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remark: str) -> str | None:
@@ -253,84 +349,8 @@ def _create_or_update_key_on_host_sync(host_name: str, email: str, days_to_add: 
     # Clean remark for URL safety
     safe_remark = host_name.replace(' ', '_').encode('ascii', 'ignore').decode('ascii')
     # Determine country flag based on server name
-    country_flag = "🇺🇸"  # Default to USA
-    host_lower = host_name.lower()
-
-    # North America
-    if "usa" in host_lower or "🇺🇸" in host_name or "united states" in host_lower or "america" in host_lower:
-        country_flag = "🇺🇸"
-    elif "canada" in host_lower or "🇨🇦" in host_name:
-        country_flag = "🇨🇦"
-    elif "mexico" in host_lower or "🇲🇽" in host_name:
-        country_flag = "🇲🇽"
-
-    # Europe
-    elif "germany" in host_lower or "deutschland" in host_lower or "🇩🇪" in host_name:
-        country_flag = "🇩🇪"
-    elif "netherlands" in host_lower or "nederland" in host_lower or "🇳🇱" in host_name:
-        country_flag = "🇳🇱"
-    elif "france" in host_lower or "french" in host_lower or "🇫🇷" in host_name:
-        country_flag = "🇫🇷"
-    elif "uk" in host_lower or "united kingdom" in host_lower or "britain" in host_lower or "england" in host_lower or "🇬🇧" in host_name:
-        country_flag = "🇬🇧"
-    elif "italy" in host_lower or "italia" in host_lower or "🇮🇹" in host_name:
-        country_flag = "🇮🇹"
-    elif "spain" in host_lower or "españa" in host_lower or "🇪🇸" in host_name:
-        country_flag = "🇪🇸"
-    elif "sweden" in host_lower or "sverige" in host_lower or "🇸🇪" in host_name:
-        country_flag = "🇸🇪"
-    elif "norway" in host_lower or "norge" in host_lower or "🇳🇴" in host_name:
-        country_flag = "🇳🇴"
-    elif "denmark" in host_lower or "danmark" in host_lower or "🇩🇰" in host_name:
-        country_flag = "🇩🇰"
-    elif "finland" in host_lower or "suomi" in host_lower or "🇫🇮" in host_name:
-        country_flag = "🇫🇮"
-    elif "switzerland" in host_lower or "schweiz" in host_lower or "🇨🇭" in host_name:
-        country_flag = "🇨🇭"
-    elif "austria" in host_lower or "österreich" in host_lower or "🇦🇹" in host_name:
-        country_flag = "🇦🇹"
-    elif "poland" in host_lower or "polska" in host_lower or "🇵🇱" in host_name:
-        country_flag = "🇵🇱"
-    elif "czech" in host_lower or "česká" in host_lower or "🇨🇿" in host_name:
-        country_flag = "🇨🇿"
-    elif "hungary" in host_lower or "magyarország" in host_lower or "🇭🇺" in host_name:
-        country_flag = "🇭🇺"
-    elif "romania" in host_lower or "românia" in host_lower or "🇷🇴" in host_name:
-        country_flag = "🇷🇴"
-    elif "bulgaria" in host_lower or "българия" in host_lower or "🇧🇬" in host_name:
-        country_flag = "🇧🇬"
-    elif "greece" in host_lower or "ελλάδα" in host_lower or "🇬🇷" in host_name:
-        country_flag = "🇬🇷"
-    elif "turkey" in host_lower or "türkiye" in host_lower or "🇹🇷" in host_name:
-        country_flag = "🇹🇷"
-    elif "portugal" in host_lower or "🇵🇹" in host_name:
-        country_flag = "🇵🇹"
-
-    # Asia
-    elif "japan" in host_lower or "nihon" in host_lower or "🇯🇵" in host_name:
-        country_flag = "🇯🇵"
-    elif "singapore" in host_lower or "🇸🇬" in host_name:
-        country_flag = "🇸🇬"
-    elif "south korea" in host_lower or "korea" in host_lower or "🇰🇷" in host_name:
-        country_flag = "🇰🇷"
-    elif "taiwan" in host_lower or "中華民國" in host_lower or "🇹🇼" in host_name:
-        country_flag = "🇹🇼"
-    elif "hong kong" in host_lower or "🇭🇰" in host_name:
-        country_flag = "🇭🇰"
-    elif "india" in host_lower or "भारत" in host_lower or "🇮🇳" in host_name:
-        country_flag = "🇮🇳"
-    elif "uae" in host_lower or "emirates" in host_lower or "🇦🇪" in host_name:
-        country_flag = "🇦🇪"
-
-    # Oceania
-    elif "australia" in host_lower or "🇦🇺" in host_name:
-        country_flag = "🇦🇺"
-
-    # South America
-    elif "brazil" in host_lower or "brasil" in host_lower or "🇧🇷" in host_name:
-        country_flag = "🇧🇷"
-
-    # Default remains 🇺🇸
+    country_flag = get_country_flag_by_host(host_name)
+    # Default is handled in the function (returns 🇺🇸)
 
     # Use server name (cleaned) with country flag for better UX
     # Clean server name: remove non-ASCII, replace spaces, keep only alphanumeric and underscores
@@ -375,84 +395,8 @@ def _get_key_details_from_host_sync(key_data: dict) -> dict | None:
     if not api or not inbound: return None
 
     # Determine country flag based on server name
-    country_flag = "🇺🇸"  # Default to USA
-    host_lower = host_name.lower()
-
-    # North America
-    if "usa" in host_lower or "🇺🇸" in host_name or "united states" in host_lower or "america" in host_lower:
-        country_flag = "🇺🇸"
-    elif "canada" in host_lower or "🇨🇦" in host_name:
-        country_flag = "🇨🇦"
-    elif "mexico" in host_lower or "🇲🇽" in host_name:
-        country_flag = "🇲🇽"
-
-    # Europe
-    elif "germany" in host_lower or "deutschland" in host_lower or "🇩🇪" in host_name:
-        country_flag = "🇩🇪"
-    elif "netherlands" in host_lower or "nederland" in host_lower or "🇳🇱" in host_name:
-        country_flag = "🇳🇱"
-    elif "france" in host_lower or "french" in host_lower or "🇫🇷" in host_name:
-        country_flag = "🇫🇷"
-    elif "uk" in host_lower or "united kingdom" in host_lower or "britain" in host_lower or "england" in host_lower or "🇬🇧" in host_name:
-        country_flag = "🇬🇧"
-    elif "italy" in host_lower or "italia" in host_lower or "🇮🇹" in host_name:
-        country_flag = "🇮🇹"
-    elif "spain" in host_lower or "españa" in host_lower or "🇪🇸" in host_name:
-        country_flag = "🇪🇸"
-    elif "sweden" in host_lower or "sverige" in host_lower or "🇸🇪" in host_name:
-        country_flag = "🇸🇪"
-    elif "norway" in host_lower or "norge" in host_lower or "🇳🇴" in host_name:
-        country_flag = "🇳🇴"
-    elif "denmark" in host_lower or "danmark" in host_lower or "🇩🇰" in host_name:
-        country_flag = "🇩🇰"
-    elif "finland" in host_lower or "suomi" in host_lower or "🇫🇮" in host_name:
-        country_flag = "🇫🇮"
-    elif "switzerland" in host_lower or "schweiz" in host_lower or "🇨🇭" in host_name:
-        country_flag = "🇨🇭"
-    elif "austria" in host_lower or "österreich" in host_lower or "🇦🇹" in host_name:
-        country_flag = "🇦🇹"
-    elif "poland" in host_lower or "polska" in host_lower or "🇵🇱" in host_name:
-        country_flag = "🇵🇱"
-    elif "czech" in host_lower or "česká" in host_lower or "🇨🇿" in host_name:
-        country_flag = "🇨🇿"
-    elif "hungary" in host_lower or "magyarország" in host_lower or "🇭🇺" in host_name:
-        country_flag = "🇭🇺"
-    elif "romania" in host_lower or "românia" in host_lower or "🇷🇴" in host_name:
-        country_flag = "🇷🇴"
-    elif "bulgaria" in host_lower or "българия" in host_lower or "🇧🇬" in host_name:
-        country_flag = "🇧🇬"
-    elif "greece" in host_lower or "ελλάδα" in host_lower or "🇬🇷" in host_name:
-        country_flag = "🇬🇷"
-    elif "turkey" in host_lower or "türkiye" in host_lower or "🇹🇷" in host_name:
-        country_flag = "🇹🇷"
-    elif "portugal" in host_lower or "🇵🇹" in host_name:
-        country_flag = "🇵🇹"
-
-    # Asia
-    elif "japan" in host_lower or "nihon" in host_lower or "🇯🇵" in host_name:
-        country_flag = "🇯🇵"
-    elif "singapore" in host_lower or "🇸🇬" in host_name:
-        country_flag = "🇸🇬"
-    elif "south korea" in host_lower or "korea" in host_lower or "🇰🇷" in host_name:
-        country_flag = "🇰🇷"
-    elif "taiwan" in host_lower or "中華民國" in host_lower or "🇹🇼" in host_name:
-        country_flag = "🇹🇼"
-    elif "hong kong" in host_lower or "🇭🇰" in host_name:
-        country_flag = "🇭🇰"
-    elif "india" in host_lower or "भारत" in host_lower or "🇮🇳" in host_name:
-        country_flag = "🇮🇳"
-    elif "uae" in host_lower or "emirates" in host_lower or "🇦🇪" in host_name:
-        country_flag = "🇦🇪"
-
-    # Oceania
-    elif "australia" in host_lower or "🇦🇺" in host_name:
-        country_flag = "🇦🇺"
-
-    # South America
-    elif "brazil" in host_lower or "brasil" in host_lower or "🇧🇷" in host_name:
-        country_flag = "🇧🇷"
-
-    # Default remains 🇺🇸
+    country_flag = get_country_flag_by_host(host_name)
+    # Default is handled in the function (returns 🇺🇸)
 
     # Use server name (cleaned) with country flag for better UX
     # Clean server name: remove non-ASCII, replace spaces, keep only alphanumeric and underscores

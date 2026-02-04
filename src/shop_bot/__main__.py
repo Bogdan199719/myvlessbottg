@@ -17,6 +17,11 @@ def main():
         level=logging.INFO,
         format="%(asctime)s - [%(levelname)s] - %(name)s - (%(filename)s).%(funcName)s(%(lineno)d) - %(message)s"
     )
+    # Reduce noise from HTTP libraries (SSL errors, connection traces)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    
     logger = logging.getLogger(__name__)
 
     database.initialize_db()

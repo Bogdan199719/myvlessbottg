@@ -223,6 +223,7 @@ async def check_expiring_subscriptions(bot: Bot):
 async def sync_keys_with_panels():
     logger.info("Scheduler: Starting sync with XUI panels...")
     total_affected_records = 0
+    failed_hosts = []  # Collect failed hosts for summary log
     
     all_hosts = await asyncio.to_thread(database.get_all_hosts)
     if not all_hosts:
@@ -231,7 +232,6 @@ async def sync_keys_with_panels():
 
     for host in all_hosts:
         host_name = host['host_name']
-        logger.info(f"Scheduler: Processing host: '{host_name}'")
         
         try:
             api, inbound = xui_api.login_to_host(
@@ -242,7 +242,7 @@ async def sync_keys_with_panels():
             )
 
             if not api or not inbound:
-                logger.error(f"Scheduler: Could not log in to host '{host_name}'. Skipping this host.")
+                failed_hosts.append(host_name)
                 continue
             
             full_inbound_details = api.inbound.get_by_id(inbound.id)
@@ -295,6 +295,10 @@ async def sync_keys_with_panels():
 
         except Exception as e:
             logger.error(f"Scheduler: An unexpected error occurred while processing host '{host_name}': {e}", exc_info=True)
+    
+    # Log summary of failed hosts (single line instead of multiple errors)
+    if failed_hosts:
+        logger.warning(f"Scheduler: {len(failed_hosts)} host(s) unavailable: {', '.join(failed_hosts)}")
             
     logger.info(f"Scheduler: Sync with XUI panels finished. Total records affected: {total_affected_records}.")
 

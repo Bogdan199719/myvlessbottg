@@ -13,10 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Copy all files first so pip install . can find src/
-COPY . .
+# Copy pyproject.toml first for dependency installation
+COPY pyproject.toml README.md ./
+COPY src ./src
 
-# Install the package and its dependencies
-RUN pip install --no-cache-dir .
+# Install in editable mode so volume-mounted changes take effect
+RUN pip install --no-cache-dir -e .
 
 CMD ["python3", "-m", "shop_bot"]

@@ -47,18 +47,33 @@ def check_for_updates() -> dict:
 
 def perform_update() -> dict:
     """
-    Performs `git pull`, `pip install`, and restarts the application.
+    Performs `git fetch`, `git reset --hard`, `pip install`, and restarts the application.
+    This method ensures that any local modifications on the server are overwritten
+    by the latest version from GitHub.
     """
     try:
-        # 1. Git Pull
-        logger.info("Starting git pull...")
-        result = subprocess.run(["git", "pull", "origin", "main"], capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            return {"status": "error", "message": f"Git Pull Failed: {result.stderr}"}
+        # 1. Configure git safe directory to avoid ownership errors in Docker
+        subprocess.run(["git", "config", "--global", "--add", "safe.directory", "/app/project"], check=False)
+
+        # 2. Fetch latest changes
+        logger.info("Fetching latest changes from GitHub...")
+        subprocess.run(["git", "fetch", "origin", "main"], check=False)
         
-        # 2. Pip Install (using current directory where pyproject.toml is)
+        # 3. Reset --hard to origin/main (to overwrite local conflicts)
+        logger.info("Resetting local state to match GitHub (Force Update)...")
+        result = subprocess.run(["git", "reset", "--hard", "origin/main"], capture_output=True, text=True, check=False)
+        
+        if result.returncode != 0:
+            return {"status": "error", "message": f"Git Reset Failed: {result.stderr}"}
+        
+        # 4. Pip Install in editable mode to accept new dependencies and keep volume sync
         logger.info("Updating dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "."], check=False)
+        install_result = subprocess.run([sys.executable, "-m", "pip", "install", "-e", "."], capture_output=True, text=True, check=False)
+
+        if install_result.returncode != 0:
+            logger.error(f"Dependency update failed: {install_result.stderr}")
+            # We continue despite dependency error, as restart might still work if deps are fine
+
         
         logger.info("Update successful. Triggering restart in 3 seconds...")
         
