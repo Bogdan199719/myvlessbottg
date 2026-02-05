@@ -101,6 +101,14 @@ def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
+def _safe_extract_zip(zip_ref: zipfile.ZipFile, extract_dir: Path) -> None:
+    extract_root = extract_dir.resolve()
+    for member in zip_ref.infolist():
+        member_path = (extract_dir / member.filename).resolve()
+        if not str(member_path).startswith(str(extract_root)):
+            raise ValueError("Недопустимый путь в архиве.")
+    zip_ref.extractall(extract_dir)
+
 def _restore_from_backup(zip_file, apply_env: bool = False):
     temp_dir = Path(tempfile.mkdtemp(prefix="restore_"))
     try:
@@ -109,7 +117,7 @@ def _restore_from_backup(zip_file, apply_env: bool = False):
 
         extract_dir = temp_dir / "extracted"
         with zipfile.ZipFile(upload_path, "r") as zip_ref:
-            zip_ref.extractall(extract_dir)
+            _safe_extract_zip(zip_ref, extract_dir)
 
         db_src = extract_dir / "users.db"
         metadata_path = extract_dir / "metadata.json"
