@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import time
 
 from datetime import datetime, timedelta
 from shop_bot.utils import time_utils
@@ -339,9 +340,54 @@ async def cleanup_old_notifications():
     except Exception as e:
         logger.error(f"Scheduler: Failed to cleanup old notifications: {e}")
 
+async def periodic_xtls_sync():
+    """
+    Periodically synchronize XTLS settings across all hosts.
+    
+    Ensures that:
+    - Reality TCP protocol clients have XTLS-Vision flow enabled
+    - gRPC protocol clients don't have XTLS flow
+    - Settings match between app config and actual 3xui panel settings
+    
+    Runs every 5-10 minutes and at bot startup.
+    """
+    try:
+        logger.info("Starting periodic XTLS synchronization across all hosts...")
+        sync_results = await asyncio.to_thread(xui_api.sync_inbounds_xtls_from_all_hosts)
+        
+        # Log results
+        if sync_results and isinstance(sync_results, dict):
+            total_fixed = 0
+            for host_name, result in sync_results.items():
+                if isinstance(result, dict):
+                    fixed = result.get('fixed', 0)
+                    status = result.get('status', 'unknown')
+                    
+                    if fixed > 0:
+                        logger.info(f"XTLS sync for '{host_name}': {fixed} clients fixed. Status: {status}")
+                        total_fixed += fixed
+                    elif status == 'success':
+                        logger.debug(f"XTLS sync for '{host_name}': no fixes needed.")
+                    else:
+                        logger.warning(f"XTLS sync for '{host_name}': status={status}")
+            
+            if total_fixed > 0:
+                logger.info(f"Periodic XTLS sync completed: {total_fixed} total clients fixed across all hosts")
+            else:
+                logger.debug("Periodic XTLS sync completed: all clients have correct settings")
+        else:
+            logger.warning(f"Unexpected XTLS sync result format: {sync_results}")
+    
+    except Exception as e:
+        logger.error(f"Scheduler: Failed to perform periodic XTLS sync: {e}", exc_info=True)
+
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
     await asyncio.sleep(10)
+
+    # Track when XTLS sync was last performed (run every 5 min instead of every CHECK_INTERVAL)
+    xtls_sync_interval = 300  # 5 minutes
+    last_xtls_sync_time = 0
 
     while True:
         try:
@@ -349,6 +395,12 @@ async def periodic_subscription_check(bot_controller: BotController):
             
             # Run cleanup once per cycle (or could be less frequent, but this is cheap)
             await cleanup_old_notifications()
+            
+            # Run XTLS sync separately on its own interval (every 5 minutes)
+            current_time = time.time()
+            if current_time - last_xtls_sync_time >= xtls_sync_interval:
+                await periodic_xtls_sync()
+                last_xtls_sync_time = current_time
 
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()

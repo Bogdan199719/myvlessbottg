@@ -82,14 +82,20 @@ def get_subscription(token):
 
             if remaining_seconds > 0:
                 existing_hosts = {k.get('host_name') for k in active_paid_keys}
+                logger.info(f"Global subscription detected. Existing hosts: {existing_hosts}. Remaining seconds: {remaining_seconds}")
+                
                 for host in get_all_hosts(only_enabled=True):
                     host_name = host.get('host_name')
                     if not host_name or host_name == 'ALL':
+                        logger.debug(f"Skipping host '{host_name}' (not a regular host)")
                         continue
                     if host_name in existing_hosts:
+                        logger.debug(f"Host '{host_name}' already has a key")
                         continue
 
                     email = f"user{user_id}-global-{host_name.replace(' ', '').lower()}"
+                    logger.info(f"Auto-provisioning key for host '{host_name}' with email '{email}'")
+                    
                     # Run async helper in a fresh loop (Flask view is sync)
                     res = asyncio.run(
                         xui_api.create_or_update_key_on_host_seconds(
@@ -111,15 +117,24 @@ def get_subscription(token):
                                 plan_id=first_global_plan_id
                             )
                             # Update local cache so that newly created keys appear in the same response
-                            active_paid_keys.append({
+                            new_key = {
                                 'host_name': host_name,
                                 'key_email': res['email'],
                                 'expiry_date': datetime.fromtimestamp(res['expiry_timestamp_ms'] / 1000).isoformat(),
                                 'connection_string': res.get('connection_string'),
                                 'plan_id': first_global_plan_id,
-                            })
+                            }
+                            active_paid_keys.append(new_key)
+                            logger.info(f"Successfully added global key for host '{host_name}'")
                         except Exception as e:
                             logger.error(f"Failed to persist new global key for host {host_name}: {e}")
+                    else:
+                        logger.error(f"Failed to create key on host '{host_name}'")
+        else:
+            if active_global_keys:
+                logger.debug(f"Active global keys found but no global plan IDs configured")
+            if global_plan_ids:
+                logger.debug(f"Global plan IDs found but no active global keys")
 
         # Filter out disabled hosts and missing keys
         enabled_hosts = {h.get('host_name') for h in get_all_hosts(only_enabled=True) if h.get('host_name')}
@@ -150,6 +165,7 @@ def get_subscription(token):
             prev = keys_by_host.get(host_name)
             if not prev:
                 keys_by_host[host_name] = key
+                logger.debug(f"Added first key for host '{host_name}': {key.get('key_email')}")
                 continue
 
             try:
@@ -157,9 +173,17 @@ def get_subscription(token):
                 cur_expiry = time_utils.parse_iso_to_msk(key.get('expiry_date'))
 
                 if cur_expiry > prev_expiry:
+                    logger.warning(f"Dedup: Replacing key {prev.get('key_email')} with newer key {key.get('key_email')} for host '{host_name}' (same host)")
                     keys_by_host[host_name] = key
-            except Exception:
+                else:
+                    logger.debug(f"Dedup: Keeping key {prev.get('key_email')} for host '{host_name}' (newer)")
+            except Exception as e:
+                logger.error(f"Error comparing expiry dates: {e}")
                 continue
+        
+        logger.info(f"User {user_id}: After deduplication: {len(keys_by_host)} hosts with 1 key each. Total keys before dedup: {len(active_paid_keys)}")
+        if len(active_paid_keys) > len(keys_by_host):
+            logger.warning(f"DEDUP ALERT: {len(active_paid_keys) - len(keys_by_host)} duplicate keys were removed!")
         
         configs = []
         for host_name in sorted(keys_by_host.keys()):
@@ -169,7 +193,9 @@ def get_subscription(token):
             # Or better, we try to reconstruct it if missing, but we lack server keys.
             # So we rely on connection_string being present.
             if key.get('connection_string'):
-                configs.append(key['connection_string'])
+                config = key['connection_string']
+                configs.append(config)
+                logger.debug(f"Added config for {key.get('key_email')} on host '{host_name}'")
             else:
                 # Try to regenerate connection_string from host data as fallback
                 logger.warning(f"Key {key.get('key_email')} on host {host_name} has NO connection_string, attempting fallback...")
@@ -178,7 +204,8 @@ def get_subscription(token):
                         xui_api.get_key_details_from_host(key)
                     )
                     if fallback_config and fallback_config.get('connection_string'):
-                        configs.append(fallback_config['connection_string'])
+                        config = fallback_config['connection_string']
+                        configs.append(config)
                         logger.info(f"Successfully regenerated config for key {key.get('key_email')}")
                     else:
                         logger.warning(f"Failed to regenerate config for key {key.get('key_email')} on host {host_name}")
@@ -187,8 +214,23 @@ def get_subscription(token):
         
         logger.info(f"User {user_id}: Final config count: {len(configs)}")
         
+        # Double-check: ensure no duplicate configs in the final list
+        unique_configs = []
+        seen_configs = set()
+        for config in configs:
+            config_hash = hash(config)
+            if config_hash in seen_configs:
+                logger.error(f"DUPLICATE CONFIG DETECTED! Config already exists in subscription. This should not happen!")
+                # Skip this duplicate
+                continue
+            seen_configs.add(config_hash)
+            unique_configs.append(config)
+        
+        if len(unique_configs) < len(configs):
+            logger.error(f"REMOVED {len(configs) - len(unique_configs)} DUPLICATE CONFIGS from subscription!")
+        
         # Join with newlines
-        subscription_data = "\n".join(configs)
+        subscription_data = "\n".join(unique_configs)
         
         # Base64 encode for wide compatibility
         encoded_data = base64.b64encode(subscription_data.encode('utf-8')).decode('utf-8')

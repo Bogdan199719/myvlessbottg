@@ -10,6 +10,7 @@ load_dotenv()
 from shop_bot.webhook_server.app import create_webhook_app
 from shop_bot.data_manager.scheduler import periodic_subscription_check
 from shop_bot.data_manager import database
+from shop_bot.modules import xui_api
 from shop_bot.bot_controller import BotController
 
 def main():
@@ -66,6 +67,30 @@ def main():
         flask_thread.start()
         
         logger.info("Flask server started in a background thread on http://0.0.0.0:1488")
+        
+        # Perform initial XTLS sync at startup (forced sync)
+        logger.info("Performing initial XTLS synchronization at startup...")
+        try:
+            sync_results = await asyncio.to_thread(xui_api.sync_inbounds_xtls_from_all_hosts)
+            total_fixed = 0
+            if sync_results and isinstance(sync_results, dict):
+                for host_name, result in sync_results.items():
+                    if isinstance(result, dict):
+                        fixed = result.get('fixed', 0)
+                        total_fixed += fixed
+                        status = result.get('status', 'unknown')
+                        if fixed > 0:
+                            logger.info(f"Startup XTLS sync for '{host_name}': {fixed} clients fixed. Status: {status}")
+                        elif status == 'success':
+                            logger.debug(f"Startup XTLS sync for '{host_name}': no fixes needed.")
+                        else:
+                            logger.warning(f"Startup XTLS sync for '{host_name}': status={status}")
+            if total_fixed > 0:
+                logger.info(f"Startup XTLS synchronization completed: {total_fixed} total clients fixed")
+            else:
+                logger.info("Startup XTLS synchronization completed: all clients have correct settings")
+        except Exception as e:
+            logger.error(f"Error during startup XTLS synchronization: {e}", exc_info=True)
             
         logger.info("Application is running. Bot can be started from the web panel.")
         
