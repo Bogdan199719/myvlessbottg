@@ -353,7 +353,7 @@ async def periodic_xtls_sync():
     """
     try:
         logger.info("Starting periodic XTLS synchronization across all hosts...")
-        sync_results = await asyncio.to_thread(xui_api.sync_inbounds_xtls_from_all_hosts)
+        sync_results = await xui_api.sync_inbounds_xtls_from_all_hosts()
         
         # Log results
         if sync_results and isinstance(sync_results, dict):

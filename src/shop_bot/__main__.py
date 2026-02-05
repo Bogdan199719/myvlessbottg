@@ -71,7 +71,7 @@ def main():
         # Perform initial XTLS sync at startup (forced sync)
         logger.info("Performing initial XTLS synchronization at startup...")
         try:
-            sync_results = await asyncio.to_thread(xui_api.sync_inbounds_xtls_from_all_hosts)
+            sync_results = await xui_api.sync_inbounds_xtls_from_all_hosts()
             total_fixed = 0
             if sync_results and isinstance(sync_results, dict):
                 for host_name, result in sync_results.items():
