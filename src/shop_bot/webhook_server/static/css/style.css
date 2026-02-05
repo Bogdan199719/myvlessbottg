@@ -1,12 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
 :root {
-	--primary-color: #4dabf7;
-	--success-color: #51cf66;
+	--primary-color: #4da3ff;
+	--success-color: #4cc38a;
 	--danger-color: #ff6b6b;
-	--warning-color: #ffa94d;
-	--light-color: #e9ecef;
-	--dark-color: #212529;
-	--border-color: #495057;
-	--body-bg: #212529;
+	--warning-color: #f5a54a;
+	--light-color: #f3f6fb;
+	--dark-color: #0f1115;
+	--border-color: #2f3642;
+	--body-bg: #0f1115;
+	--card-bg: rgba(24, 28, 35, 0.88);
+	--card-border: rgba(255, 255, 255, 0.08);
+	--text-muted: #a6b0bf;
+	--shadow-1: 0 20px 50px rgba(3, 8, 18, 0.5);
+	--shadow-2: 0 8px 24px rgba(10, 14, 20, 0.35);
+	--radius-lg: 16px;
+	--radius-md: 12px;
 }
 
 * {
@@ -24,34 +33,40 @@
 }
 
 body {
-	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-		'Helvetica Neue', Arial, sans-serif;
-	background-color: var(--body-bg);
+	font-family: 'IBM Plex Sans', 'Segoe UI', Tahoma, sans-serif;
+	background: radial-gradient(1200px 500px at 20% -10%, rgba(77, 163, 255, 0.18), transparent 60%),
+		radial-gradient(900px 400px at 90% 10%, rgba(76, 195, 138, 0.12), transparent 55%),
+		var(--body-bg);
 	color: var(--light-color);
 	line-height: 1.6;
 	padding: 20px;
 }
 
 .container {
-	max-width: 80%;
+	max-width: 86%;
 	margin: 0 auto;
-	background: #2d3238;
-	padding: 30px;
-	border-radius: 8px;
-	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+	background: var(--card-bg);
+	padding: 32px;
+	border-radius: var(--radius-lg);
+	box-shadow: var(--shadow-1);
+	border: 1px solid var(--card-border);
+	backdrop-filter: blur(10px);
+	animation: fade-up 0.6s ease-out;
 }
 
 h1 {
+	font-family: 'Space Grotesk', 'IBM Plex Sans', sans-serif;
 	text-align: center;
-	margin-bottom: 30px;
+	margin-bottom: 26px;
 	color: var(--light-color);
+	letter-spacing: -0.02em;
 }
 
 h2 {
-	color: var(--primary-color);
-	border-bottom: 2px solid var(--border-color);
-	padding-bottom: 10px;
-	margin-bottom: 20px;
+	color: var(--light-color);
+	border-bottom: 1px solid var(--border-color);
+	padding-bottom: 12px;
+	margin-bottom: 22px;
 }
 
 h3 {
@@ -89,10 +104,10 @@ h4 {
 	width: 100%;
 	padding: 12px;
 	border: 1px solid var(--border-color);
-	border-radius: 5px;
+	border-radius: var(--radius-md);
 	font-size: 16px;
 	transition: border-color 0.2s, box-shadow 0.2s;
-	background-color: #343a40;
+	background-color: rgba(19, 23, 30, 0.8);
 	color: var(--light-color);
 	height: 45px;
 	/* Fixed height for inputs to easier position buttons */
@@ -109,7 +124,7 @@ h4 {
 .form-group textarea:focus {
 	outline: none;
 	border-color: var(--primary-color);
-	box-shadow: 0 0 0 3px rgba(77, 171, 247, 0.25);
+	box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.2);
 }
 
 .form-group-checkbox {
@@ -192,14 +207,15 @@ h4 {
 	text-align: center;
 	cursor: pointer;
 	border: none;
-	border-radius: 5px;
-	transition: background-color 0.2s, transform 0.1s;
+	border-radius: 12px;
+	transition: background-color 0.2s, transform 0.15s, box-shadow 0.2s;
 	color: #fff;
 	text-decoration: none;
+	box-shadow: var(--shadow-2);
 }
 
 .button:active {
-	transform: translateY(1px);
+	transform: translateY(1px) scale(0.99);
 }
 
 .button-primary {
@@ -207,7 +223,7 @@ h4 {
 }
 
 .button-primary:hover {
-	background-color: #339af0;
+	background-color: #2f8df0;
 }
 
 .button-wide {
@@ -220,7 +236,7 @@ h4 {
 }
 
 .button-start:hover {
-	background-color: #37b24d;
+	background-color: #33b06f;
 }
 
 .button-stop {
@@ -228,7 +244,7 @@ h4 {
 }
 
 .button-stop:hover {
-	background-color: #ff922b;
+	background-color: #e5963d;
 }
 
 .toggle-section {
@@ -240,15 +256,15 @@ h4 {
 }
 
 .button-danger:hover {
-	background-color: #fa5252;
+	background-color: #f24b4b;
 }
 
 .backup-card {
-	background: linear-gradient(135deg, #2f3540 0%, #242932 100%);
-	border: 1px solid #3b4250;
-	border-radius: 12px;
+	background: linear-gradient(160deg, rgba(36, 44, 55, 0.92) 0%, rgba(24, 30, 38, 0.95) 100%);
+	border: 1px solid var(--card-border);
+	border-radius: var(--radius-lg);
 	padding: 20px;
-	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+	box-shadow: var(--shadow-2);
 }
 
 .backup-header {
@@ -788,6 +804,17 @@ a.stat-card:hover {
 
 .users-table tbody tr:hover {
 	background-color: #343a40;
+}
+
+@keyframes fade-up {
+	from {
+		opacity: 0;
+		transform: translateY(12px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
 }
 
 .users-table th,
