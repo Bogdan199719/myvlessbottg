@@ -54,8 +54,13 @@ def main():
                 logger.warning("Signal handlers are not supported on this platform/event loop.")
                 break
         
+        def run_flask():
+            from waitress import serve
+            logger.info("Starting production server (waitress) on http://0.0.0.0:1488")
+            serve(flask_app, host='0.0.0.0', port=1488, _quiet=True)
+
         flask_thread = threading.Thread(
-            target=lambda: flask_app.run(host='0.0.0.0', port=1488, use_reloader=False, debug=False),
+            target=run_flask,
             daemon=True
         )
         flask_thread.start()

@@ -149,6 +149,9 @@ def initialize_db():
                 cursor.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
             logging.info(f"Database initialized successfully at {DB_FILE}")
+            
+        # Clear any stale pending payment flags on startup
+        clear_all_pending_payments()
     except sqlite3.Error as e:
         logging.error(f"Database error on initialization: {e}")
 
@@ -247,6 +250,42 @@ def run_migration():
                 logging.info(" -> Existing keys will have plan_id=0 (trial). Update manually if needed.")
             else:
                 logging.info(" -> The column 'plan_id' already exists in vpn_keys.")
+            
+            # Add pending_payment flag to prevent race conditions
+            logging.info("Migration of users table to add pending_payment protection...")
+            cursor.execute("PRAGMA table_info(users)")
+            user_columns = [row[1] for row in cursor.fetchall()]
+            if 'pending_payment' not in user_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN pending_payment BOOLEAN DEFAULT 0")
+                logging.info(" -> The column 'pending_payment' is successfully added for race condition protection.")
+            else:
+                logging.info(" -> The column 'pending_payment' already exists in users.")
+            
+            # Create indexes for performance
+            logging.info("Creating performance indexes...")
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vpn_keys_user_id ON vpn_keys(user_id)")
+                logging.info(" -> Index on vpn_keys.user_id created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on vpn_keys.user_id already exists.")
+            
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vpn_keys_expiry ON vpn_keys(expiry_date)")
+                logging.info(" -> Index on vpn_keys.expiry_date created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on vpn_keys.expiry_date already exists.")
+            
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id)")
+                logging.info(" -> Index on transactions.user_id created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on transactions.user_id already exists.")
+            
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned)")
+                logging.info(" -> Index on users.is_banned created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on users.is_banned already exists.")
             
             logging.info("The table 'users' has been successfully updated.")
 
@@ -1295,3 +1334,73 @@ def cleanup_notifications(days_to_keep: int = 30):
                 logging.info(f"Cleaned up {deleted} old notification records.")
     except Exception as e:
         logger.error(f"Error cleaning up notifications: {e}")
+
+
+# ============================================================================
+# Race Condition Protection Functions
+# ============================================================================
+
+def set_pending_payment(user_id: int, is_pending: bool) -> bool:
+    """
+    Set or clear pending payment flag to prevent race conditions when multiple
+    payment webhooks arrive simultaneously for the same user.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET pending_payment = ? WHERE telegram_id = ?",
+                (1 if is_pending else 0, user_id)
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                logging.info(f"Pending payment flag for user {user_id} set to {is_pending}")
+                return True
+            else:
+                logging.warning(f"User {user_id} not found when setting pending payment flag")
+                return False
+    except sqlite3.Error as e:
+        logging.error(f"Failed to set pending payment flag for user {user_id}: {e}")
+        return False
+
+def get_pending_payment_status(user_id: int) -> bool:
+    """
+    Check if user has a pending payment in progress.
+    Returns True if there's a pending payment, False otherwise.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT pending_payment FROM users WHERE telegram_id = ?",
+                (user_id,)
+            )
+            result = cursor.fetchone()
+            if result:
+                return bool(result[0])
+            else:
+                logging.warning(f"User {user_id} not found when checking pending payment status")
+                return False
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get pending payment status for user {user_id}: {e}")
+        return False
+
+def clear_all_pending_payments() -> int:
+    """
+    Clear pending payment flags for all users. 
+    Used on startup to ensure no stale flags remain.
+    Returns count of affected users.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET pending_payment = 0 WHERE pending_payment = 1")
+            conn.commit()
+            affected = cursor.rowcount
+            if affected > 0:
+                logging.info(f"Cleared {affected} stale pending payment flags on startup")
+            return affected
+    except sqlite3.Error as e:
+        logging.error(f"Failed to clear pending payments: {e}")
+        return 0

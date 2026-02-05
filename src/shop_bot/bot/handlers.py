@@ -41,7 +41,8 @@ from shop_bot.data_manager.database import (
     update_key_info, update_key_plan_id, set_trial_used, set_terms_agreed, get_setting, get_all_hosts,
     get_plans_for_host, get_plan_by_id, log_transaction, get_referral_count,
     add_to_referral_balance, create_pending_transaction, get_all_users,
-    set_referral_balance, set_referral_balance_all, DB_FILE, get_user_paid_keys, get_user_trial_keys
+    set_referral_balance, set_referral_balance_all, DB_FILE, get_user_paid_keys, get_user_trial_keys,
+    set_pending_payment, get_pending_payment_status, clear_all_pending_payments
 )
 
 from shop_bot.config import (
@@ -2436,6 +2437,19 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         logger.info(f"Processing successful payment for user {metadata.get('user_id')}: {metadata}")
 
         user_id = int(metadata['user_id'])
+        
+        # ========== RACE CONDITION PROTECTION ==========
+        # Check if payment is already being processed
+        if get_pending_payment_status(user_id):
+            logger.warning(f"Payment already being processed for user {user_id}. Ignoring duplicate webhook.")
+            return
+        
+        # Mark payment as pending to prevent duplicate processing
+        if not set_pending_payment(user_id, True):
+            logger.error(f"Failed to set pending payment flag for user {user_id}")
+            return
+        # ===============================================
+        
         months = int(metadata['months'])
         price = float(metadata['price'])
         action = metadata['action']
@@ -2452,21 +2466,27 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         if action in ['extend', 'new'] and not host_name:
              logger.error(f"Missing host_name in metadata for action {action}: {metadata}")
              await bot.send_message(user_id, "❌ Произошла ошибка при обработке платежа: не указан сервер. Обратитесь в поддержку.")
+             set_pending_payment(user_id, False)
              return
 
         plan = get_plan_by_id(plan_id)
         if not plan:
             logger.error(f"Plan {plan_id} not found during payment processing")
             await bot.send_message(user_id, "❌ Ошибка: Тариф не найден. Обратитесь в поддержку.")
+            set_pending_payment(user_id, False)
             return
 
         months = plan['months'] # Re-assign months from plan, as it might be different from metadata['months'] for some payment methods
         
     except (ValueError, TypeError) as e:
         logger.error(f"FATAL: Could not parse metadata. Error: {e}. Metadata: {metadata}")
+        if 'user_id' in metadata:
+            set_pending_payment(int(metadata['user_id']), False)
         return
     except Exception as e:
         logger.error(f"An unexpected error occurred during initial payment processing for user {metadata.get('user_id')}: {e}", exc_info=True)
+        if metadata.get('user_id'):
+            set_pending_payment(int(metadata.get('user_id')), False)
         await bot.send_message(metadata.get('user_id'), "❌ Произошла непредвиденная ошибка при обработке платежа. Пожалуйста, обратитесь в поддержку.")
         return
 
@@ -2705,6 +2725,12 @@ async def process_successful_payment(bot: Bot, metadata: dict):
 
         await notify_admin_of_purchase(bot, metadata)
         
+        # ========== CLEAR RACE CONDITION PROTECTION ==========
+        set_pending_payment(user_id, False)
+        # ======================================================
+        
     except Exception as e:
         logger.error(f"Error processing payment for user {user_id} on host {host_name}: {e}", exc_info=True)
+        # Clear pending payment flag on error so user can retry
+        set_pending_payment(user_id, False)
         await processing_message.edit_text("❌ Ошибка при выдаче ключа.")

@@ -171,7 +171,19 @@ def get_subscription(token):
             if key.get('connection_string'):
                 configs.append(key['connection_string'])
             else:
-                logger.warning(f"Key {key.get('key_email')} on host {host_name} has NO connection_string!")
+                # Try to regenerate connection_string from host data as fallback
+                logger.warning(f"Key {key.get('key_email')} on host {host_name} has NO connection_string, attempting fallback...")
+                try:
+                    fallback_config = asyncio.run(
+                        xui_api.get_key_details_from_host(key)
+                    )
+                    if fallback_config and fallback_config.get('connection_string'):
+                        configs.append(fallback_config['connection_string'])
+                        logger.info(f"Successfully regenerated config for key {key.get('key_email')}")
+                    else:
+                        logger.warning(f"Failed to regenerate config for key {key.get('key_email')} on host {host_name}")
+                except Exception as e:
+                    logger.error(f"Fallback config regeneration failed for {key.get('key_email')}: {e}")
         
         logger.info(f"User {user_id}: Final config count: {len(configs)}")
         
