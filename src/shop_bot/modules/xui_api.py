@@ -140,6 +140,11 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
     port = inbound.port
     protocol = getattr(inbound, 'protocol', 'unknown')
 
+    # Determine network type (transport)
+    network = "tcp"
+    if hasattr(inbound, 'stream_settings') and inbound.stream_settings:
+        network = getattr(inbound.stream_settings, 'network', 'tcp') or 'tcp'
+
     # Special handling for Reality - use port 443 (standard HTTPS port)
     if hasattr(inbound, 'stream_settings') and inbound.stream_settings:
         stream_settings = inbound.stream_settings
@@ -151,13 +156,13 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
     # Keep original remark (including Unicode flag)
     safe_remark = remark
 
-    logger.debug(f"Generating connection string - protocol: {protocol}, port: {port}, hostname: {parsed_url.hostname}, remark: {safe_remark}")
+    logger.debug(f"Generating connection string - protocol: {protocol}, network: {network}, port: {port}, hostname: {parsed_url.hostname}, remark: {safe_remark}")
 
     # Определяем тип протокола
     protocol_lower = protocol.lower()
 
     if protocol_lower == "vless":
-        return _get_vless_connection_string(inbound, user_uuid, parsed_url.hostname, port, safe_remark)
+        return _get_vless_connection_string(inbound, user_uuid, parsed_url.hostname, port, safe_remark, network)
     elif protocol_lower == "vmess":
         return _get_vmess_connection_string(inbound, user_uuid, parsed_url.hostname, port, safe_remark)
     elif protocol_lower == "trojan":
@@ -166,11 +171,14 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
         logger.error(f"Unsupported protocol: {protocol}")
         return None
 
-def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str, port: int, remark: str) -> str | None:
+def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str, port: int, remark: str, network: str) -> str | None:
     """Generate VLESS connection string with automatic parameter detection"""
 
     stream_settings = inbound.stream_settings
-    logger.debug(f"Generating VLESS connection string for inbound protocol: {getattr(inbound, 'protocol', 'unknown')}, port: {port}")
+    logger.debug(f"Generating VLESS connection string for inbound protocol: {getattr(inbound, 'protocol', 'unknown')}, network: {network}, port: {port}")
+
+    # Common parameters
+    base_link = f"vless://{user_uuid}@{hostname}:{port}?type={network}&encryption=none"
 
     # Проверяем Reality настройки (основной случай)
     if hasattr(stream_settings, 'reality_settings') and stream_settings.reality_settings:
@@ -192,11 +200,34 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
 
         short_id = short_ids[0]
         server_name = server_names[0]
+        
+        # Determine flow
+        # XTLS-Vision flow is only valid for TCP + TLS/Reality
+        flow_param = ""
+        if network == "tcp":
+             flow_param = "&flow=xtls-rprx-vision"
+        
+        if network == "grpc":
+             # Extract grpc serviceName if available
+             service_name = ""
+             if hasattr(stream_settings, 'grpc_settings'):
+                  grpc_settings = stream_settings.grpc_settings
+                  if isinstance(grpc_settings, dict):
+                       service_name = grpc_settings.get('serviceName', '')
+                  elif hasattr(grpc_settings, 'service_name'): # Try object attribute
+                       service_name = grpc_settings.service_name
+             
+             if service_name:
+                  base_link += f"&serviceName={service_name}"
+             
+             # gRPC usually works with mode=gun or multi
+             base_link += "&mode=gun"
+
 
         connection_string = (
-            f"vless://{user_uuid}@{hostname}:{port}"
-            f"?type=tcp&encryption=none&security=reality&pbk={public_key}&fp={fp}&sni={server_name}"
-            f"&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#{remark}"
+            f"{base_link}"
+            f"&security=reality&pbk={public_key}&fp={fp}&sni={server_name}"
+            f"&sid={short_id}&spx=%2F{flow_param}#{remark}"
         )
         logger.info(f"Generated Reality connection string: {connection_string}")
         return connection_string
@@ -207,28 +238,44 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
         server_name = tls_settings.get("serverName", hostname)
         fp = tls_settings.get("fingerprint", "chrome")
 
+        if network == "grpc":
+             # Extract grpc serviceName
+             service_name = ""
+             if hasattr(stream_settings, 'grpc_settings'):
+                  grpc_settings = stream_settings.grpc_settings
+                  if isinstance(grpc_settings, dict):
+                       service_name = grpc_settings.get('serviceName', '')
+                  elif hasattr(grpc_settings, 'service_name'):
+                       service_name = grpc_settings.service_name
+             
+             if service_name:
+                  base_link += f"&serviceName={service_name}"
+             base_link += "&mode=gun"
+
         connection_string = (
-            f"vless://{user_uuid}@{hostname}:{port}"
-            f"?type=tcp&encryption=none&security=tls&sni={server_name}&fp={fp}#{remark}"
+            f"{base_link}"
+            f"&security=tls&sni={server_name}&fp={fp}#{remark}"
         )
         logger.info(f"Generated TLS connection string: {connection_string}")
         return connection_string
 
     # Без безопасности
     else:
-        connection_string = f"vless://{user_uuid}@{hostname}:{port}?type=tcp&encryption=none&security=none#{remark}"
+        connection_string = f"{base_link}&security=none#{remark}"
         logger.info(f"Generated plain connection string: {connection_string}")
         return connection_string
 
+# ... (VMess and Trojan functions remain similar but skipped for brevity as VLESS is focus) ...
+
 def _get_vmess_connection_string(inbound: Inbound, user_uuid: str, hostname: str, port: int, remark: str) -> str | None:
     """Generate VMess connection string"""
-    # Аналогичная логика для VMess
+    # Placeholder - VMess implementation isn't changing in this task
     logger.warning("VMess protocol not fully implemented yet")
     return None
 
 def _get_trojan_connection_string(inbound: Inbound, user_uuid: str, hostname: str, port: int, remark: str) -> str | None:
     """Generate Trojan connection string"""
-    # Аналогичная логика для Trojan
+    # Placeholder
     logger.warning("Trojan protocol not fully implemented yet")
     return None
 
@@ -241,6 +288,23 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
         if inbound_to_modify.settings.clients is None:
             inbound_to_modify.settings.clients = []
             
+        # Determine appropriate flow settings based on inbound config
+        target_flow = ""
+        is_tcp_reality_vision = False
+        
+        if hasattr(inbound_to_modify, 'stream_settings') and inbound_to_modify.stream_settings:
+            ss = inbound_to_modify.stream_settings
+            # Check network
+            network = getattr(ss, 'network', 'tcp') or 'tcp'
+            # Check security
+            security = getattr(ss, 'security', 'none')
+            
+            if network == 'tcp' and security == 'reality':
+                 target_flow = "xtls-rprx-vision"
+                 is_tcp_reality_vision = True
+        
+        logger.debug(f"Determined target flow for client: '{target_flow}' (is_reality_vision={is_tcp_reality_vision})")
+
         client_index = -1
         for i, client in enumerate(inbound_to_modify.settings.clients):
             if client.email == email:
@@ -270,7 +334,11 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
             client_to_update = inbound_to_modify.settings.clients[client_index]
             client_to_update.expiry_time = new_expiry_ms
             client_to_update.enable = True
-            client_to_update.flow = "xtls-rprx-vision"
+            
+            # Update flow ONLY if we determined a specific one is required (like Reality Vision)
+            # Or if it's explicitly NOT vision anymore (e.g. switched to grpc) we might want to clear it?
+            # Safer: explicitly set what we determined.
+            client_to_update.flow = target_flow
             
             # Ensure all required parameters exist
             if not hasattr(client_to_update, 'sub_id') or not client_to_update.sub_id:
@@ -297,13 +365,14 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
                 id=client_uuid,
                 email=email,
                 enable=True,
-                flow="xtls-rprx-vision",
+                flow=target_flow,
                 expiry_time=new_expiry_ms,
                 sub_id=subscription_id,
                 total_gb=0,
                 reset=0,
                 tg_id=telegram_id
             )
+
             api.client.add(inbound_id, [new_client])
             logger.info(f"Added new client '{email}' (UUID: {client_uuid})")
 
@@ -480,8 +549,15 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
             logger.warning(f"Client '{client_email}' not found on host '{host_name}'.")
             return False
 
+        # Determine correct flow
+        target_flow = ""
+        if hasattr(inbound_to_modify, 'stream_settings') and inbound_to_modify.stream_settings:
+             ss = inbound_to_modify.stream_settings
+             if getattr(ss, 'network', 'tcp') == 'tcp' and getattr(ss, 'security', 'none') == 'reality':
+                  target_flow = "xtls-rprx-vision"
+        
         # Fix client parameters
-        inbound_to_modify.settings.clients[client_index].flow = "xtls-rprx-vision"
+        inbound_to_modify.settings.clients[client_index].flow = target_flow
         try:
             inbound_to_modify.settings.clients[client_index].encryption = "none"
         except (ValueError, AttributeError):
