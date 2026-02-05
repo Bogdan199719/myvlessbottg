@@ -304,10 +304,62 @@ document.addEventListener('DOMContentLoaded', function () {
 		})
 	}
 
+	function setupUserTableFilters() {
+		const searchInput = document.getElementById('usersSearch')
+		const countEl = document.getElementById('usersCount')
+		const filterButtons = document.querySelectorAll('[data-user-filter]')
+		const table = document.querySelector('.users-table')
+		if (!table || (!searchInput && !filterButtons.length)) {
+			return
+		}
+
+		const rows = Array.from(table.querySelectorAll('tbody tr'))
+		let activeFilter = 'all'
+
+		function normalize(value) {
+			return (value || '').toString().toLowerCase()
+		}
+
+		function applyFilters() {
+			const query = normalize(searchInput ? searchInput.value : '')
+			let visible = 0
+
+			rows.forEach(row => {
+				const status = normalize(row.dataset.status)
+				const haystack = normalize(row.dataset.search || row.textContent)
+				const matchesFilter = activeFilter === 'all' || status === activeFilter
+				const matchesQuery = !query || haystack.includes(query)
+				const show = matchesFilter && matchesQuery
+				row.style.display = show ? '' : 'none'
+				if (show) visible += 1
+			})
+
+			if (countEl) {
+				countEl.textContent = `${visible}/${rows.length}`
+			}
+		}
+
+		if (searchInput) {
+			searchInput.addEventListener('input', applyFilters)
+		}
+
+		filterButtons.forEach(button => {
+			button.addEventListener('click', () => {
+				filterButtons.forEach(btn => btn.classList.remove('is-active'))
+				button.classList.add('is-active')
+				activeFilter = button.getAttribute('data-user-filter') || 'all'
+				applyFilters()
+			})
+		})
+
+		applyFilters()
+	}
+
 	initializePasswordToggles()
 	setupBotControlForms()
 	setupConfirmationForms()
 	setupToggleSections()
 	setupCopyButtons()
 	initializeDashboardCharts()
+	setupUserTableFilters()
 })

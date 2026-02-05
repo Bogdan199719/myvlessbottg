@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 ## [2.4.6] - 2026-02-05
 - Version bump after repository audit.
 
+## [2.4.7] - 2026-02-05
+- Improve admin panel UX (search, filters, sticky headers).
+- Move modal styling to shared CSS and refine visuals.
+
 ## [2.4.3] - 2026-02-05
 - Bump version and keep version files in sync.
 

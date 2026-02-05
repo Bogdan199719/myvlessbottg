@@ -5,6 +5,19 @@
 
 <section class="settings-section">
 	<h2>Список пользователей</h2>
+
+	<div class="table-toolbar">
+		<div class="table-tools">
+			<input id="usersSearch" class="search-input" type="text" placeholder="Search by ID or username" />
+			<div class="filter-group">
+				<button type="button" class="filter-chip is-active" data-user-filter="all">All</button>
+				<button type="button" class="filter-chip" data-user-filter="active">Active</button>
+				<button type="button" class="filter-chip" data-user-filter="banned">Banned</button>
+			</div>
+		</div>
+		<div class="count-pill">Shown: <span id="usersCount"></span></div>
+	</div>
+
 	<div style="overflow-x: auto">
 		<table class="users-table">
 			<thead>
@@ -18,7 +31,7 @@
 			</thead>
 			<tbody>
 				{% for user in users %}
-				<tr>
+				<tr data-status="{{ 'banned' if user.is_banned else 'active' }}" data-search="{{ user.telegram_id }} {{ user.username or '' }}">
 					<td>{{ user.telegram_id }}</td>
 					<td>@{{ user.username or 'N/A' }}</td>
 					<td>
@@ -157,67 +170,6 @@
 	}
 </script>
 
-<style>
-	/* Simple Modal Styles */
-	.modal {
-		display: none;
-		position: fixed;
-		z-index: 1000;
-		left: 0;
-		top: 0;
-		width: 100%;
-		height: 100%;
-		overflow: auto;
-		background-color: rgb(0, 0, 0);
-		background-color: rgba(0, 0, 0, 0.4);
-	}
 
-	.modal-content {
-		background-color: #2c2f33;
-		/* Dark theme match */
-		color: #fff;
-		margin: 15% auto;
-		padding: 20px;
-		border: 1px solid #888;
-		width: 500px;
-		border-radius: 8px;
-		box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-	}
-
-	.close {
-		color: #aaa;
-		float: right;
-		font-size: 28px;
-		font-weight: bold;
-	}
-
-	.close:hover,
-	.close:focus {
-		color: #fff;
-		text-decoration: none;
-		cursor: pointer;
-	}
-
-	.form-group {
-		margin-bottom: 20px;
-	}
-
-	.form-control {
-		width: 100%;
-		padding: 10px;
-		border-radius: 5px;
-		border: 1px solid #444;
-		background-color: #23272a;
-		color: white;
-	}
-
-	.actions-wrapper {
-		display: flex;
-		gap: 5px;
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		align-items: center;
-	}
-</style>
 
 {% endblock %}
