@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 - Refresh admin panel styling (modernized, Apple-inspired look).
 - Normalize repository docs and ignore rules.
 
+## [2.4.6] - 2026-02-05
+- Version bump after repository audit.
+
 ## [2.4.3] - 2026-02-05
 - Bump version and keep version files in sync.
 
