@@ -67,18 +67,18 @@
 					{% endif %}
 					<div class="form-group">
 						<label for="host_name">Название хоста:</label>
-						<input type="text" id="host_name" name="host_name" required maxlength="26"
-							value="{{ edit_host.host_name if edit_host else '' }}" />
+						<input type="text" id="host_name" name="host_name" required maxlength="26" placeholder="RigaLatvia" title="Short display name" value="{{ edit_host.host_name if edit_host else '' }}" />
+						<small class="field-hint">Short name shown to users (ASCII recommended).</small>
 					</div>
 					<div class="form-group">
 						<label for="host_url">URL панели XUI:</label>
-						<input type="url" id="host_url" name="host_url" placeholder="http://123.45.67.89:54321" required
-							value="{{ edit_host.host_url if edit_host else '' }}" />
+						<input type="url" id="host_url" name="host_url" placeholder="http://123.45.67.89:54321" required value="{{ edit_host.host_url if edit_host else '' }}" />
+						<small class="field-hint">Example: http://123.45.67.89:54321</small>
 					</div>
 					<div class="form-group">
 						<label for="host_username">Логин XUI:</label>
-						<input type="text" id="host_username" name="host_username" required
-							value="{{ edit_host.host_username if edit_host else '' }}" />
+						<input type="text" id="host_username" name="host_username" required placeholder="admin" value="{{ edit_host.host_username if edit_host else '' }}" />
+						<small class="field-hint">XUI panel login.</small>
 					</div>
 					<div class="form-group password-wrapper">
 						<label for="host_pass">Пароль XUI {% if edit_host %}(оставьте пустым, чтобы не менять){% endif
@@ -89,8 +89,8 @@
 					</div>
 					<div class="form-group">
 						<label for="host_inbound_id">ID входящего подключения:</label>
-						<input type="number" id="host_inbound_id" name="host_inbound_id" required
-							value="{{ edit_host.host_inbound_id if edit_host else '' }}" />
+						<input type="number" id="host_inbound_id" name="host_inbound_id" required placeholder="1" value="{{ edit_host.host_inbound_id if edit_host else '' }}" />
+						<small class="field-hint">Inbound ID from 3x-ui panel.</small>
 					</div>
 					<button type="submit" class="button button-primary">{% if edit_host %}Сохранить изменения{% else
 						%}Добавить{% endif %}</button>
@@ -218,12 +218,13 @@
 				<h2>Настройки Панели</h2>
 				<div class="form-group">
 					<label for="panel_login">Логин для входа в панель:</label>
-					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}"
-						required />
+					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}" placeholder="admin" required />
+					<small class="field-hint">Admin login for the web panel.</small>
 				</div>
 				<div class="form-group password-wrapper">
 					<label for="panel_password">Новый пароль (оставьте пустым, чтобы не менять):</label>
-					<input type="password" id="panel_password" name="panel_password" />
+					<input type="password" id="panel_password" name="panel_password" placeholder="new-password" />
+					<small class="field-hint">Leave empty to keep current password.</small>
 					<button type="button" class="toggle-password">👁️</button>
 				</div>
 			</section>
@@ -232,19 +233,20 @@
 				<h2>Настройка Бота</h2>
 				<div class="form-group password-wrapper">
 					<label for="telegram_bot_token">Токен бота:</label>
-					<input type="password" id="telegram_bot_token" name="telegram_bot_token"
-						value="{{ settings.telegram_bot_token or '' }}" required />
+					<input type="password" id="telegram_bot_token" name="telegram_bot_token" placeholder="123456:ABCDEF" value="{{ settings.telegram_bot_token or '' }}" required />
+					<small class="field-hint">Keep this token secret.</small>
 					<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
 					<button type="button" class="toggle-password">👁️</button>
 				</div>
 				<div class="form-group">
 					<label for="telegram_bot_username">Username бота (без @):</label>
-					<input type="text" id="telegram_bot_username" name="telegram_bot_username"
-						value="{{ settings.telegram_bot_username or '' }}" required />
+					<input type="text" id="telegram_bot_username" name="telegram_bot_username" placeholder="myvpn_bot" value="{{ settings.telegram_bot_username or '' }}" required />
+					<small class="field-hint">Without @. Example: myvpn_bot.</small>
 				</div>
 				<div class="form-group">
-					<input type="text" id="admin_telegram_id" name="admin_telegram_id"
-						value="{{ settings.admin_telegram_id or '' }}" required />
+					<label for="admin_telegram_id">Admin Telegram ID:</label>
+					<input type="text" id="admin_telegram_id" name="admin_telegram_id" placeholder="123456789" value="{{ settings.admin_telegram_id or '' }}" required />
+					<small class="field-hint">Numeric ID for admin notifications.</small>
 				</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_admin_payment_notifications" value="false" />
@@ -387,7 +389,7 @@
 						<label for="stars_rub_per_star">Курс (RUB за 1 Star):</label>
 						<input type="number" step="0.01" id="stars_rub_per_star" name="stars_rub_per_star"
 							value="{{ settings.stars_rub_per_star or '2.5' }}" />
-						<small style="color: #666; display: block; margin-top: 4px;">Рекомендуемый курс: 1.6-2.5 RUB.
+						<small class="field-hint">Рекомендуемый курс: 1.6-2.5 RUB.
 							Оставьте 0 для автоматического курса (1.6 RUB).</small>
 					</div>
 				</div>
@@ -439,16 +441,15 @@
 				</div>
 				<div class="form-group">
 					<label for="domain">Ваш домен (например, my-shop.com):</label>
-					<input type="text" id="domain" name="domain" value="{{ settings.domain or '' }}"
-						placeholder="IP адрес сервера (напр. 45.12.34.56) или Домен" />
-					<small style="color: #666; display: block; margin-top: 4px;">Укажите IP-адрес этого сервера, где
+					<input type="text" id="domain" name="domain" placeholder="example.com" value="{{ settings.domain or '' }}" />
+					<small class="field-hint">Укажите IP-адрес этого сервера, где
 						установлен бот.</small>
 				</div>
 				<div class="form-group">
 					<label for="subscription_name">Название подписки (в приложении):</label>
 					<input type="text" id="subscription_name" name="subscription_name"
 						value="{{ settings.subscription_name or 'AresVPN' }}" placeholder="Например: AresVPN" />
-					<small style="color: #666; display: block; margin-top: 4px;">Это имя будет отображаться при импорте
+					<small class="field-hint">Это имя будет отображаться при импорте
 						подписки.</small>
 				</div>
 				<h2>Настройка TonConnect</h2>

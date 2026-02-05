@@ -95,6 +95,13 @@ h4 {
 	color: var(--light-color);
 }
 
+.field-hint {
+	display: block;
+	margin-top: 6px;
+	color: var(--text-muted);
+	font-size: 0.85rem;
+}
+
 .form-group input[type='text'],
 .form-group input[type='url'],
 .form-group input[type='password'],

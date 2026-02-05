@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.8] - 2026-02-05
+- Add admin settings field hints and restore admin ID label.
+- Clean up settings form placeholders for clarity.
+
 ## [2.4.4] - 2026-02-05
 - Fix async XTLS sync awaiting to avoid runtime warnings.
 - Refresh admin panel styling (modernized, Apple-inspired look).
