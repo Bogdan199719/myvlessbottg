@@ -31,19 +31,5 @@ logs.txt
 .vscode/
 *.DS_Store
 
-# Developer Documentation (local notes)
-ARCHITECTURE.md
-DEVELOPER_GUIDE.md
-DEPLOYMENT_GUIDE.md
-ISSUES_AND_RECOMMENDATIONS.md
-CRITICAL_DATA_ANALYSIS.md
-DOCUMENTATION_INDEX.md
-QUICK_REFERENCE.md
-ANALYSIS_SUMMARY.md
-
 # Misc
 *.bak*
-test
-Setting
-Table
-The
