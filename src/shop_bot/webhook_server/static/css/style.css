@@ -723,6 +723,10 @@ a.stat-card:hover {
 	margin-top: 20px;
 }
 
+.transactions-table tbody tr:hover {
+	background-color: #343a40;
+}
+
 .transactions-table th,
 .transactions-table td {
 	border: 1px solid var(--border-color);
@@ -780,6 +784,10 @@ a.stat-card:hover {
 	width: 100%;
 	border-collapse: collapse;
 	margin-top: 20px;
+}
+
+.users-table tbody tr:hover {
+	background-color: #343a40;
 }
 
 .users-table th,
