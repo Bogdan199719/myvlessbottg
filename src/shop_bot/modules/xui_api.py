@@ -131,6 +131,17 @@ def login_to_host(host_url: str, username: str, password: str, inbound_id: int) 
         _log_host_error(host_url, e)
         return None, None
 
+def _get_stream_network_security(inbound: Inbound) -> tuple[str, str]:
+    network = "tcp"
+    security = "none"
+    ss = getattr(inbound, "stream_settings", None)
+    if ss:
+        network = getattr(ss, "network", "tcp") or "tcp"
+        security = getattr(ss, "security", None) or "none"
+        if getattr(ss, "reality_settings", None):
+            security = "reality"
+    return network, security
+
 def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remark: str) -> str | None:
     if not inbound:
         logger.error("Inbound is None")
@@ -141,9 +152,7 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
     protocol = getattr(inbound, 'protocol', 'unknown')
 
     # Determine network type (transport)
-    network = "tcp"
-    if hasattr(inbound, 'stream_settings') and inbound.stream_settings:
-        network = getattr(inbound.stream_settings, 'network', 'tcp') or 'tcp'
+    network, _ = _get_stream_network_security(inbound)
 
     # Special handling for Reality - use port 443 (standard HTTPS port)
     if hasattr(inbound, 'stream_settings') and inbound.stream_settings:
@@ -292,16 +301,10 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
         target_flow = ""
         is_tcp_reality_vision = False
         
-        if hasattr(inbound_to_modify, 'stream_settings') and inbound_to_modify.stream_settings:
-            ss = inbound_to_modify.stream_settings
-            # Check network
-            network = getattr(ss, 'network', 'tcp') or 'tcp'
-            # Check security
-            security = getattr(ss, 'security', 'none')
-            
-            if network == 'tcp' and security == 'reality':
-                 target_flow = "xtls-rprx-vision"
-                 is_tcp_reality_vision = True
+        network, security = _get_stream_network_security(inbound_to_modify)
+        if network == 'tcp' and security == 'reality':
+             target_flow = "xtls-rprx-vision"
+             is_tcp_reality_vision = True
         
         logger.debug(f"Determined target flow for client: '{target_flow}' (is_reality_vision={is_tcp_reality_vision})")
 
@@ -551,10 +554,9 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
 
         # Determine correct flow
         target_flow = ""
-        if hasattr(inbound_to_modify, 'stream_settings') and inbound_to_modify.stream_settings:
-             ss = inbound_to_modify.stream_settings
-             if getattr(ss, 'network', 'tcp') == 'tcp' and getattr(ss, 'security', 'none') == 'reality':
-                  target_flow = "xtls-rprx-vision"
+        network, security = _get_stream_network_security(inbound_to_modify)
+        if network == 'tcp' and security == 'reality':
+             target_flow = "xtls-rprx-vision"
         
         # Fix client parameters
         inbound_to_modify.settings.clients[client_index].flow = target_flow
@@ -608,145 +610,164 @@ def _delete_client_on_host_sync(host_name: str, client_email: str) -> bool:
         logger.error(f"Failed to delete client '{client_email}' from host '{host_name}': {e}", exc_info=True)
         return False
 
-async def sync_inbounds_xtls_from_all_hosts() -> dict[str, list]:
+async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     """
     Synchronize XTLS settings across all hosts.
-    
+
     For each host and inbound:
     - Determine protocol type (Reality TCP, gRPC, etc.)
     - Validate XTLS settings match protocol requirements
     - Auto-fix if mismatch detected
     - Report results
-    
+
     Runs at startup and periodically in background (every 5-10 min).
-    
+
     Returns: dict with sync results for each host
     """
     from shop_bot.data_manager.database import get_all_hosts
-    
+
     all_hosts = get_all_hosts()
     if not all_hosts:
         logger.warning("No hosts configured in database. XTLS sync skipped.")
         return {"status": "no_hosts"}
-    
+
     results = {}
-    
+
     for host_info in all_hosts:
         host_name = host_info.get('host_name')
         logger.info(f"Starting XTLS sync for host: {host_name}")
-        
-        try:
-            # Login to host
-            api, inbound = login_to_host(
-                host_url=host_info['host_url'],
-                username=host_info['host_username'],
-                password=host_info['host_pass'],
-                inbound_id=host_info['host_inbound_id']
-            )
-            
-            if not api or not inbound:
-                logger.error(f"Could not connect to host '{host_name}' for XTLS sync")
-                results[host_name] = {"status": "connection_failed", "fixed": 0}
-                continue
-            
-            # Get fresh inbound data
-            inbound_fresh = api.inbound.get_by_id(inbound.id)
-            if not inbound_fresh or not inbound_fresh.settings.clients:
-                logger.warning(f"No clients found on host '{host_name}'")
-                results[host_name] = {"status": "no_clients", "fixed": 0}
-                continue
-            
-            # Determine inbound protocol type
-            protocol = getattr(inbound_fresh, 'protocol', 'unknown').lower()
-            network = "tcp"
-            security = "none"
-            
-            if hasattr(inbound_fresh, 'stream_settings') and inbound_fresh.stream_settings:
-                ss = inbound_fresh.stream_settings
-                network = getattr(ss, 'network', 'tcp') or 'tcp'
-                security = getattr(ss, 'security', 'none') or 'none'
-            
-            logger.info(f"Host '{host_name}' - protocol: {protocol}, network: {network}, security: {security}")
-            
-            # Validate and fix XTLS for each client
-            fixed_count = 0
-            issues_found = []
-            
-            for client in inbound_fresh.settings.clients:
-                client_email = client.email
-                client_flow = getattr(client, 'flow', '')
-                current_security = getattr(client, 'security', 'none') or 'none'
-                
-                # Determine expected XTLS config
-                expected_flow = ""
-                expected_security = "none"
-                
-                if protocol == "vless":
-                    if network == "tcp" and security == "reality":
-                        expected_flow = "xtls-rprx-vision"
-                        expected_security = "reality"
-                    elif network == "tcp" and security == "tls":
-                        expected_security = "tls"
-                    elif network == "grpc":
-                        # gRPC doesn't use XTLS flow
-                        expected_security = security
-                
-                # Check if fix needed
-                needs_fix = False
-                fix_reason = ""
-                
-                if protocol == "vless" and network == "tcp" and security == "reality":
-                    # Reality TCP MUST have XTLS flow
-                    if client_flow != "xtls-rprx-vision":
-                        needs_fix = True
-                        fix_reason = f"Flow '{client_flow}' != 'xtls-rprx-vision' (Reality TCP requires XTLS-Vision)"
-                    if current_security != "reality":
-                        needs_fix = True
-                        fix_reason = f"Security '{current_security}' != 'reality'"
-                
-                elif protocol == "vless" and network == "grpc":
-                    # gRPC should not have XTLS flow
-                    if "xtls" in client_flow.lower():
-                        needs_fix = True
-                        fix_reason = f"Flow contains XTLS ('{client_flow}') but gRPC doesn't use XTLS"
-                
-                if needs_fix:
-                    logger.info(f"Client '{client_email}' needs XTLS fix: {fix_reason}")
-                    issues_found.append({
-                        "email": client_email,
-                        "reason": fix_reason,
-                        "current_flow": client_flow,
-                        "expected_flow": expected_flow
-                    })
-                    
-                    # Auto-fix: update client on panel
-                    try:
-                        client.flow = expected_flow
-                        if expected_security:
-                            client.security = expected_security
-                        
-                        api.inbound.update(inbound.id, inbound_fresh)
-                        fixed_count += 1
-                        logger.info(f"Fixed XTLS for client '{client_email}': flow='{expected_flow}', security='{expected_security}'")
-                    except Exception as fix_error:
-                        logger.error(f"Failed to fix XTLS for client '{client_email}': {fix_error}")
-            
-            results[host_name] = {
-                "status": "success",
-                "fixed": fixed_count,
-                "issues": issues_found,
-                "protocol": protocol,
-                "network": network,
-                "security": security
-            }
-            
-            if fixed_count > 0:
-                logger.info(f"XTLS sync completed for host '{host_name}': {fixed_count} clients fixed")
-            else:
-                logger.debug(f"XTLS sync completed for host '{host_name}': all clients OK")
-        
-        except Exception as e:
-            logger.error(f"XTLS sync failed for host '{host_name}': {e}", exc_info=True)
-            results[host_name] = {"status": "error", "error": str(e), "fixed": 0}
-    
+        results[host_name] = _sync_xtls_for_host(host_info)
+
+    return results
+
+def _sync_xtls_for_host(host_info: dict) -> dict:
+    """
+    Synchronize XTLS settings for a single host.
+
+    Returns: dict with sync result for the host
+    """
+    host_name = host_info.get('host_name')
+    try:
+        # Login to host
+        api, inbound = login_to_host(
+            host_url=host_info['host_url'],
+            username=host_info['host_username'],
+            password=host_info['host_pass'],
+            inbound_id=host_info['host_inbound_id']
+        )
+
+        if not api or not inbound:
+            logger.error(f"Could not connect to host '{host_name}' for XTLS sync")
+            return {"status": "connection_failed", "fixed": 0}
+
+        # Get fresh inbound data
+        inbound_fresh = api.inbound.get_by_id(inbound.id)
+        if not inbound_fresh or not inbound_fresh.settings.clients:
+            logger.warning(f"No clients found on host '{host_name}'")
+            return {"status": "no_clients", "fixed": 0}
+
+        # Determine inbound protocol type
+        protocol = getattr(inbound_fresh, 'protocol', 'unknown').lower()
+        network, security = _get_stream_network_security(inbound_fresh)
+
+        logger.info(f"Host '{host_name}' - protocol: {protocol}, network: {network}, security: {security}")
+
+        # Validate and fix XTLS for each client
+        fixed_count = 0
+        issues_found = []
+
+        for client in inbound_fresh.settings.clients:
+            client_email = client.email
+            client_flow = getattr(client, 'flow', '') or ''
+
+            # Determine expected XTLS config
+            expected_flow = ""
+            expected_security = "none"
+
+            if protocol == "vless":
+                if network == "tcp" and security == "reality":
+                    expected_flow = "xtls-rprx-vision"
+                    expected_security = "reality"
+                elif network == "tcp" and security == "tls":
+                    expected_security = "tls"
+                elif network == "grpc":
+                    # gRPC doesn't use XTLS flow
+                    expected_security = security
+
+            # Check if fix needed
+            needs_fix = False
+            fix_reason = ""
+
+            if protocol == "vless" and network == "tcp" and security == "reality":
+                # Reality TCP MUST have XTLS flow
+                if client_flow != "xtls-rprx-vision":
+                    needs_fix = True
+                    fix_reason = f"Flow '{client_flow}' != 'xtls-rprx-vision' (Reality TCP requires XTLS-Vision)"
+            elif protocol == "vless" and network == "grpc":
+                # gRPC should not have XTLS flow
+                if "xtls" in client_flow.lower():
+                    needs_fix = True
+                    fix_reason = f"Flow contains XTLS ('{client_flow}') but gRPC doesn't use XTLS"
+
+            if needs_fix:
+                logger.info(f"Client '{client_email}' needs XTLS fix: {fix_reason}")
+                issues_found.append({
+                    "email": client_email,
+                    "reason": fix_reason,
+                    "current_flow": client_flow,
+                    "expected_flow": expected_flow
+                })
+
+                # Auto-fix: update client on panel
+                try:
+                    client.flow = expected_flow
+
+                    api.inbound.update(inbound.id, inbound_fresh)
+                    fixed_count += 1
+                    logger.info(f"Fixed XTLS for client '{client_email}': flow='{expected_flow}', security='{expected_security}'")
+                except Exception as fix_error:
+                    logger.error(f"Failed to fix XTLS for client '{client_email}': {fix_error}")
+
+        result = {
+            "status": "success",
+            "fixed": fixed_count,
+            "issues": issues_found,
+            "protocol": protocol,
+            "network": network,
+            "security": security
+        }
+
+        if fixed_count > 0:
+            logger.info(f"XTLS sync completed for host '{host_name}': {fixed_count} clients fixed")
+        else:
+            logger.debug(f"XTLS sync completed for host '{host_name}': all clients OK")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"XTLS sync failed for host '{host_name}': {e}", exc_info=True)
+        return {"status": "error", "error": str(e), "fixed": 0}
+
+def sync_inbounds_xtls_for_hosts(host_names: set[str]) -> dict[str, dict]:
+    from shop_bot.data_manager.database import get_all_hosts
+
+    if not host_names:
+        return {}
+
+    results = {}
+    all_hosts = get_all_hosts()
+    if not all_hosts:
+        logger.warning("No hosts configured in database. XTLS sync skipped.")
+        return {"status": "no_hosts"}
+
+    selected_hosts = [h for h in all_hosts if h.get('host_name') in host_names]
+    if not selected_hosts:
+        logger.warning("Requested hosts not found in database. XTLS sync skipped.")
+        return {"status": "no_matching_hosts"}
+
+    for host_info in selected_hosts:
+        host_name = host_info.get('host_name')
+        logger.info(f"Starting XTLS sync for host: {host_name}")
+        results[host_name] = _sync_xtls_for_host(host_info)
+
     return results

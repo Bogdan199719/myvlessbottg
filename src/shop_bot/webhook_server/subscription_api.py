@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from datetime import datetime
 from flask import Blueprint, Response, request, abort
 from werkzeug.exceptions import HTTPException
@@ -18,6 +19,26 @@ from shop_bot.utils import time_utils
 
 
 subscription_bp = Blueprint('subscription', __name__)
+
+_XTLS_SYNC_INTERVAL_SECONDS = 300
+_last_xtls_sync_by_host: dict[str, float] = {}
+
+def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
+    if not host_names:
+        return
+
+    now = time.time()
+    to_sync = {h for h in host_names if now - _last_xtls_sync_by_host.get(h, 0) >= _XTLS_SYNC_INTERVAL_SECONDS}
+    if not to_sync:
+        return
+
+    try:
+        results = xui_api.sync_inbounds_xtls_for_hosts(to_sync)
+        for host_name in to_sync:
+            _last_xtls_sync_by_host[host_name] = now
+        logger.info(f"Auto XTLS sync triggered from subscription: hosts={sorted(to_sync)} results={results}")
+    except Exception as e:
+        logger.error(f"Auto XTLS sync failed in subscription handler: {e}", exc_info=True)
 
 @subscription_bp.route('/sub/<token>', methods=['GET'])
 def get_subscription(token):
@@ -185,6 +206,8 @@ def get_subscription(token):
         if len(active_paid_keys) > len(keys_by_host):
             logger.warning(f"DEDUP ALERT: {len(active_paid_keys) - len(keys_by_host)} duplicate keys were removed!")
         
+        _maybe_sync_xtls_for_hosts({h for h in keys_by_host.keys() if h})
+
         configs = []
         for host_name in sorted(keys_by_host.keys()):
             key = keys_by_host[host_name]
