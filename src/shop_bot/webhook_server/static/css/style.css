@@ -758,6 +758,9 @@ a.stat-card:hover {
 
 .transactions-table th {
 	font-weight: 600;
+	position: sticky;
+	top: 0;
+	z-index: 1;
 }
 
 .pagination {
@@ -832,6 +835,9 @@ a.stat-card:hover {
 
 .users-table th {
 	font-weight: 600;
+	position: sticky;
+	top: 0;
+	z-index: 1;
 }
 
 .users-table .actions-cell {

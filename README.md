@@ -57,6 +57,7 @@ docker-compose up -d --build
 - [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
