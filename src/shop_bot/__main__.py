@@ -56,9 +56,16 @@ def main():
                 break
         
         def run_flask():
-            from waitress import serve
-            logger.info("Starting production server (waitress) on http://0.0.0.0:1488")
-            serve(flask_app, host='0.0.0.0', port=1488, _quiet=True)
+            try:
+                from waitress import serve
+                logger.info("Starting production server (waitress) on http://0.0.0.0:1488")
+                serve(flask_app, host='0.0.0.0', port=1488, _quiet=True)
+            except Exception as e:
+                logger.warning(
+                    f"Waitress failed to стартовать ({e}). "
+                    "Falling back to Flask встроенный сервер.",
+                )
+                flask_app.run(host='0.0.0.0', port=1488, threaded=True, use_reloader=False)
 
         flask_thread = threading.Thread(
             target=run_flask,
@@ -68,29 +75,36 @@ def main():
         
         logger.info("Flask server started in a background thread on http://0.0.0.0:1488")
         
-        # Perform initial XTLS sync at startup (forced sync)
-        logger.info("Performing initial XTLS synchronization at startup...")
+        # Perform initial XTLS sync at startup only if enabled
         try:
-            sync_results = await xui_api.sync_inbounds_xtls_from_all_hosts()
-            total_fixed = 0
-            if sync_results and isinstance(sync_results, dict):
-                for host_name, result in sync_results.items():
-                    if isinstance(result, dict):
-                        fixed = result.get('fixed', 0)
-                        total_fixed += fixed
-                        status = result.get('status', 'unknown')
-                        if fixed > 0:
-                            logger.info(f"Startup XTLS sync for '{host_name}': {fixed} clients fixed. Status: {status}")
-                        elif status == 'success':
-                            logger.debug(f"Startup XTLS sync for '{host_name}': no fixes needed.")
-                        else:
-                            logger.warning(f"Startup XTLS sync for '{host_name}': status={status}")
-            if total_fixed > 0:
-                logger.info(f"Startup XTLS synchronization completed: {total_fixed} total clients fixed")
+            xtls_enabled = database.get_setting("xtls_sync_enabled")
+            if str(xtls_enabled).strip().lower() in {"1", "true", "yes", "on"}:
+                logger.info("Performing initial XTLS synchronization at startup...")
+                try:
+                    sync_results = await xui_api.sync_inbounds_xtls_from_all_hosts()
+                    total_fixed = 0
+                    if sync_results and isinstance(sync_results, dict):
+                        for host_name, result in sync_results.items():
+                            if isinstance(result, dict):
+                                fixed = result.get('fixed', 0)
+                                total_fixed += fixed
+                                status = result.get('status', 'unknown')
+                                if fixed > 0:
+                                    logger.info(f"Startup XTLS sync for '{host_name}': {fixed} clients fixed. Status: {status}")
+                                elif status == 'success':
+                                    logger.debug(f"Startup XTLS sync for '{host_name}': no fixes needed.")
+                                else:
+                                    logger.warning(f"Startup XTLS sync for '{host_name}': status={status}")
+                    if total_fixed > 0:
+                        logger.info(f"Startup XTLS synchronization completed: {total_fixed} total clients fixed")
+                    else:
+                        logger.info("Startup XTLS synchronization completed: all clients have correct settings")
+                except Exception as e:
+                    logger.error(f"Error during startup XTLS synchronization: {e}", exc_info=True)
             else:
-                logger.info("Startup XTLS synchronization completed: all clients have correct settings")
+                logger.debug("Startup XTLS sync disabled (xtls_sync_enabled=false).")
         except Exception as e:
-            logger.error(f"Error during startup XTLS synchronization: {e}", exc_info=True)
+            logger.error(f"Failed to read xtls_sync_enabled setting: {e}", exc_info=True)
             
         logger.info("Application is running. Bot can be started from the web panel.")
         

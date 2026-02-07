@@ -40,7 +40,7 @@ from shop_bot.data_manager.database import (
     get_referral_count, add_to_referral_balance, create_pending_transaction, run_migration,
     set_referral_balance, set_referral_balance_all, get_all_keys_with_usernames,
     update_key_connection_string,
-    get_host, update_host, toggle_host_status,
+    get_host, update_host, toggle_host_status, get_keys_for_host,
     add_new_key, get_user, update_user_stats
 )
 
@@ -209,7 +209,10 @@ ALL_SETTINGS_KEYS = [
     "heleket_merchant_id", "heleket_api_key", "domain", "referral_percentage",
     "referral_discount", "ton_wallet_address", "tonapi_key", "force_subscription", "trial_enabled", "trial_duration_days", "enable_referrals", "minimum_withdrawal",
     "support_group_id", "support_bot_token", "p2p_enabled", "p2p_card_number", "stars_enabled", "stars_rub_per_star",
-    "enable_admin_payment_notifications", "enable_admin_trial_notifications", "subscription_name"
+    "enable_admin_payment_notifications", "enable_admin_trial_notifications", "subscription_name",
+    "subscription_live_sync", "subscription_live_stats", "subscription_allow_fallback_host_fetch",
+    "subscription_auto_provision",
+    "panel_sync_enabled", "xtls_sync_enabled"
 ]
 
 def create_webhook_app(bot_controller_instance):
@@ -536,25 +539,52 @@ def create_webhook_app(bot_controller_instance):
     def sync_keys_configs():
         try:
             all_keys = get_all_keys_with_usernames()
-            updated_count = 0
-            
+            loop = current_app.config.get('EVENT_LOOP')
+            if not loop or not loop.is_running():
+                flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for('keys_page'))
+
+            keys_by_host = {}
             for key in all_keys:
-                try:
-                    # Logic: fetch details from host
-                    result = asyncio.run(xui_api.get_key_details_from_host(key))
-                    if result and result.get('connection_string'):
-                        # Update DB
-                        update_key_connection_string(key['key_id'], result['connection_string'])
-                        updated_count += 1
-                except Exception as k_e:
-                    logger.warning(f"Failed to sync key {key['key_id']}: {k_e}")
+                host_name = key.get('host_name')
+                if not host_name:
                     continue
+                keys_by_host.setdefault(host_name, []).append(key)
 
-            flash(f"Синхронизация завершена. Обновлено строк подключения: {updated_count}", "success")
+            async def _sync_all_keys():
+                total_updated = 0
+                hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
+                for host_name in hosts:
+                    if host_name not in keys_by_host:
+                        continue
+                    try:
+                        mapping = await asyncio.wait_for(
+                            xui_api.get_connection_strings_for_host(host_name),
+                            timeout=15
+                        )
+                    except Exception as k_e:
+                        logger.warning(f"Failed to sync host '{host_name}': {k_e!r}", exc_info=True)
+                        await asyncio.sleep(0.5)
+                        continue
 
+                    for key in keys_by_host[host_name]:
+                        email = key.get('key_email')
+                        if not email:
+                            continue
+                        conn = mapping.get(email)
+                        if conn:
+                            update_key_connection_string(key['key_id'], conn)
+                            total_updated += 1
+
+                    await asyncio.sleep(0.5)
+
+                logger.info(f"Sync keys completed. Updated connection strings: {total_updated}")
+
+            asyncio.run_coroutine_threadsafe(_sync_all_keys(), loop)
+            flash("Синхронизация ключей запущена в фоне. Проверьте логи позже.", "info")
         except Exception as e:
             logger.error(f"Error syncing keys: {e}", exc_info=True)
-            flash("Ошибка при синхронизации ключей.", "danger")
+            flash("Не удалось запустить синхронизацию ключей.", "danger")
 
         return redirect(url_for('keys_page'))
 
@@ -562,23 +592,32 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def fix_client_parameters():
         try:
-            all_keys = get_all_keys_with_usernames()
-            fixed_count = 0
+            loop = current_app.config.get('EVENT_LOOP')
+            if not loop or not loop.is_running():
+                flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for('keys_page'))
 
-            for key in all_keys:
-                try:
-                    # Fix client parameters on panel
-                    result = asyncio.run(xui_api.fix_client_parameters_on_host(key['host_name'], key['key_email']))
-                    if result:
-                        fixed_count += 1
-                except Exception as k_e:
-                    logger.warning(f"Failed to fix client parameters for key {key['key_id']}: {k_e}")
-                    continue
+            async def _fix_all_clients():
+                total_fixed = 0
+                hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
+                for host_name in hosts:
+                    try:
+                        fixed = await asyncio.wait_for(
+                            xui_api.fix_all_client_parameters_on_host(host_name),
+                            timeout=20
+                        )
+                        total_fixed += fixed
+                    except Exception as k_e:
+                        logger.warning(f"Failed to fix clients on host '{host_name}': {k_e!r}", exc_info=True)
+                    await asyncio.sleep(1)
 
-            flash(f"Исправление параметров завершено. Обновлено клиентов: {fixed_count}", "success")
+                logger.info(f"Fix parameters completed. Updated clients: {total_fixed}")
+
+            asyncio.run_coroutine_threadsafe(_fix_all_clients(), loop)
+            flash("Исправление параметров запущено в фоне. Проверьте логи позже.", "info")
         except Exception as e:
-            logger.error(f"Fix parameters error: {e}")
-            flash("Ошибка при исправлении параметров клиентов", "danger")
+            logger.error(f"Fix parameters error: {e}", exc_info=True)
+            flash("Не удалось запустить исправление параметров клиентов.", "danger")
         return redirect(url_for('keys_page'))
 
     @flask_app.route('/settings', methods=['GET', 'POST'])
@@ -978,14 +1017,6 @@ def create_webhook_app(bot_controller_instance):
             inbound=int(request.form['host_inbound_id'])
         )
         
-        # Trigger background sync to update connection strings (flags)
-        try:
-            loop = current_app.config.get('EVENT_LOOP')
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(scheduler.sync_keys_with_panels(), loop)
-        except Exception as e:
-            logger.error(f"Failed to trigger background sync after host update: {e}")
-
         flash(f"Хост '{old_host_name}' успешно обновлен.", 'success')
         return redirect(url_for('settings_page'))
 
@@ -1004,6 +1035,44 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/delete-host/<host_name>', methods=['POST'])
     @login_required
     def delete_host_route(host_name):
+        keys = get_keys_for_host(host_name)
+        if keys:
+            async def _delete_all_clients_strict():
+                tasks = [
+                    xui_api.delete_client_on_host(host_name, key.get('key_email'))
+                    for key in keys
+                    if key.get('key_email')
+                ]
+                if not tasks:
+                    return True
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=60
+                )
+                all_ok = True
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Error deleting client during host removal: {result}", exc_info=True)
+                        all_ok = False
+                    elif result is False:
+                        all_ok = False
+                return all_ok
+
+            loop = current_app.config.get('EVENT_LOOP')
+            try:
+                if loop and loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(_delete_all_clients_strict(), loop)
+                    all_ok = future.result(timeout=65)
+                else:
+                    all_ok = asyncio.run(_delete_all_clients_strict())
+            except Exception as e:
+                logger.error(f"Failed to delete clients from host '{host_name}': {e}", exc_info=True)
+                all_ok = False
+
+            if not all_ok:
+                flash("Удаление остановлено: не все клиенты удалены из 3x-ui. Хост не удалён.", "danger")
+                return redirect(url_for('settings_page'))
+
         delete_host(host_name)
         flash(f"Хост '{host_name}' и все его тарифы были удалены.", 'success')
         return redirect(url_for('settings_page'))

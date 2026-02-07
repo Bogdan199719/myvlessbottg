@@ -1,7 +1,24 @@
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery, Chat
+from aiogram.exceptions import TelegramBadRequest
 from shop_bot.data_manager.database import get_user
+
+class SafeCallbackMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        try:
+            return await handler(event, data)
+        except TelegramBadRequest as e:
+            message = str(e).lower()
+            if "query is too old" in message or "query id is invalid" in message:
+                # Ignore expired callback answers to reduce log noise
+                return
+            raise
 
 class BanMiddleware(BaseMiddleware):
     async def __call__(

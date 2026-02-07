@@ -143,6 +143,12 @@ def initialize_db():
                 "tonapi_key": os.getenv("TONAPI_KEY"),
                 "p2p_enabled": "false",
                 "p2p_card_number": None,
+                "subscription_live_sync": "false",
+                "subscription_live_stats": "false",
+                "subscription_allow_fallback_host_fetch": "false",
+                "subscription_auto_provision": "false",
+                "panel_sync_enabled": "false",
+                "xtls_sync_enabled": "false",
             }
             run_migration()
             for key, value in default_settings.items():
@@ -391,6 +397,7 @@ def update_host(old_name: str, new_name: str, url: str, user: str, passwd: str, 
             if old_name != new_name:
                 cursor.execute("UPDATE plans SET host_name=? WHERE host_name=?", (new_name, old_name))
                 cursor.execute("UPDATE vpn_keys SET host_name=? WHERE host_name=?", (new_name, old_name))
+                cursor.execute("UPDATE vpn_keys_missing SET host_name=? WHERE host_name=?", (new_name, old_name))
                 
             conn.commit()
             logging.info(f"Host '{old_name}' updated to '{new_name}'.")
@@ -413,6 +420,8 @@ def delete_host(host_name: str):
             cursor = conn.cursor()
             cursor.execute("DELETE FROM xui_hosts WHERE host_name = ?", (host_name,))
             cursor.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
+            cursor.execute("DELETE FROM vpn_keys WHERE host_name = ?", (host_name,))
+            cursor.execute("DELETE FROM vpn_keys_missing WHERE host_name = ?", (host_name,))
             conn.commit()
             logging.info(f"Host '{host_name}' deleted.")
     except sqlite3.Error as e:
@@ -832,6 +841,28 @@ def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: s
     except sqlite3.Error as e:
         logging.error(f"Failed to add new key for user {user_id}: {e}")
         return None
+
+def update_key_by_email(key_email: str, host_name: str, xui_client_uuid: str, expiry_timestamp_ms: int, connection_string: str | None = None, plan_id: int = 0):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            expiry_date = time_utils.from_timestamp_ms(expiry_timestamp_ms)
+            if connection_string:
+                cursor.execute(
+                    "UPDATE vpn_keys SET host_name = ?, xui_client_uuid = ?, expiry_date = ?, connection_string = ?, plan_id = ? WHERE key_email = ?",
+                    (host_name, xui_client_uuid, expiry_date, connection_string, plan_id, key_email)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE vpn_keys SET host_name = ?, xui_client_uuid = ?, expiry_date = ?, plan_id = ? WHERE key_email = ?",
+                    (host_name, xui_client_uuid, expiry_date, plan_id, key_email)
+                )
+            cursor.execute("DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,))
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update key by email {key_email}: {e}")
+        return False
 
 def delete_key_by_email(email: str):
     try:

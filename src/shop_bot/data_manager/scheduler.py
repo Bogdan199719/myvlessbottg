@@ -21,6 +21,12 @@ TRIAL_NOTIFY_HOURS = {1, 0}
 
 logger = logging.getLogger(__name__)
 
+def _bool_setting(key: str, default: bool = False) -> bool:
+    raw = database.get_setting(key)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
 def format_time_left(hours: int) -> str:
     if hours >= 24:
         days = hours // 24
@@ -226,7 +232,7 @@ async def sync_keys_with_panels():
     total_affected_records = 0
     failed_hosts = []  # Collect failed hosts for summary log
     
-    all_hosts = await asyncio.to_thread(database.get_all_hosts)
+    all_hosts = await asyncio.to_thread(database.get_all_hosts, True)
     if not all_hosts:
         logger.info("Scheduler: No hosts configured in the database. Sync skipped.")
         return
@@ -391,16 +397,21 @@ async def periodic_subscription_check(bot_controller: BotController):
 
     while True:
         try:
-            await sync_keys_with_panels()
+            if _bool_setting("panel_sync_enabled", default=False):
+                await sync_keys_with_panels()
+            else:
+                logger.debug("Scheduler: panel sync disabled (panel_sync_enabled=false).")
             
             # Run cleanup once per cycle (or could be less frequent, but this is cheap)
             await cleanup_old_notifications()
             
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
-            if current_time - last_xtls_sync_time >= xtls_sync_interval:
+            if _bool_setting("xtls_sync_enabled", default=False) and current_time - last_xtls_sync_time >= xtls_sync_interval:
                 await periodic_xtls_sync()
                 last_xtls_sync_time = current_time
+            elif current_time - last_xtls_sync_time >= xtls_sync_interval:
+                logger.debug("Scheduler: XTLS sync disabled (xtls_sync_enabled=false).")
 
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()

@@ -8,7 +8,14 @@ from typing import List, Dict
 
 from py3xui import Api, Client, Inbound
 
-from shop_bot.data_manager.database import get_host, get_key_by_email
+from shop_bot.data_manager.database import (
+    get_host,
+    get_key_by_email,
+    get_keys_for_host,
+    update_key_by_email,
+    update_key_connection_string,
+    purge_missing_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +245,7 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
             f"&security=reality&pbk={public_key}&fp={fp}&sni={server_name}"
             f"&sid={short_id}&spx=%2F{flow_param}#{remark}"
         )
-        logger.info(f"Generated Reality connection string: {connection_string}")
+        logger.debug("Generated Reality connection string for %s on %s", user_uuid, hostname)
         return connection_string
 
     # Проверяем TLS настройки
@@ -265,13 +272,13 @@ def _get_vless_connection_string(inbound: Inbound, user_uuid: str, hostname: str
             f"{base_link}"
             f"&security=tls&sni={server_name}&fp={fp}#{remark}"
         )
-        logger.info(f"Generated TLS connection string: {connection_string}")
+        logger.debug("Generated TLS connection string for %s on %s", user_uuid, hostname)
         return connection_string
 
     # Без безопасности
     else:
         connection_string = f"{base_link}&security=none#{remark}"
-        logger.info(f"Generated plain connection string: {connection_string}")
+        logger.debug("Generated plain connection string for %s on %s", user_uuid, hostname)
         return connection_string
 
 # ... (VMess and Trojan functions remain similar but skipped for brevity as VLESS is focus) ...
@@ -512,6 +519,46 @@ def _get_client_traffic_sync(key_data: dict) -> dict | None:
             }
     return None
 
+async def get_connection_strings_for_host(host_name: str) -> dict[str, str]:
+    return await asyncio.to_thread(_get_connection_strings_for_host_sync, host_name)
+
+def _get_connection_strings_for_host_sync(host_name: str) -> dict[str, str]:
+    host_db_data = get_host(host_name)
+    if not host_db_data:
+        logger.error(f"Could not get connection strings: Host '{host_name}' not found in the database.")
+        return {}
+
+    api, inbound = login_to_host(
+        host_url=host_db_data['host_url'],
+        username=host_db_data['host_username'],
+        password=host_db_data['host_pass'],
+        inbound_id=host_db_data['host_inbound_id']
+    )
+    if not api or not inbound:
+        return {}
+
+    inbound_fresh = api.inbound.get_by_id(inbound.id)
+    if not inbound_fresh or not inbound_fresh.settings.clients:
+        return {}
+
+    country_flag = get_country_flag_by_host(host_name)
+    clean_server_name = host_name.replace(' ', '').encode('ascii', 'ignore').decode('ascii')
+    clean_server_name = ''.join(c for c in clean_server_name if c.isalnum() or c == '_')
+    clean_server_name = clean_server_name.lstrip('_')
+    server_remark = f"{country_flag}{clean_server_name}"
+
+    result: dict[str, str] = {}
+    for client in inbound_fresh.settings.clients:
+        email = getattr(client, 'email', None)
+        client_uuid = getattr(client, 'id', None)
+        if not email or not client_uuid:
+            continue
+        conn = get_connection_string(inbound_fresh, client_uuid, host_db_data['host_url'], remark=server_remark)
+        if conn:
+            result[email] = conn
+
+    return result
+
 async def fix_client_parameters_on_host(host_name: str, client_email: str) -> bool:
     """Fix flow and encryption parameters for existing client on host"""
     return await asyncio.to_thread(_fix_client_parameters_on_host_sync, host_name, client_email)
@@ -574,6 +621,135 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         logger.error(f"Failed to fix client '{client_email}' on host '{host_name}': {e}", exc_info=True)
         return False
 
+async def fix_all_client_parameters_on_host(host_name: str) -> int:
+    return await asyncio.to_thread(_fix_all_client_parameters_on_host_sync, host_name)
+
+def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
+    host_data = get_host(host_name)
+    if not host_data:
+        logger.error(f"Cannot fix clients: Host '{host_name}' not found.")
+        return 0
+
+    api, inbound = login_to_host(
+        host_url=host_data['host_url'],
+        username=host_data['host_username'],
+        password=host_data['host_pass'],
+        inbound_id=host_data['host_inbound_id']
+    )
+
+    if not api or not inbound:
+        logger.error(f"Cannot fix clients: Login or inbound lookup failed for host '{host_name}'.")
+        return 0
+
+    try:
+        keys_in_db = get_keys_for_host(host_name)
+        now = time_utils.get_msk_now()
+
+        # Fetch inbound once to detect missing clients
+        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        if not inbound_to_modify:
+            raise ValueError(f"Could not find inbound with ID {inbound.id}")
+
+        if inbound_to_modify.settings.clients is None:
+            inbound_to_modify.settings.clients = []
+
+        existing_emails = {c.email for c in inbound_to_modify.settings.clients if getattr(c, 'email', None)}
+
+        # Ensure all DB keys exist on panel (recreate if missing only)
+        for key in keys_in_db:
+            email = key.get('key_email')
+            expiry_str = key.get('expiry_date')
+            if not email or not expiry_str:
+                continue
+
+            if email in existing_emails:
+                continue
+
+            expiry_dt = time_utils.parse_iso_to_msk(expiry_str)
+            if not expiry_dt or expiry_dt <= now:
+                continue
+
+            remaining_seconds = int((expiry_dt - now).total_seconds())
+            if remaining_seconds <= 0:
+                continue
+
+            try:
+                client_uuid, new_expiry_ms = update_or_create_client_on_panel(
+                    api,
+                    inbound.id,
+                    email,
+                    days_to_add=0,
+                    seconds_to_add=remaining_seconds,
+                    telegram_id=None
+                )
+                if client_uuid and new_expiry_ms:
+                    country_flag = get_country_flag_by_host(host_name)
+                    clean_server_name = host_name.replace(' ', '').encode('ascii', 'ignore').decode('ascii')
+                    clean_server_name = ''.join(c for c in clean_server_name if c.isalnum() or c == '_').lstrip('_')
+                    server_remark = f"{country_flag}{clean_server_name}"
+                    conn = get_connection_string(inbound, client_uuid, host_data['host_url'], remark=server_remark)
+                    update_key_by_email(
+                        key_email=email,
+                        host_name=host_name,
+                        xui_client_uuid=client_uuid,
+                        expiry_timestamp_ms=new_expiry_ms,
+                        connection_string=conn,
+                        plan_id=key.get('plan_id')
+                    )
+                    existing_emails.add(email)
+                time.sleep(0.2)
+            except Exception as e:
+                logger.error(f"Failed to ensure client '{email}' on host '{host_name}': {e}", exc_info=True)
+
+        # Refresh inbound after potential additions and fix parameters in bulk
+        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        if not inbound_to_modify:
+            raise ValueError(f"Could not find inbound with ID {inbound.id}")
+
+        if inbound_to_modify.settings.clients is None:
+            inbound_to_modify.settings.clients = []
+
+        network, security = _get_stream_network_security(inbound_to_modify)
+        target_flow = ""
+        if network == 'tcp' and security == 'reality':
+            target_flow = "xtls-rprx-vision"
+
+        country_flag = get_country_flag_by_host(host_name)
+        clean_server_name = host_name.replace(' ', '').encode('ascii', 'ignore').decode('ascii')
+        clean_server_name = ''.join(c for c in clean_server_name if c.isalnum() or c == '_').lstrip('_')
+        server_remark = f"{country_flag}{clean_server_name}"
+
+        updated = 0
+        for client in inbound_to_modify.settings.clients:
+            client.flow = target_flow
+            try:
+                client.encryption = "none"
+            except (ValueError, AttributeError):
+                pass
+            updated += 1
+
+            try:
+                email = getattr(client, 'email', None)
+                if not email:
+                    continue
+                key = get_key_by_email(email)
+                if not key:
+                    continue
+                conn = get_connection_string(inbound_to_modify, client.id, host_data['host_url'], remark=server_remark)
+                if conn:
+                    update_key_connection_string(key['key_id'], conn)
+                    purge_missing_key(email)
+            except Exception as e:
+                logger.warning(f"Failed to refresh connection string for '{getattr(client, 'email', '')}': {e}")
+
+        api.inbound.update(inbound.id, inbound_to_modify)
+        logger.info(f"Fixed parameters for {updated} clients on host '{host_name}'.")
+        return updated
+
+    except Exception as e:
+        logger.error(f"Failed to fix clients on host '{host_name}': {e}", exc_info=True)
+        return 0
+
 async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     return await asyncio.to_thread(_delete_client_on_host_sync, host_name, client_email)
 
@@ -626,7 +802,7 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     """
     from shop_bot.data_manager.database import get_all_hosts
 
-    all_hosts = get_all_hosts()
+    all_hosts = get_all_hosts(only_enabled=True)
     if not all_hosts:
         logger.warning("No hosts configured in database. XTLS sync skipped.")
         return {"status": "no_hosts"}
@@ -755,7 +931,7 @@ def sync_inbounds_xtls_for_hosts(host_names: set[str]) -> dict[str, dict]:
         return {}
 
     results = {}
-    all_hosts = get_all_hosts()
+    all_hosts = get_all_hosts(only_enabled=True)
     if not all_hosts:
         logger.warning("No hosts configured in database. XTLS sync skipped.")
         return {"status": "no_hosts"}

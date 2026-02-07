@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 
 from shop_bot.data_manager import database
 from shop_bot.bot.handlers import get_user_router
-from shop_bot.bot.middlewares import BanMiddleware
+from shop_bot.bot.middlewares import BanMiddleware, SafeCallbackMiddleware
 from shop_bot.bot import handlers, support_handlers
 from shop_bot.bot.support_handlers import get_support_router
 
@@ -79,6 +79,7 @@ class BotController:
         try:
             self.shop_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             self.shop_dp = Dispatcher()
+            self.shop_dp.update.middleware(SafeCallbackMiddleware())
             self.shop_dp.update.middleware(BanMiddleware())
             self.shop_dp.include_router(get_user_router())
 
@@ -152,6 +153,7 @@ class BotController:
         try:
             self.support_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             self.support_dp = Dispatcher()
+            self.support_dp.update.middleware(SafeCallbackMiddleware())
             
             support_handlers.SUPPORT_GROUP_ID = int(group_id)
             support_handlers.user_bot = self.shop_bot
