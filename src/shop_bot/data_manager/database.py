@@ -838,6 +838,26 @@ def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: s
             
             conn.commit()
             return new_key_id
+    except sqlite3.IntegrityError as e:
+        message = str(e)
+        if "UNIQUE constraint failed: vpn_keys.key_email" in message:
+            existing_key = get_key_by_email(key_email)
+            if existing_key:
+                # Key already exists: update it instead of failing
+                updated = update_key_by_email(
+                    key_email=key_email,
+                    host_name=host_name,
+                    xui_client_uuid=xui_client_uuid,
+                    expiry_timestamp_ms=expiry_timestamp_ms,
+                    connection_string=connection_string,
+                    plan_id=plan_id
+                )
+                if updated:
+                    return existing_key.get('key_id')
+            logging.warning(f"Key '{key_email}' already exists but could not be updated.")
+            return None
+        logging.error(f"Failed to add new key for user {user_id}: {e}")
+        return None
     except sqlite3.Error as e:
         logging.error(f"Failed to add new key for user {user_id}: {e}")
         return None

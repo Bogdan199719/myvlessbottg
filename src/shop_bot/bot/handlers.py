@@ -865,7 +865,11 @@ def get_user_router() -> Router:
             await callback.answer()
         except TelegramBadRequest as e:
             message = str(e).lower()
-            if "query is too old" not in message and "query id is invalid" not in message:
+            if (
+                "query is too old" not in message
+                and "query id is invalid" not in message
+                and "response timeout expired" not in message
+            ):
                 raise
         user_id = callback.from_user.id
         

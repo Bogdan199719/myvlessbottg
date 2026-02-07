@@ -15,7 +15,11 @@ class SafeCallbackMiddleware(BaseMiddleware):
             return await handler(event, data)
         except TelegramBadRequest as e:
             message = str(e).lower()
-            if "query is too old" in message or "query id is invalid" in message:
+            if (
+                "query is too old" in message
+                or "query id is invalid" in message
+                or "response timeout expired" in message
+            ):
                 # Ignore expired callback answers to reduce log noise
                 return
             raise
