@@ -42,7 +42,8 @@ from shop_bot.data_manager.database import (
     get_plans_for_host, get_plan_by_id, log_transaction, get_referral_count,
     add_to_referral_balance, create_pending_transaction, get_all_users,
     set_referral_balance, set_referral_balance_all, DB_FILE, get_user_paid_keys, get_user_trial_keys,
-    set_pending_payment, get_pending_payment_status, clear_all_pending_payments
+    set_pending_payment, get_pending_payment_status, clear_all_pending_payments,
+    get_or_create_subscription_token
 )
 
 from shop_bot.config import (
@@ -346,7 +347,7 @@ def get_user_router() -> Router:
         token = callback.data[len("global_qr_"):]
         domain = get_setting("domain")
         user_id = callback.from_user.id
-        user_id = callback.from_user.id
+        expected_token = get_or_create_subscription_token(user_id)
         now = time_utils.get_msk_now()
         paid_keys = get_user_paid_keys(user_id)
         active_paid_keys = []
@@ -362,6 +363,10 @@ def get_user_router() -> Router:
 
         if not has_active_global_subscription(active_paid_keys):
              await callback.answer("У вас нет активной платной мультиподписки.", show_alert=True)
+             return
+        
+        if not expected_token or token != expected_token:
+             await callback.answer("Ссылка подписки недействительна. Откройте профиль и получите новую.", show_alert=True)
              return
 
         if not domain.startswith('http'):
@@ -386,7 +391,7 @@ def get_user_router() -> Router:
         token = callback.data[len("global_link_"):]
         domain = get_setting("domain")
         user_id = callback.from_user.id
-        user_id = callback.from_user.id
+        expected_token = get_or_create_subscription_token(user_id)
         now = time_utils.get_msk_now()
         paid_keys = get_user_paid_keys(user_id)
         active_paid_keys = []
@@ -402,6 +407,10 @@ def get_user_router() -> Router:
 
         if not has_active_global_subscription(active_paid_keys):
             await callback.answer("У вас нет активной платной мультиподписки.", show_alert=True)
+            return
+        
+        if not expected_token or token != expected_token:
+            await callback.answer("Ссылка подписки недействительна. Откройте профиль и получите новую.", show_alert=True)
             return
 
         if not str(domain).startswith('http'):
@@ -489,6 +498,8 @@ def get_user_router() -> Router:
         
         domain = get_setting("domain")
         subscription_token = user_db_data.get('subscription_token')
+        if not subscription_token:
+            subscription_token = get_or_create_subscription_token(user_id)
         subscription_text = ""
         profile_kb = InlineKeyboardBuilder()
 
@@ -961,7 +972,7 @@ def get_user_router() -> Router:
              if dt and dt > now:
                  user_keys.append(k)
 
-        user_token = get_user(user_id).get('subscription_token')
+        user_token = get_or_create_subscription_token(user_id)
         
         if not has_active_global_subscription(user_keys):
              await callback.message.edit_text("У вас нет активной глобальной подписки.", reply_markup=keyboards.create_back_to_menu_keyboard())
@@ -985,7 +996,7 @@ def get_user_router() -> Router:
             f"🔗 <b>Доступно серверов:</b> {len(user_keys)}\n\n"
             "Продление действует сразу на все сервера в глобальной подписке.\n"
             "Используйте кнопки ниже для продления или подключения.",
-            reply_markup=keyboards.create_global_info_keyboard(user_token)
+            reply_markup=keyboards.create_global_info_keyboard(user_token) if user_token else keyboards.create_back_to_menu_keyboard()
         )
 
     @user_router.callback_query(F.data == "get_trial")
@@ -2692,11 +2703,15 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         
         if host_name == 'ALL':
              domain = get_setting("domain")
-             user_token = get_user(user_id).get('subscription_token')
+             user_token = get_or_create_subscription_token(user_id)
+             plan = get_plan_by_id(metadata.get('plan_id')) if metadata else None
+             plan_name = plan.get('plan_name') if isinstance(plan, dict) else None
+             if not plan_name:
+                 plan_name = "—"
              
              final_text = (
                  f"🎉 <b>Мульти-подписка активирована!</b>\n"
-                 f"Ваш тариф: {get_plan_by_id(metadata.get('plan_id')).get('plan_name')}\n"
+                 f"Ваш тариф: {plan_name}\n"
                  f"Срок действия до: {new_expiry_date.strftime('%d.%m.%Y')}\n\n"
              )
              

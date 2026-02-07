@@ -211,6 +211,16 @@ def run_migration():
                 logging.info(f" -> Generated subscription tokens for {len(users_without_token)} existing users and created unique index.")
             else:
                 logging.info(" -> The column 'subscription_token' already exists.")
+                # Ensure unique index exists even if column was created earlier
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users (subscription_token)")
+                # Backfill missing tokens if any users have NULL/empty values
+                cursor.execute("SELECT telegram_id FROM users WHERE subscription_token IS NULL OR subscription_token = ''")
+                users_without_token = cursor.fetchall()
+                for (uid,) in users_without_token:
+                    new_token = str(uuid.uuid4())
+                    cursor.execute("UPDATE users SET subscription_token = ? WHERE telegram_id = ?", (new_token, uid))
+                if users_without_token:
+                    logging.info(f" -> Backfilled subscription tokens for {len(users_without_token)} users.")
 
             # Check for is_enabled column in xui_hosts
             cursor.execute("PRAGMA table_info(xui_hosts)")
@@ -575,8 +585,9 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
-            if not cursor.fetchone():
+            cursor.execute("SELECT telegram_id, subscription_token FROM users WHERE telegram_id = ?", (telegram_id,))
+            row = cursor.fetchone()
+            if not row:
                 token = str(uuid.uuid4())
                 cursor.execute(
                     "INSERT INTO users (telegram_id, username, registration_date, referred_by, subscription_token) VALUES (?, ?, ?, ?, ?)",
@@ -584,9 +595,36 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
                 )
             else:
                 cursor.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
+                # Ensure legacy users have a subscription token
+                existing_token = row[1] if len(row) > 1 else None
+                if not existing_token:
+                    new_token = str(uuid.uuid4())
+                    cursor.execute(
+                        "UPDATE users SET subscription_token = ? WHERE telegram_id = ?",
+                        (new_token, telegram_id)
+                    )
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to register user {telegram_id}: {e}")
+
+def get_or_create_subscription_token(telegram_id: int) -> str | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT subscription_token FROM users WHERE telegram_id = ?", (telegram_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+            new_token = str(uuid.uuid4())
+            cursor.execute(
+                "UPDATE users SET subscription_token = ? WHERE telegram_id = ?",
+                (new_token, telegram_id)
+            )
+            conn.commit()
+            return new_token
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get/create subscription token for user {telegram_id}: {e}")
+        return None
 
 def add_to_referral_balance(user_id: int, amount: float):
     try:
