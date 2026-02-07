@@ -6,12 +6,12 @@ MyVlessBot is a ready-to-run solution for automated VLESS key sales via Telegram
 
 - Automatic key issuance after payment.
 - Web admin panel.
-- Multi-host support.
+- Multi-host support with global subscription support.
 - Flexible plans (month, year, trial, referrals).
 - Payments: YooKassa, CryptoBot, Heleket, TonConnect, Telegram Stars.
 - Built-in support workflow.
 
-## One-command install
+## One-command install (recommended)
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Bogdan199719/myvlessbottg/main/install.sh | sudo bash
@@ -49,16 +49,19 @@ docker-compose up -d --build
 
 ## Updates
 
-- Admin panel update uses `git fetch/reset` and `pip install`.
+- Admin panel update uses `git fetch/reset` and dependency install.
 - `.env` and `users.db` are not touched.
 
-## Documentation
+## Security & privacy
 
-- [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)
-- [CHANGELOG.md](CHANGELOG.md)
+- Do NOT commit `.env` or `users.db` to Git.
+- Keep all tokens and API keys only in `.env` or in the admin panel settings.
+- This repository does not include any personal data or secrets.
+
+## Support
+
+If you have questions or issues, open an issue or contact the support bot configured in your panel.
 
 ## License
 
-MyVlessBot ? 2024 Bogdan199719. All rights reserved.
+MyVlessBot © 2024 Bogdan199719. All rights reserved.
