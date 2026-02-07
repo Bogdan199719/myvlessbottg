@@ -244,6 +244,10 @@ def create_webhook_app(bot_controller_instance):
     flask_app.config['SESSION_COOKIE_HTTPONLY'] = True
     flask_app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
+    @flask_app.route('/favicon.ico')
+    def favicon():
+        return ("", 204)
+
     # CSRF Protection
     @flask_app.before_request
     def csrf_protect():

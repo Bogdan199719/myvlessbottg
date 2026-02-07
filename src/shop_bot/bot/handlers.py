@@ -861,7 +861,12 @@ def get_user_router() -> Router:
     @user_router.callback_query(F.data == "manage_keys")
     @registration_required
     async def manage_keys_handler(callback: types.CallbackQuery):
-        await callback.answer()
+        try:
+            await callback.answer()
+        except TelegramBadRequest as e:
+            message = str(e).lower()
+            if "query is too old" not in message and "query id is invalid" not in message:
+                raise
         user_id = callback.from_user.id
         
         # Get PAID keys (for global subscription check) and TRIAL keys
