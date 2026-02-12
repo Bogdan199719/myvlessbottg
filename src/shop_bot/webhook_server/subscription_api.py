@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from flask import Blueprint, Response, request, abort
@@ -10,7 +11,7 @@ from werkzeug.exceptions import HTTPException
 from shop_bot.data_manager.database import (
     get_user, get_user_paid_keys, get_all_settings,
     get_user_by_token, get_plans_for_host, get_all_hosts, add_new_key,
-    get_missing_keys, get_setting, get_key_by_email, update_key_by_email
+    get_missing_keys, get_setting, get_key_by_email, update_key_by_email, get_next_key_number
 )
 from shop_bot.modules import xui_api
 
@@ -28,6 +29,36 @@ _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
 _PROVISION_TIMEOUT_SECONDS = 10
+
+def _host_slug(host_name: str) -> str:
+    return (host_name or "").replace(" ", "").lower()
+
+def _pick_global_key_number(user_id: int, active_paid_keys: list[dict]) -> int:
+    """
+    Pick a stable key number for global auto-provisioning.
+    Prefer existing user key numbers; fallback to next available.
+    """
+    pattern = re.compile(rf"^user{int(user_id)}-key(\d+)-", re.IGNORECASE)
+    numbers: list[int] = []
+
+    for key in active_paid_keys:
+        email = str(key.get("key_email") or "")
+        match = pattern.match(email)
+        if not match:
+            continue
+        try:
+            numbers.append(int(match.group(1)))
+        except Exception:
+            continue
+
+    if numbers:
+        # Keep continuity with already issued keys for this subscription.
+        return max(set(numbers), key=numbers.count)
+
+    try:
+        return int(get_next_key_number(int(user_id)))
+    except Exception:
+        return 1
 
 def _bool_setting(key: str, default: bool = False) -> bool:
     raw = get_setting(key)
@@ -136,6 +167,7 @@ def get_subscription(token):
 
         if active_global_keys and global_plan_ids and auto_provision_enabled:
             first_global_plan_id = int(next(iter(global_plan_ids)))
+            key_number = _pick_global_key_number(user_id, active_paid_keys)
             # Remaining validity based on the soonest-expiring global key
             try:
                 remaining_seconds = int(
@@ -158,7 +190,7 @@ def get_subscription(token):
                         logger.debug(f"Host '{host_name}' already has a key")
                         continue
 
-                    email = f"user{user_id}-global-{host_name.replace(' ', '').lower()}"
+                    email = f"user{user_id}-key{key_number}-{_host_slug(host_name)}"
                     logger.info(f"Auto-provisioning key for host '{host_name}' with email '{email}'")
                     
                     # Run async helper in a fresh loop (Flask view is sync)
