@@ -149,6 +149,25 @@ def _get_stream_network_security(inbound: Inbound) -> tuple[str, str]:
             security = "reality"
     return network, security
 
+def _set_unlimited_traffic_fields(client: Client) -> bool:
+    """
+    Force client to unlimited traffic in all commonly used fields.
+    Returns True if at least one field value changed.
+    """
+    changed = False
+
+    for attr, value in (("total_gb", 0), ("reset", 0), ("total", 0)):
+        try:
+            current = getattr(client, attr, None)
+            if current != value:
+                setattr(client, attr, value)
+                changed = True
+        except Exception:
+            # Some py3xui versions may not expose all fields.
+            continue
+
+    return changed
+
 def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remark: str) -> str | None:
     if not inbound:
         logger.error("Inbound is None")
@@ -356,8 +375,7 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
 
             # Normalize to unlimited traffic for consistency across global hosts.
             # Otherwise legacy non-zero caps may cause "exhausted" on one host only.
-            client_to_update.total_gb = 0
-            client_to_update.reset = 0
+            _set_unlimited_traffic_fields(client_to_update)
 
             if telegram_id and (not hasattr(client_to_update, 'tg_id') or not client_to_update.tg_id):
                  client_to_update.tg_id = telegram_id
@@ -381,6 +399,7 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
                 reset=0,
                 tg_id=telegram_id
             )
+            _set_unlimited_traffic_fields(new_client)
 
             api.client.add(inbound_id, [new_client])
             logger.info(f"Added new client '{email}' (UUID: {client_uuid})")
@@ -606,8 +625,7 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         
         # Fix client parameters
         inbound_to_modify.settings.clients[client_index].flow = target_flow
-        inbound_to_modify.settings.clients[client_index].total_gb = 0
-        inbound_to_modify.settings.clients[client_index].reset = 0
+        _set_unlimited_traffic_fields(inbound_to_modify.settings.clients[client_index])
         try:
             inbound_to_modify.settings.clients[client_index].encryption = "none"
         except (ValueError, AttributeError):
@@ -723,8 +741,7 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
         updated = 0
         for client in inbound_to_modify.settings.clients:
             client.flow = target_flow
-            client.total_gb = 0
-            client.reset = 0
+            _set_unlimited_traffic_fields(client)
             try:
                 client.encryption = "none"
             except (ValueError, AttributeError):
@@ -752,6 +769,104 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
     except Exception as e:
         logger.error(f"Failed to fix clients on host '{host_name}': {e}", exc_info=True)
         return 0
+
+async def sync_clients_state_on_host(host_name: str, desired_by_email: dict[str, dict]) -> dict:
+    return await asyncio.to_thread(_sync_clients_state_on_host_sync, host_name, desired_by_email)
+
+def _sync_clients_state_on_host_sync(host_name: str, desired_by_email: dict[str, dict]) -> dict:
+    """
+    Synchronize clients on one host to the target state from DB:
+    - enable/disable status
+    - expiry timestamp
+    - unlimited traffic fields
+    """
+    result = {
+        "host": host_name,
+        "checked": 0,
+        "updated": 0,
+        "already_ok": 0,
+        "not_found": 0,
+        "errors": 0,
+    }
+
+    if not desired_by_email:
+        return result
+
+    host_data = get_host(host_name)
+    if not host_data:
+        logger.error(f"Cannot sync clients state: Host '{host_name}' not found.")
+        result["errors"] += 1
+        return result
+
+    api, inbound = login_to_host(
+        host_url=host_data['host_url'],
+        username=host_data['host_username'],
+        password=host_data['host_pass'],
+        inbound_id=host_data['host_inbound_id']
+    )
+
+    if not api or not inbound:
+        logger.error(f"Cannot sync clients state: Login or inbound lookup failed for host '{host_name}'.")
+        result["errors"] += 1
+        return result
+
+    try:
+        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        if not inbound_to_modify:
+            raise ValueError(f"Could not find inbound with ID {inbound.id}")
+
+        if inbound_to_modify.settings.clients is None:
+            inbound_to_modify.settings.clients = []
+
+        clients_by_email = {
+            c.email: c for c in inbound_to_modify.settings.clients if getattr(c, "email", None)
+        }
+
+        any_changed = False
+        for email, state in desired_by_email.items():
+            result["checked"] += 1
+            client = clients_by_email.get(email)
+            if not client:
+                result["not_found"] += 1
+                continue
+
+            changed = False
+
+            target_enabled = bool(state.get("enabled", True))
+            if bool(getattr(client, "enable", True)) != target_enabled:
+                client.enable = target_enabled
+                changed = True
+
+            target_expiry_ms = state.get("expiry_timestamp_ms")
+            if target_expiry_ms is not None:
+                try:
+                    target_expiry_ms = int(target_expiry_ms)
+                    current_expiry_ms = int(getattr(client, "expiry_time", 0) or 0)
+                    if abs(current_expiry_ms - target_expiry_ms) > 1000:
+                        client.expiry_time = target_expiry_ms
+                        changed = True
+                except Exception:
+                    result["errors"] += 1
+
+            if state.get("force_unlimited", False):
+                if _set_unlimited_traffic_fields(client):
+                    changed = True
+
+            if changed:
+                result["updated"] += 1
+                any_changed = True
+            else:
+                result["already_ok"] += 1
+
+        if any_changed:
+            api.inbound.update(inbound.id, inbound_to_modify)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to sync clients state on host '{host_name}': {e}", exc_info=True)
+        result["errors"] += 1
+        return result
 
 async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     return await asyncio.to_thread(_delete_client_on_host_sync, host_name, client_email)

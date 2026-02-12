@@ -227,6 +227,88 @@ async def check_expiring_subscriptions(bot: Bot):
         except Exception as e:
             logger.error(f"Error processing expiry for key {key.get('key_id')}: {e}")
 
+async def enforce_clients_state_from_db() -> None:
+    """
+    Source of truth is DB: enforce enabled/disabled + expiry + unlimited traffic
+    on all enabled hosts every scheduler cycle.
+    """
+    logger.info("Scheduler: Enforcing client states from DB...")
+    all_hosts = await asyncio.to_thread(database.get_all_hosts, True)
+    if not all_hosts:
+        logger.info("Scheduler: No enabled hosts configured. Enforce skipped.")
+        return
+
+    total_checked = 0
+    total_updated = 0
+    total_already_ok = 0
+    total_not_found = 0
+    total_errors = 0
+    total_deleted = 0
+
+    now = time_utils.get_msk_now()
+
+    for host in all_hosts:
+        host_name = host.get("host_name")
+        if not host_name:
+            continue
+
+        keys_in_db = await asyncio.to_thread(database.get_keys_for_host, host_name)
+        desired_by_email: dict[str, dict] = {}
+        emails_to_delete: list[str] = []
+
+        for db_key in keys_in_db:
+            key_email = db_key.get("key_email")
+            if not key_email:
+                continue
+
+            expiry_date = time_utils.parse_iso_to_msk(db_key.get("expiry_date"))
+            if not expiry_date:
+                logger.error(
+                    f"Scheduler: Invalid expiry date for key '{key_email}': {db_key.get('expiry_date')}"
+                )
+                total_errors += 1
+                continue
+
+            if expiry_date < now - timedelta(days=5):
+                emails_to_delete.append(key_email)
+                continue
+
+            desired_by_email[key_email] = {
+                "enabled": expiry_date > now,
+                "expiry_timestamp_ms": time_utils.get_timestamp_ms(expiry_date),
+                "force_unlimited": True,
+            }
+
+        if desired_by_email:
+            host_result = await xui_api.sync_clients_state_on_host(host_name, desired_by_email)
+            total_checked += int(host_result.get("checked", 0))
+            total_updated += int(host_result.get("updated", 0))
+            total_already_ok += int(host_result.get("already_ok", 0))
+            total_not_found += int(host_result.get("not_found", 0))
+            total_errors += int(host_result.get("errors", 0))
+
+        for email in emails_to_delete:
+            try:
+                deleted = await xui_api.delete_client_on_host(host_name, email)
+                if deleted:
+                    total_deleted += 1
+            except Exception as e:
+                logger.error(
+                    f"Scheduler: Failed to delete expired client '{email}' from host '{host_name}': {e}"
+                )
+                total_errors += 1
+            await asyncio.to_thread(database.delete_key_by_email, email)
+
+    logger.info(
+        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s deleted=%s errors=%s",
+        total_checked,
+        total_updated,
+        total_already_ok,
+        total_not_found,
+        total_deleted,
+        total_errors,
+    )
+
 async def sync_keys_with_panels():
     logger.info("Scheduler: Starting sync with XUI panels...")
     total_affected_records = 0
@@ -264,17 +346,6 @@ async def sync_keys_with_panels():
                 expiry_date = time_utils.parse_iso_to_msk(db_key['expiry_date'])
                 if not expiry_date:
                     logger.error(f"Scheduler: Invalid expiry date for key '{key_email}': {db_key.get('expiry_date')}")
-                    continue
-
-                now = time_utils.get_msk_now()
-                if expiry_date < now - timedelta(days=5):
-                    logger.info(f"Scheduler: Key '{key_email}' expired more than 5 days ago. Deleting from panel and DB.")
-                    try:
-                        await xui_api.delete_client_on_host(host_name, key_email)
-                    except Exception as e:
-                        logger.error(f"Scheduler: Failed to delete client '{key_email}' from panel: {e}")
-                    await asyncio.to_thread(database.delete_key_by_email, key_email)
-                    total_affected_records += 1
                     continue
 
                 server_client = clients_on_server.pop(key_email, None)
@@ -397,6 +468,9 @@ async def periodic_subscription_check(bot_controller: BotController):
 
     while True:
         try:
+            # Always enforce access state by DB even if panel_sync_enabled is disabled.
+            await enforce_clients_state_from_db()
+
             if _bool_setting("panel_sync_enabled", default=False):
                 await sync_keys_with_panels()
             else:
