@@ -122,7 +122,7 @@ def create_payment_method_keyboard(payment_methods: dict, action: str, key_id: i
     builder = InlineKeyboardBuilder()
 
     if payment_methods and payment_methods.get("yookassa"):
-        if get_setting("sbp_enabled"):
+        if str(get_setting("sbp_enabled")).lower() == "true":
             builder.button(text="🏦 СБП / Банковская карта", callback_data="pay_yookassa")
         else:
             builder.button(text="🏦 Банковская карта", callback_data="pay_yookassa")
@@ -300,4 +300,3 @@ def get_main_menu_button() -> InlineKeyboardButton:
 
 def get_buy_button() -> InlineKeyboardButton:
     return InlineKeyboardButton(text="💳 Купить подписку", callback_data="buy_vpn")
-

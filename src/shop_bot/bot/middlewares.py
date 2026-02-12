@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Message, CallbackQuery, Chat
+from aiogram.types import TelegramObject, Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 from shop_bot.data_manager.database import get_user
 
@@ -19,8 +19,9 @@ class SafeCallbackMiddleware(BaseMiddleware):
                 "query is too old" in message
                 or "query id is invalid" in message
                 or "response timeout expired" in message
+                or "message is not modified" in message
             ):
-                # Ignore expired callback answers to reduce log noise
+                # Ignore benign Telegram callback/edit races to reduce log noise.
                 return
             raise
 

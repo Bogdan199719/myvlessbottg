@@ -1389,34 +1389,22 @@ def cleanup_notifications(days_to_keep: int = 30):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            # SQLite 'now' modifier works for cleanup. sent_notifications doesn't have a timestamp column though.
-            # Wait, looking at initialize_db, sent_notifications creation is not shown in snippet 1-800 or 801-1250.
-            # Assuming it defaults to CURRENT_TIMESTAMP or doesn't have one?
-            # Let's check schema. If it doesn't have a date, we can't clean up by date.
-            
-            # Let's check if 'created_at' exists. The snippet for initialize_db didn't show sent_notifications table creation.
-            # It was likely added in a migration or I missed it.
-            # Assuming it has a timestamp. If not, I'll add one.
-            
-            # Safe approach: Check column existence first or catch error.
-            # Actually, let's just use a naive approach assuming it has a rowid or similar if no date,
-            # BUT efficient cleanup requires a date column.
-            
-            # Re-reading viewed files... I don't see sent_notifications creation in initialize_db snippet.
-            # It must be created dynamically or in a migration that runs implicitly?
-            # Wait, I see `is_notification_sent` and `mark_notification_sent`.
-            
-            # Let's add the column if missing in this very function for robustness.
             cursor.execute("PRAGMA table_info(sent_notifications)")
             columns = [row[1] for row in cursor.fetchall()]
-            if 'created_at' not in columns:
-                 cursor.execute("ALTER TABLE sent_notifications ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-                 conn.commit()
-            
-            cursor.execute(
-                "DELETE FROM sent_notifications WHERE created_at < date('now', ?)", 
-                (f'-{days_to_keep} days',)
-            )
+
+            # Historical schema used "sent_at". Some old DBs may have "created_at".
+            date_column = None
+            if 'sent_at' in columns:
+                date_column = 'sent_at'
+            elif 'created_at' in columns:
+                date_column = 'created_at'
+            else:
+                # Keep compatibility with legacy DBs by adding a timestamp column once.
+                cursor.execute("ALTER TABLE sent_notifications ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                conn.commit()
+                date_column = 'sent_at'
+
+            cursor.execute(f"DELETE FROM sent_notifications WHERE {date_column} < datetime('now', ?)", (f'-{days_to_keep} days',))
             conn.commit()
             deleted = cursor.rowcount
             if deleted > 0:
