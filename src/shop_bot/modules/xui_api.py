@@ -354,11 +354,10 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
             if not hasattr(client_to_update, 'sub_id') or not client_to_update.sub_id:
                 client_to_update.sub_id = uuid.uuid4().hex[:16]
 
-            if not hasattr(client_to_update, 'total_gb') or client_to_update.total_gb is None:
-                client_to_update.total_gb = 0
-
-            if not hasattr(client_to_update, 'reset') or client_to_update.reset is None:
-                client_to_update.reset = 0
+            # Normalize to unlimited traffic for consistency across global hosts.
+            # Otherwise legacy non-zero caps may cause "exhausted" on one host only.
+            client_to_update.total_gb = 0
+            client_to_update.reset = 0
 
             if telegram_id and (not hasattr(client_to_update, 'tg_id') or not client_to_update.tg_id):
                  client_to_update.tg_id = telegram_id
@@ -607,6 +606,8 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         
         # Fix client parameters
         inbound_to_modify.settings.clients[client_index].flow = target_flow
+        inbound_to_modify.settings.clients[client_index].total_gb = 0
+        inbound_to_modify.settings.clients[client_index].reset = 0
         try:
             inbound_to_modify.settings.clients[client_index].encryption = "none"
         except (ValueError, AttributeError):
@@ -722,6 +723,8 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
         updated = 0
         for client in inbound_to_modify.settings.clients:
             client.flow = target_flow
+            client.total_gb = 0
+            client.reset = 0
             try:
                 client.encryption = "none"
             except (ValueError, AttributeError):
