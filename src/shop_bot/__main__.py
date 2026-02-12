@@ -3,6 +3,7 @@ import threading
 import asyncio
 import signal
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +14,34 @@ from shop_bot.data_manager import database
 from shop_bot.modules import xui_api
 from shop_bot.bot_controller import BotController
 
+class _RateLimitedDispatcherNoiseFilter(logging.Filter):
+    def __init__(self, interval_seconds: int = 60):
+        super().__init__()
+        self.interval_seconds = interval_seconds
+        self._last_seen: dict[str, float] = {}
+        self._patterns = (
+            "Failed to fetch updates - TelegramNetworkError",
+            "Failed to fetch updates - TelegramConflictError",
+            "Sleep for ",
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        matched_pattern = next((p for p in self._patterns if p in message), None)
+        if not matched_pattern:
+            return True
+
+        now = time.monotonic()
+        last = self._last_seen.get(matched_pattern, 0.0)
+        if now - last < self.interval_seconds:
+            return False
+        self._last_seen[matched_pattern] = now
+
+        if record.levelno >= logging.ERROR:
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -22,6 +51,7 @@ def main():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.dispatcher").addFilter(_RateLimitedDispatcherNoiseFilter(interval_seconds=60))
     
     logger = logging.getLogger(__name__)
 
