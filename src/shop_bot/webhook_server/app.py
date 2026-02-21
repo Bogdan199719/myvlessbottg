@@ -334,6 +334,15 @@ def create_webhook_app(bot_controller_instance):
         all_settings_ok = all(settings.get(key) for key in required_for_start)
         return {"bot_status": bot_status, "all_settings_ok": all_settings_ok}
 
+    def _run_auto_provision_for_global_users(context_host_name: str) -> None:
+        """Run global users auto-provisioning from admin host actions."""
+        try:
+            from shop_bot.data_manager.scheduler import auto_provision_new_hosts_for_global_users
+            asyncio.run(auto_provision_new_hosts_for_global_users())
+            logger.info(f"Auto-provisioning completed for host '{context_host_name}'")
+        except Exception as e:
+            logger.error(f"Failed to auto-provision for host '{context_host_name}': {e}")
+
     @flask_app.route('/')
     @login_required
     def index():
@@ -934,14 +943,23 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/add-host', methods=['POST'])
     @login_required
     def add_host_route():
-        create_host(
-            name=request.form['host_name'],
+        host_name = request.form['host_name']
+        success = create_host(
+            name=host_name,
             url=request.form['host_url'],
             user=request.form['host_username'],
             passwd=request.form['host_pass'],
             inbound=int(request.form['host_inbound_id'])
         )
-        flash(f"Хост '{request.form['host_name']}' успешно добавлен.", 'success')
+
+        if not success:
+            flash(f"Не удалось добавить хост '{host_name}': хост с таким именем или идентичными параметрами уже существует.", 'warning')
+            return redirect(url_for('settings_page'))
+
+        # Auto-provision keys for all global subscription users immediately
+        _run_auto_provision_for_global_users(host_name)
+
+        flash(f"Хост '{host_name}' успешно добавлен. Ключи созданы для всех пользователей с глобальной подпиской.", 'success')
         return redirect(url_for('settings_page'))
 
     @flask_app.route('/edit-host/<host_name>', methods=['GET'])
@@ -1012,16 +1030,20 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def update_host_route():
         old_host_name = request.form['old_host_name']
+        new_host_name = request.form['host_name']
         update_host(
             old_name=old_host_name,
-            new_name=request.form['host_name'],
+            new_name=new_host_name,
             url=request.form['host_url'],
             user=request.form['host_username'],
-            passwd=request.form['host_pass'], # Can be empty
+            passwd=request.form['host_pass'],
             inbound=int(request.form['host_inbound_id'])
         )
-        
-        flash(f"Хост '{old_host_name}' успешно обновлен.", 'success')
+
+        # Auto-provision keys for all global subscription users if host name changed or enabled
+        _run_auto_provision_for_global_users(new_host_name)
+
+        flash(f"Хост '{old_host_name}' успешно обновлен. Ключи обновлены для всех пользователей.", 'success')
         return redirect(url_for('settings_page'))
 
     @flask_app.route('/toggle-host/<host_name>', methods=['POST'])
@@ -1031,6 +1053,10 @@ def create_webhook_app(bot_controller_instance):
         if host:
              new_status = not bool(host['is_enabled'])
              toggle_host_status(host_name, new_status)
+             
+             # If enabling host, auto-provision keys for users missing this host
+             if new_status:
+                 _run_auto_provision_for_global_users(host_name)
              flash(f"Хост '{host_name}' {'включен' if new_status else 'отключен'}.", 'success')
         else:
              flash(f"Хост '{host_name}' не найден.", 'warning')
@@ -1049,9 +1075,16 @@ def create_webhook_app(bot_controller_instance):
                 ]
                 if not tasks:
                     return True
+                # Use semaphore to limit concurrent deletions (avoid overwhelming the API)
+                semaphore = asyncio.Semaphore(5)
+                
+                async def delete_with_semaphore(client_task):
+                    async with semaphore:
+                        return await client_task
+                
                 results = await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=60
+                    asyncio.gather(*[delete_with_semaphore(task) for task in tasks], return_exceptions=True),
+                    timeout=300  # Increased timeout for large number of clients
                 )
                 all_ok = True
                 for result in results:
@@ -1066,7 +1099,7 @@ def create_webhook_app(bot_controller_instance):
             try:
                 if loop and loop.is_running():
                     future = asyncio.run_coroutine_threadsafe(_delete_all_clients_strict(), loop)
-                    all_ok = future.result(timeout=65)
+                    all_ok = future.result(timeout=305)  # Match the increased timeout
                 else:
                     all_ok = asyncio.run(_delete_all_clients_strict())
             except Exception as e:

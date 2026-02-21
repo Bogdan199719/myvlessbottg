@@ -104,7 +104,28 @@ def main():
         flask_thread.start()
         
         logger.info("Flask server started in a background thread on http://0.0.0.0:1488")
-        
+
+        # Auto-start Telegram Bot and Support Bot on application startup
+        try:
+            logger.info("Attempting to auto-start Telegram Bot and Support Bot...")
+            
+            # Start Shop Bot (Telegram Bot)
+            shop_result = bot_controller.start_shop_bot()
+            if shop_result["status"] == "success":
+                logger.info(f"✅ Telegram Bot auto-started: {shop_result['message']}")
+            else:
+                logger.warning(f"⚠️ Telegram Bot auto-start skipped: {shop_result['message']}")
+            
+            # Start Support Bot
+            support_result = bot_controller.start_support_bot()
+            if support_result["status"] == "success":
+                logger.info(f"✅ Support Bot auto-started: {support_result['message']}")
+            else:
+                logger.warning(f"⚠️ Support Bot auto-start skipped: {support_result['message']}")
+                
+        except Exception as e:
+            logger.error(f"Error during bot auto-start: {e}", exc_info=True)
+
         # Perform initial XTLS sync at startup only if enabled
         try:
             xtls_enabled = database.get_setting("xtls_sync_enabled")
@@ -135,8 +156,8 @@ def main():
                 logger.debug("Startup XTLS sync disabled (xtls_sync_enabled=false).")
         except Exception as e:
             logger.error(f"Failed to read xtls_sync_enabled setting: {e}", exc_info=True)
-            
-        logger.info("Application is running. Bot can be started from the web panel.")
+
+        logger.info("Application is running. Bots are auto-started if configured.")
         
         asyncio.create_task(periodic_subscription_check(bot_controller))
 

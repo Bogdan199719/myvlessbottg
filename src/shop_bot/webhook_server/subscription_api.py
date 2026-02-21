@@ -33,6 +33,17 @@ _PROVISION_TIMEOUT_SECONDS = 10
 def _host_slug(host_name: str) -> str:
     return (host_name or "").replace(" ", "").lower()
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def _token_prefix(token: str, limit: int = 5) -> str:
+    if not token:
+        return "empty"
+    return f"{token[:limit]}..."
+
 def _pick_global_key_number(user_id: int, active_paid_keys: list[dict]) -> int:
     """
     Pick a stable key number for global auto-provisioning.
@@ -77,6 +88,22 @@ def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
         logger.error(f"Subscription: error calling {getattr(func, '__name__', 'callable')}: {e}", exc_info=True)
         return None
 
+def _get_global_plan_ids() -> set[int]:
+    plan_ids: set[int] = set()
+    try:
+        for plan in get_plans_for_host('ALL'):
+            plan_id = _safe_int(plan.get('plan_id'), default=0)
+            if plan_id > 0:
+                plan_ids.add(plan_id)
+    except Exception as e:
+        logger.error(f"Failed to load global plan ids: {e}")
+    return plan_ids
+
+def _is_global_key(key: dict, global_plan_ids: set[int]) -> bool:
+    if not global_plan_ids:
+        return False
+    return _safe_int(key.get('plan_id'), default=0) in global_plan_ids
+
 def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
     if not host_names:
         return
@@ -105,10 +132,10 @@ def get_subscription(token):
         user = get_user_by_token(token)
         
         if not user:
-            logger.warning(f"Subscription token not found: {token}")
+            logger.info(f"Subscription token not found (prefix: {_token_prefix(token)})")
             abort(404, "Subscription not found")
 
-        logger.info(f"Serving subscription for user {user['telegram_id']} (token prefix: {token[:5]}...)")
+        logger.info(f"Serving subscription for user {user['telegram_id']} (token prefix: {_token_prefix(token)})")
 
         user_id = user['telegram_id']
         keys = get_user_paid_keys(user_id)
@@ -137,14 +164,7 @@ def get_subscription(token):
         logger.info(f"Enabled hosts: {enabled_hosts}")
 
         # Determine global plan ids to support global subscription behavior
-        try:
-            global_plan_ids = {
-                int(p['plan_id'])
-                for p in get_plans_for_host('ALL')
-                if p.get('plan_id') is not None
-            }
-        except Exception:
-            global_plan_ids = set()
+        global_plan_ids = _get_global_plan_ids()
 
         # Keys that are actually usable right now
         available_paid_keys = [
@@ -154,10 +174,7 @@ def get_subscription(token):
         ]
 
         # Auto-provision missing hosts for active global subscriptions
-        active_global_keys = [
-            k for k in active_paid_keys
-            if global_plan_ids and k.get('plan_id') and int(k['plan_id']) in global_plan_ids
-        ]
+        active_global_keys = [k for k in active_paid_keys if _is_global_key(k, global_plan_ids)]
 
         # Fallback heuristic for legacy users whose plan_id не выставлен:
         # если у пользователя 2+ активных платных ключа и есть глобальные тарифы в панели,
@@ -170,10 +187,12 @@ def get_subscription(token):
             key_number = _pick_global_key_number(user_id, active_paid_keys)
             # Remaining validity based on the soonest-expiring global key
             try:
-                remaining_seconds = int(
-                    (min(time_utils.parse_iso_to_msk(k['expiry_date']) for k in active_global_keys if time_utils.parse_iso_to_msk(k.get('expiry_date'))) - now).total_seconds()
-
-                )
+                global_expiries = []
+                for key in active_global_keys:
+                    parsed = time_utils.parse_iso_to_msk(key.get('expiry_date'))
+                    if parsed:
+                        global_expiries.append(parsed)
+                remaining_seconds = int((min(global_expiries) - now).total_seconds()) if global_expiries else 0
             except Exception:
                 remaining_seconds = 0
 
@@ -249,9 +268,9 @@ def get_subscription(token):
         else:
             if active_global_keys and global_plan_ids and not auto_provision_enabled:
                 logger.debug("Global auto-provision disabled (subscription_auto_provision=false).")
-            if active_global_keys:
+            if active_global_keys and not global_plan_ids:
                 logger.debug("Active global keys found but no global plan IDs configured")
-            if global_plan_ids:
+            if global_plan_ids and not active_global_keys:
                 logger.debug("Global plan IDs found but no active global keys")
 
         # Filter out disabled hosts and missing keys

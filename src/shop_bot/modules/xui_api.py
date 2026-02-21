@@ -315,6 +315,9 @@ def _get_trojan_connection_string(inbound: Inbound, user_uuid: str, hostname: st
     return None
 
 def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days_to_add: int = 0, seconds_to_add: int | None = None, telegram_id: str = None) -> tuple[str | None, int | None]:
+    def _is_record_not_found_error(exc: Exception) -> bool:
+        return "record not found" in str(exc).lower()
+
     try:
         inbound_to_modify = api.inbound.get_by_id(inbound_id)
         if not inbound_to_modify:
@@ -381,8 +384,34 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
                  client_to_update.tg_id = telegram_id
 
             client_uuid = client_to_update.id
-            api.inbound.update(inbound_id, inbound_to_modify)
-            logger.info(f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
+            try:
+                api.inbound.update(inbound_id, inbound_to_modify)
+                logger.info(f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
+            except Exception as update_error:
+                if not _is_record_not_found_error(update_error):
+                    raise
+
+                # Panel can keep a stale reference in clients list; fallback to safe recreate.
+                logger.warning(
+                    f"Client '{email}' update failed with 'record not found' on inbound {inbound_id}. "
+                    "Trying recreate fallback."
+                )
+                client_uuid = str(uuid.uuid4())
+                subscription_id = uuid.uuid4().hex[:16]
+                recreated_client = Client(
+                    id=client_uuid,
+                    email=email,
+                    enable=True,
+                    flow=target_flow,
+                    expiry_time=new_expiry_ms,
+                    sub_id=subscription_id,
+                    total_gb=0,
+                    reset=0,
+                    tg_id=telegram_id
+                )
+                _set_unlimited_traffic_fields(recreated_client)
+                api.client.add(inbound_id, [recreated_client])
+                logger.info(f"Recreated client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
 
         else:
             client_uuid = str(uuid.uuid4())

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import time
 
 from datetime import datetime, timedelta
@@ -17,6 +18,8 @@ from shop_bot.bot import keyboards
 CHECK_INTERVAL_SECONDS = 300
 PAID_NOTIFY_HOURS = {24, 1, 0}
 TRIAL_NOTIFY_HOURS = {1, 0}
+
+_PROVISION_TIMEOUT_SECONDS = 10
 
 
 logger = logging.getLogger(__name__)
@@ -411,11 +414,217 @@ async def cleanup_old_notifications():
     """Delete sent_notifications older than 30 days to keep DB size manageable."""
     try:
         await asyncio.to_thread(
-            database.cleanup_notifications, 
+            database.cleanup_notifications,
             days_to_keep=30
         )
     except Exception as e:
         logger.error(f"Scheduler: Failed to cleanup old notifications: {e}")
+
+
+def _host_slug(host_name: str) -> str:
+    """Generate a slug from host name for email generation."""
+    return (host_name or "").replace(" ", "").lower()
+
+
+def _pick_global_key_number(user_id: int, active_paid_keys: list) -> int:
+    """
+    Pick a stable key number for global auto-provisioning.
+    Prefer existing user key numbers; fallback to next available.
+    """
+    pattern = re.compile(rf"^user{int(user_id)}-key(\d+)-", re.IGNORECASE)
+    numbers: list[int] = []
+
+    for key in active_paid_keys:
+        email = str(key.get("key_email") or "")
+        match = pattern.match(email)
+        if not match:
+            continue
+        try:
+            numbers.append(int(match.group(1)))
+        except ValueError:
+            continue
+
+    if numbers:
+        return min(numbers)
+    
+    existing_keys = database.get_all_keys()
+    max_num = 0
+    for k in existing_keys:
+        if k.get("user_id") == user_id:
+            email = str(k.get("key_email") or "")
+            match = pattern.match(email)
+            if match:
+                try:
+                    max_num = max(max_num, int(match.group(1)))
+                except ValueError:
+                    pass
+    return max_num + 1
+
+
+async def auto_provision_new_hosts_for_global_users():
+    """
+    Auto-provision keys on new hosts for all users with active global subscriptions.
+    
+    This function is called periodically by the scheduler to ensure that when
+    new hosts are added via the web admin panel, existing users with global
+    subscriptions automatically get keys on the new hosts.
+    """
+    logger.info("Scheduler: Checking for new hosts to auto-provision for global users...")
+    
+    # Get all enabled hosts
+    all_hosts = database.get_all_hosts(only_enabled=True)
+    if not all_hosts:
+        logger.debug("Scheduler: No enabled hosts found.")
+        return
+    
+    enabled_host_names = {h.get("host_name") for h in all_hosts if h.get("host_name") and h.get("host_name") != "ALL"}
+    if not enabled_host_names:
+        logger.debug("Scheduler: No regular enabled hosts found.")
+        return
+    
+    # Get global plan IDs
+    global_plan_ids = set()
+    try:
+        global_plans = database.get_plans_for_host("ALL")
+        for p in global_plans:
+            try:
+                global_plan_ids.add(int(p.get("plan_id")))
+            except (ValueError, TypeError):
+                continue
+    except Exception as e:
+        logger.error(f"Scheduler: Failed to get global plans: {e}")
+        return
+    
+    if not global_plan_ids:
+        logger.debug("Scheduler: No global plan IDs configured. Skipping auto-provision.")
+        return
+    
+    # Get all keys and group by user
+    all_keys = database.get_all_keys()
+    
+    # Group keys by user_id
+    keys_by_user: dict[int, list] = {}
+    for key in all_keys:
+        user_id = key.get("user_id")
+        if user_id is None:
+            continue
+        if user_id not in keys_by_user:
+            keys_by_user[user_id] = []
+        keys_by_user[user_id].append(key)
+    
+    # Track statistics
+    total_users_processed = 0
+    total_keys_created = 0
+    total_errors = 0
+    
+    for user_id, user_keys in keys_by_user.items():
+        try:
+            # Filter to active paid keys (global subscription)
+            now = time_utils.get_msk_now()
+            active_paid_keys = []
+            for k in user_keys:
+                try:
+                    expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
+                    if expiry and expiry > now:
+                        plan_id = k.get("plan_id")
+                        # Check if key belongs to global subscription
+                        is_global = (plan_id is not None and int(plan_id) in global_plan_ids)
+                        # Fallback: if user has 2+ active paid keys and global plans exist, treat as global
+                        if not is_global and len(user_keys) >= 2 and global_plan_ids:
+                            is_global = True
+                        if is_global:
+                            active_paid_keys.append(k)
+                except (ValueError, TypeError):
+                    continue
+            
+            if not active_paid_keys:
+                continue  # No active global subscription for this user
+            
+            # Get hosts this user already has keys for
+            existing_hosts = {k.get("host_name") for k in active_paid_keys if k.get("host_name")}
+            
+            # Find missing hosts
+            missing_hosts = enabled_host_names - existing_hosts
+            if not missing_hosts:
+                continue  # User has keys on all hosts
+            
+            # Calculate remaining seconds from soonest-expiring key
+            try:
+                remaining_seconds = int(
+                    (min(time_utils.parse_iso_to_msk(k["expiry_date"]) for k in active_paid_keys if time_utils.parse_iso_to_msk(k.get("expiry_date"))) - now).total_seconds()
+                )
+            except (ValueError, TypeError):
+                remaining_seconds = 0
+            
+            if remaining_seconds <= 0:
+                logger.warning(f"Scheduler: User {user_id} has global subscription but no valid expiry. Skipping.")
+                continue
+            
+            # Pick key number for this user
+            key_number = _pick_global_key_number(user_id, active_paid_keys)
+            first_global_plan_id = int(next(iter(global_plan_ids)))
+            
+            logger.info(f"Scheduler: User {user_id} has global subscription. Missing hosts: {missing_hosts}. Auto-provisioning...")
+            total_users_processed += 1
+            
+            # Provision keys on missing hosts
+            for host_name in missing_hosts:
+                try:
+                    email = f"user{user_id}-key{key_number}-{_host_slug(host_name)}"
+                    logger.info(f"Scheduler: Auto-provisioning key for user {user_id} on host '{host_name}' with email '{email}'")
+                    
+                    # Create key on host
+                    res = await asyncio.wait_for(
+                        xui_api.create_or_update_key_on_host_seconds(
+                            host_name=host_name,
+                            email=email,
+                            seconds_to_add=remaining_seconds,
+                            telegram_id=str(user_id)
+                        ),
+                        timeout=_PROVISION_TIMEOUT_SECONDS
+                    )
+                    
+                    if res:
+                        # Persist to database
+                        existing_key = database.get_key_by_email(res["email"])
+                        if existing_key:
+                            database.update_key_by_email(
+                                key_email=res["email"],
+                                host_name=host_name,
+                                xui_client_uuid=res["client_uuid"],
+                                expiry_timestamp_ms=res["expiry_timestamp_ms"],
+                                connection_string=res.get("connection_string"),
+                                plan_id=first_global_plan_id
+                            )
+                        else:
+                            database.add_new_key(
+                                user_id=user_id,
+                                host_name=host_name,
+                                xui_client_uuid=res["client_uuid"],
+                                key_email=res["email"],
+                                expiry_timestamp_ms=res["expiry_timestamp_ms"],
+                                connection_string=res.get("connection_string"),
+                                plan_id=first_global_plan_id
+                            )
+                        total_keys_created += 1
+                        logger.info(f"Scheduler: Successfully created key for user {user_id} on host '{host_name}'")
+                    else:
+                        logger.error(f"Scheduler: Failed to create key for user {user_id} on host '{host_name}'")
+                        total_errors += 1
+                        
+                except asyncio.TimeoutError:
+                    logger.error(f"Scheduler: Timeout provisioning key for user {user_id} on host '{host_name}'")
+                    total_errors += 1
+                except Exception as e:
+                    logger.error(f"Scheduler: Error provisioning key for user {user_id} on host '{host_name}': {e}")
+                    total_errors += 1
+                    
+        except Exception as e:
+            logger.error(f"Scheduler: Error processing user {user_id} for auto-provision: {e}")
+            total_errors += 1
+    
+    logger.info(f"Scheduler: Auto-provision finished. Users processed: {total_users_processed}, Keys created: {total_keys_created}, Errors: {total_errors}")
+
 
 async def periodic_xtls_sync():
     """
@@ -478,7 +687,10 @@ async def periodic_subscription_check(bot_controller: BotController):
             
             # Run cleanup once per cycle (or could be less frequent, but this is cheap)
             await cleanup_old_notifications()
-            
+
+            # Auto-provision new hosts for global subscription users
+            await auto_provision_new_hosts_for_global_users()
+
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
             if _bool_setting("xtls_sync_enabled", default=False) and current_time - last_xtls_sync_time >= xtls_sync_interval:

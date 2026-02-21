@@ -52,6 +52,14 @@ docker-compose up -d --build
 - Admin panel update uses `git fetch/reset` and dependency install.
 - `.env` and `users.db` are not touched.
 
+## Recent Stability Updates (No Version Bump)
+
+- Safer subscription handling for invalid/legacy `plan_id` values.
+- Fallback recreate flow for `record not found` errors in 3x-ui client updates.
+- Reduced noisy Telegram callback errors (`message is not modified`) in runtime logs.
+- Refactoring of host auto-provision trigger paths in web admin routes.
+- Improved global subscription key handling and safer token logging (prefix only).
+
 ## Security & privacy
 
 - Do NOT commit `.env` or `users.db` to Git.

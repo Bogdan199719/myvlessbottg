@@ -370,14 +370,31 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            # Check if host with same name and identical parameters already exists
+            cursor.execute(
+                "SELECT host_name FROM xui_hosts WHERE host_name=? AND host_url=? AND host_username=? AND host_pass=? AND host_inbound_id=?",
+                (name, url, user, passwd, inbound)
+            )
+            if cursor.fetchone():
+                logging.warning(f"Host '{name}' with identical parameters already exists.")
+                return False
+            
+            # Also check if host name already exists (even with different params)
+            cursor.execute("SELECT host_name FROM xui_hosts WHERE host_name=?", (name,))
+            if cursor.fetchone():
+                logging.warning(f"Host with name '{name}' already exists.")
+                return False
+            
             cursor.execute(
                 "INSERT INTO xui_hosts (host_name, host_url, host_username, host_pass, host_inbound_id, is_enabled) VALUES (?, ?, ?, ?, ?, 1)",
                 (name, url, user, passwd, inbound)
             )
             conn.commit()
             logging.info(f"Host '{name}' added.")
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to add host: {e}")
+        return False
 
 def update_host(old_name: str, new_name: str, url: str, user: str, passwd: str, inbound: int):
     try:

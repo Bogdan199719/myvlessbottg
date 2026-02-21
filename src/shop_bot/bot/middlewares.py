@@ -4,6 +4,16 @@ from aiogram.types import TelegramObject, Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 from shop_bot.data_manager.database import get_user
 
+def _is_ignorable_telegram_bad_request(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    return (
+        "query is too old" in text
+        or "query id is invalid" in text
+        or "response timeout expired" in text
+        or "message is not modified" in text
+        or "specified new message content and reply markup are exactly the same" in text
+    )
+
 class SafeCallbackMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -14,13 +24,7 @@ class SafeCallbackMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except TelegramBadRequest as e:
-            message = str(e).lower()
-            if (
-                "query is too old" in message
-                or "query id is invalid" in message
-                or "response timeout expired" in message
-                or "message is not modified" in message
-            ):
+            if _is_ignorable_telegram_bad_request(str(e)):
                 # Ignore benign Telegram callback/edit races to reduce log noise.
                 return
             raise

@@ -133,6 +133,15 @@ def has_active_global_subscription(active_paid_keys: list[dict]) -> bool:
             continue
     return False
 
+def get_active_paid_keys(user_id: int) -> list[dict]:
+    now = time_utils.get_msk_now()
+    active_keys: list[dict] = []
+    for key in get_user_paid_keys(user_id):
+        expiry_dt = time_utils.parse_iso_to_msk(key.get('expiry_date'))
+        if expiry_dt and expiry_dt > now:
+            active_keys.append(key)
+    return active_keys
+
 def _stars_is_pending_transaction(payment_id: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -219,7 +228,12 @@ def registration_required(f):
         user_id = event.from_user.id
         user_data = get_user(user_id)
         if user_data:
-            return await f(event, *args, **kwargs)
+            try:
+                return await f(event, *args, **kwargs)
+            except TelegramBadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return
+                raise
         else:
             message_text = "Пожалуйста, для начала работы со мной, отправьте команду /start"
             if isinstance(event, types.CallbackQuery):
@@ -348,13 +362,7 @@ def get_user_router() -> Router:
         domain = get_setting("domain")
         user_id = callback.from_user.id
         expected_token = get_or_create_subscription_token(user_id)
-        now = time_utils.get_msk_now()
-        paid_keys = get_user_paid_keys(user_id)
-        active_paid_keys = []
-        for k in paid_keys:
-             dt = time_utils.parse_iso_to_msk(k.get('expiry_date'))
-             if dt and dt > now:
-                 active_paid_keys.append(k)
+        active_paid_keys = get_active_paid_keys(user_id)
 
         
         if not domain:
@@ -392,13 +400,7 @@ def get_user_router() -> Router:
         domain = get_setting("domain")
         user_id = callback.from_user.id
         expected_token = get_or_create_subscription_token(user_id)
-        now = time_utils.get_msk_now()
-        paid_keys = get_user_paid_keys(user_id)
-        active_paid_keys = []
-        for k in paid_keys:
-             dt = time_utils.parse_iso_to_msk(k.get('expiry_date'))
-             if dt and dt > now:
-                 active_paid_keys.append(k)
+        active_paid_keys = get_active_paid_keys(user_id)
 
 
         if not domain:
@@ -566,8 +568,9 @@ def get_user_router() -> Router:
 
     @user_router.message(Broadcast.waiting_for_message)
     async def broadcast_message_received_handler(message: types.Message, state: FSMContext):
-        await state.update_data(message_to_send=message.model_dump_json())
-        
+        message_dict = message.model_dump(mode='json', exclude_unset=True)
+        await state.update_data(message_to_send=json.dumps(message_dict))
+
         await message.answer(
             "Сообщение получено. Хотите добавить к нему кнопку со ссылкой?",
             reply_markup=keyboards.create_broadcast_options_keyboard()
