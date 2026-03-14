@@ -12,19 +12,28 @@
 <body>
 	<div class="container">
 		<header class="main-header">
-			<button type="button" id="mobileNavToggle" class="mobile-nav-toggle" aria-expanded="false" aria-controls="mainNavigation">
-				Меню
-			</button>
-			<nav class="navigation" id="mainNavigation">
-				<a href="{{ url_for('dashboard_page') }}"
-					class="nav-link {% if request.endpoint == 'dashboard_page' %}active{% endif %}">Главная</a>
-				<a href="{{ url_for('users_page') }}"
-					class="nav-link {% if request.endpoint == 'users_page' %}active{% endif %}">Пользователи</a>
-				<a href="{{ url_for('settings_page') }}"
-					class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}">Настройки</a>
-				<a href="{{ url_for('updates_page') }}"
-					class="nav-link {% if request.endpoint == 'updates_page' %}active{% endif %}">Обновления</a>
-			</nav>
+			<div class="header-main">
+				<a href="{{ url_for('dashboard_page') }}" class="header-brand">
+					<span class="header-brand-mark">MV</span>
+					<span class="header-brand-copy">
+						<strong>MyVlessBot</strong>
+						<small>Админ-панель</small>
+					</span>
+				</a>
+				<button type="button" id="mobileNavToggle" class="mobile-nav-toggle" aria-expanded="false" aria-controls="mainNavigation">
+					Меню
+				</button>
+				<nav class="navigation" id="mainNavigation">
+					<a href="{{ url_for('dashboard_page') }}"
+						class="nav-link {% if request.endpoint == 'dashboard_page' %}active{% endif %}">Главная</a>
+					<a href="{{ url_for('users_page') }}"
+						class="nav-link {% if request.endpoint == 'users_page' %}active{% endif %}">Пользователи</a>
+					<a href="{{ url_for('settings_page') }}"
+						class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}">Настройки</a>
+					<a href="{{ url_for('updates_page') }}"
+						class="nav-link {% if request.endpoint == 'updates_page' %}active{% endif %}">Обновления</a>
+				</nav>
+			</div>
 
 			<div class="header-controls">
 				<div class="bot-control">
