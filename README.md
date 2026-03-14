@@ -19,7 +19,7 @@ curl -sSL https://raw.githubusercontent.com/Bogdan199719/myvlessbottg/main/insta
 
 The script installs dependencies (Docker, Nginx, Certbot), asks for settings, and creates `.env`.
 
-## Environment
+## Environment & security
 
 Project uses `.env` for configuration. Key variables:
 
@@ -32,6 +32,7 @@ Project uses `.env` for configuration. Key variables:
 | `PANEL_PASSWORD` | Panel password | no |
 
 Full list: see `install.sh` and the admin panel settings.
+Do not commit `.env`, `users.db`, backups, or logs. They are local runtime files and are ignored by Git.
 
 ## Manual install (Docker)
 
@@ -47,10 +48,18 @@ nano .env
 docker-compose up -d --build
 ```
 
+After first start, verify panel credentials and change any temporary/default values in the admin panel.
+
+## Development checks
+
+- `python3 -m compileall -q src scripts`
+- `python3 scripts/check_callbacks.py`
+- `python3 scripts/check_fsm_transitions.py`
+
 ## Updates
 
-- Admin panel update uses `git fetch/reset` and dependency install.
-- `.env` and `users.db` are not touched.
+- Application updates should not overwrite `.env` or `users.db`.
+- Review installer and admin settings when adding new payment providers or tokens.
 
 ## Recent Stability Updates (No Version Bump)
 
@@ -64,7 +73,7 @@ docker-compose up -d --build
 
 - Do NOT commit `.env` or `users.db` to Git.
 - Keep all tokens and API keys only in `.env` or in the admin panel settings.
-- This repository does not include any personal data or secrets.
+- No live API keys, database files, or personal data should be stored in tracked files.
 
 ## Support
 

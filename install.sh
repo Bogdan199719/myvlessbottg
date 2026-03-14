@@ -51,10 +51,8 @@ setup_project() {
     
     if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${YELLOW}Cloning repository...${NC}"
-        echo -e "${YELLOW}Note: Since this is a PRIVATE repository, you need to provide credentials (username + token).${NC}"
         if ! git clone "$REPO_URL" "$PROJECT_DIR"; then
             echo -e "${RED}Failed to clone repository. Check your internet connection or permissions.${NC}"
-            echo -e "${YELLOW}Tip: Ensure you use a Personal Access Token as the password.${NC}"
             exit 1
         fi
     else
@@ -82,6 +80,15 @@ configure_environment() {
         read -p "Enter Admin Telegram ID: " ADMIN_ID
         read -p "Enter Domain (e.g., vpn.mysite.com): " DOMAIN
         read -p "Enter Email for SSL (letsencrypt): " EMAIL
+        read -p "Enter Panel Login [admin]: " PANEL_LOGIN
+        PANEL_LOGIN=${PANEL_LOGIN:-admin}
+        read -s -p "Enter Panel Password [auto-generate if empty]: " PANEL_PASSWORD
+        echo
+        if [ -z "$PANEL_PASSWORD" ]; then
+            PANEL_PASSWORD=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 24)
+            echo -e "${GREEN}Generated panel password: ${PANEL_PASSWORD}${NC}"
+            echo -e "${YELLOW}Save this password now. It will not be shown again.${NC}"
+        fi
         
         # Save EMAIL temporarily for certbot
         export CERT_EMAIL="$EMAIL"
@@ -92,8 +99,8 @@ configure_environment() {
 TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 ADMIN_TELEGRAM_ID=$ADMIN_ID
 DOMAIN=$DOMAIN
-PANEL_LOGIN=admin
-PANEL_PASSWORD=admin
+PANEL_LOGIN=$PANEL_LOGIN
+PANEL_PASSWORD=$PANEL_PASSWORD
 YOOKASSA_ENABLED=false
 CRYPTOBOT_ENABLED=false
 TONCONNECT_ENABLED=false
@@ -168,7 +175,8 @@ finalize_installation() {
         echo -e "${GREEN}      🎉 Installation Successful! 🎉      ${NC}"
         echo -e "${GREEN}==============================================${NC}"
         echo -e "\nWeb Panel available at: https://$DOMAIN"
-        echo -e "Initial Login/Pass: admin / admin"
+        echo -e "Panel Login: $PANEL_LOGIN"
+        echo -e "${YELLOW}Use the panel password you entered during setup.${NC}"
         echo -e "Running in Docker."
     else
         echo -e "${RED}Docker Launch Failed! Check logs with 'docker-compose logs -f'${NC}"
