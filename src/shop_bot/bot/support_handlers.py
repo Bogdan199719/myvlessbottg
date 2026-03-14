@@ -1,5 +1,6 @@
 import logging
 import json
+from json import JSONDecodeError
 
 from aiogram import Bot, Router, F, types
 from aiogram.filters import CommandStart
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 SUPPORT_GROUP_ID = None
 
 router = Router()
+
 
 async def get_user_summary(user_id: int, username: str) -> str:
     keys = database.get_user_keys(user_id)
@@ -35,7 +37,10 @@ async def get_user_summary(user_id: int, username: str) -> str:
 
     if latest_transaction:
         summary_parts.append("\n<b>💸 Последняя транзакция:</b>")
-        metadata = json.loads(latest_transaction.get('metadata', '{}'))
+        try:
+            metadata = json.loads(latest_transaction.get('metadata', '{}') or '{}')
+        except JSONDecodeError:
+            metadata = {}
         plan_name = metadata.get('plan_name', 'N/A')
         price = latest_transaction.get('amount_rub', 'N/A')
         date = latest_transaction.get('created_date', '').split(' ')[0]
@@ -44,6 +49,8 @@ async def get_user_summary(user_id: int, username: str) -> str:
         summary_parts.append("\n<b>💸 Последняя транзакция:</b> Нет")
 
     return "\n".join(summary_parts)
+
+
 def get_support_router() -> Router:
     support_router = Router()
 
@@ -81,9 +88,13 @@ def get_support_router() -> Router:
                 # Автоматическая обработка миграции группы в супергруппу
                 from aiogram.exceptions import TelegramMigrateToChat
                 if isinstance(e, TelegramMigrateToChat):
-                    new_id = e.migrate_to_chat_id
+                    new_id = getattr(e, "migrate_to_chat_id", None)
+                    if new_id is None:
+                        logger.error("Support group migration exception did not include a target chat ID.")
+                        await message.answer("Не удалось создать тикет в поддержке. Пожалуйста, попробуйте позже.")
+                        return
                     logger.info(f"Support group migrated to supergroup. Updating ID to {new_id}")
-                    database.set_setting("support_group_id", str(new_id))
+                    database.update_setting("support_group_id", str(new_id))
                     SUPPORT_GROUP_ID = new_id
                     # Повторная попытка с новым ID
                     try:
@@ -91,7 +102,12 @@ def get_support_router() -> Router:
                         thread_id = new_thread.message_thread_id
                         database.add_support_thread(user_id, thread_id)
                         summary_text = await get_user_summary(user_id, username)
-                        await bot.send_message(chat_id=SUPPORT_GROUP_ID, message_thread_id=thread_id, text=summary_text)
+                        await bot.send_message(
+                            chat_id=SUPPORT_GROUP_ID,
+                            message_thread_id=thread_id,
+                            text=summary_text,
+                            parse_mode=ParseMode.HTML,
+                        )
                     except Exception as retry_e:
                         logger.error(f"Failed retry after migration: {retry_e}")
                 else:
@@ -126,7 +142,7 @@ def get_support_router() -> Router:
                 # Cleanup probe immediately
                 try:
                     await bot.delete_message(chat_id=SUPPORT_GROUP_ID, message_id=probe_msg.message_id)
-                except:
+                except Exception:
                     pass
 
                 if target_thread_id is not None and real_thread_id != target_thread_id:
@@ -145,13 +161,16 @@ def get_support_router() -> Router:
             except Exception as e:
                 from aiogram.exceptions import TelegramMigrateToChat, TelegramBadRequest
                 if isinstance(e, TelegramMigrateToChat):
-                    new_id = e.migrate_to_chat_id
+                    new_id = getattr(e, "migrate_to_chat_id", None)
+                    if new_id is None:
+                        logger.error("Support group migration during copy did not include a target chat ID.")
+                        return None
                     logger.info(f"Support group migrated to {new_id} during copy. Updating...")
-                    database.set_setting("support_group_id", str(new_id))
+                    database.update_setting("support_group_id", str(new_id))
                     SUPPORT_GROUP_ID = new_id
                     return await AttemptCopy(target_thread_id)
                 
-                error_msg = e.message.lower() if isinstance(e, TelegramBadRequest) else str(e).lower()
+                error_msg = str(e).lower()
                 if isinstance(e, TelegramBadRequest) and ("thread not found" in error_msg or "topic_deleted" in error_msg):
                     logger.warning(f"Thread {target_thread_id} explicitly not found/deleted. Recreating...")
                     database.delete_support_thread(user_id)

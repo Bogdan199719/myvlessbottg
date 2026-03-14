@@ -180,13 +180,9 @@ def get_connection_string(inbound: Inbound, user_uuid: str, host_url: str, remar
     # Determine network type (transport)
     network, _ = _get_stream_network_security(inbound)
 
-    # Special handling for Reality - use port 443 (standard HTTPS port)
-    if hasattr(inbound, 'stream_settings') and inbound.stream_settings:
-        stream_settings = inbound.stream_settings
-        if hasattr(stream_settings, 'reality_settings') and stream_settings.reality_settings:
-            # Reality always uses port 443 for client connections (HTTPS)
-            port = 443
-            logger.debug(f"Using port 443 for Reality protocol instead of inbound port {inbound.port}")
+    if not port:
+        logger.error("Inbound port is missing")
+        return None
 
     # Keep original remark (including Unicode flag)
     safe_remark = remark
@@ -314,7 +310,15 @@ def _get_trojan_connection_string(inbound: Inbound, user_uuid: str, hostname: st
     logger.warning("Trojan protocol not fully implemented yet")
     return None
 
-def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days_to_add: int = 0, seconds_to_add: int | None = None, telegram_id: str = None) -> tuple[str | None, int | None]:
+def update_or_create_client_on_panel(
+    api: Api,
+    inbound_id: int,
+    email: str,
+    days_to_add: int = 0,
+    seconds_to_add: int | None = None,
+    telegram_id: str = None,
+    absolute_expiry_ms: int | None = None,
+) -> tuple[str | None, int | None]:
     def _is_record_not_found_error(exc: Exception) -> bool:
         return "record not found" in str(exc).lower()
 
@@ -343,23 +347,40 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
                 client_index = i
                 break
 
-        if seconds_to_add is not None:
-            delta = timedelta(seconds=int(seconds_to_add))
+        if absolute_expiry_ms is not None:
+            try:
+                target_expiry_ms = int(absolute_expiry_ms)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid absolute_expiry_ms value: {absolute_expiry_ms}")
+            if target_expiry_ms <= 0:
+                raise ValueError(f"absolute_expiry_ms must be positive, got: {target_expiry_ms}")
+
+            # Idempotent path for auto-provision:
+            # never decrease expiry for existing clients, only move forward.
+            if client_index != -1:
+                existing_client = inbound_to_modify.settings.clients[client_index]
+                current_ms = int(getattr(existing_client, "expiry_time", 0) or 0)
+                new_expiry_ms = max(current_ms, target_expiry_ms)
+            else:
+                new_expiry_ms = target_expiry_ms
         else:
-            delta = timedelta(days=int(days_to_add))
-        
-        # Calculate expiry time
-        if client_index != -1:
-            existing_client = inbound_to_modify.settings.clients[client_index]
-            if existing_client.expiry_time > time_utils.get_timestamp_ms(time_utils.get_msk_now()):
-                current_expiry_dt = time_utils.from_timestamp_ms(existing_client.expiry_time)
-                new_expiry_dt = current_expiry_dt + delta
+            if seconds_to_add is not None:
+                delta = timedelta(seconds=int(seconds_to_add))
+            else:
+                delta = timedelta(days=int(days_to_add))
+
+            # Calculate expiry time for additive updates.
+            if client_index != -1:
+                existing_client = inbound_to_modify.settings.clients[client_index]
+                if existing_client.expiry_time > time_utils.get_timestamp_ms(time_utils.get_msk_now()):
+                    current_expiry_dt = time_utils.from_timestamp_ms(existing_client.expiry_time)
+                    new_expiry_dt = current_expiry_dt + delta
+                else:
+                    new_expiry_dt = time_utils.get_msk_now() + delta
             else:
                 new_expiry_dt = time_utils.get_msk_now() + delta
-        else:
-            new_expiry_dt = time_utils.get_msk_now() + delta
 
-        new_expiry_ms = time_utils.get_timestamp_ms(new_expiry_dt)
+            new_expiry_ms = time_utils.get_timestamp_ms(new_expiry_dt)
         
         if client_index != -1:
             # Update existing client
@@ -385,33 +406,59 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
 
             client_uuid = client_to_update.id
             try:
-                api.inbound.update(inbound_id, inbound_to_modify)
+                # Prefer direct client update endpoint for existing users.
+                # It tends to refresh panel runtime state more reliably than full inbound rewrite.
+                api.client.update(client_uuid, client_to_update)
                 logger.info(f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
             except Exception as update_error:
                 if not _is_record_not_found_error(update_error):
                     raise
 
-                # Panel can keep a stale reference in clients list; fallback to safe recreate.
+                # Some panels intermittently return "record not found" on direct update.
+                # Retry via full inbound update before recreate fallback.
                 logger.warning(
                     f"Client '{email}' update failed with 'record not found' on inbound {inbound_id}. "
-                    "Trying recreate fallback."
+                    "Trying inbound.update fallback."
                 )
-                client_uuid = str(uuid.uuid4())
-                subscription_id = uuid.uuid4().hex[:16]
-                recreated_client = Client(
-                    id=client_uuid,
-                    email=email,
-                    enable=True,
-                    flow=target_flow,
-                    expiry_time=new_expiry_ms,
-                    sub_id=subscription_id,
-                    total_gb=0,
-                    reset=0,
-                    tg_id=telegram_id
-                )
-                _set_unlimited_traffic_fields(recreated_client)
-                api.client.add(inbound_id, [recreated_client])
-                logger.info(f"Recreated client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
+                try:
+                    api.inbound.update(inbound_id, inbound_to_modify)
+                    logger.info(
+                        f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id} "
+                        "via inbound.update fallback."
+                    )
+                except Exception as inbound_update_error:
+                    if not _is_record_not_found_error(inbound_update_error):
+                        raise
+
+                    # Panel can keep a stale reference in clients list; final fallback is safe recreate.
+                    logger.warning(
+                        f"Client '{email}' inbound.update fallback also failed with 'record not found' "
+                        f"on inbound {inbound_id}. Trying recreate fallback."
+                    )
+                    client_uuid = str(uuid.uuid4())
+                    subscription_id = uuid.uuid4().hex[:16]
+                    recreated_client = Client(
+                        id=client_uuid,
+                        email=email,
+                        enable=True,
+                        flow=target_flow,
+                        expiry_time=new_expiry_ms,
+                        sub_id=subscription_id,
+                        total_gb=0,
+                        reset=0,
+                        tg_id=telegram_id
+                    )
+                    _set_unlimited_traffic_fields(recreated_client)
+                    api.client.add(inbound_id, [recreated_client])
+                    logger.info(f"Recreated client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}")
+
+            # Reset traffic counters so the 3x-ui panel no longer shows "exhausted" (исчерпано).
+            # This is a best-effort call: if it fails the key is still functional.
+            try:
+                api.client.reset_stats(inbound_id, email)
+                logger.debug(f"Traffic stats reset for '{email}' on inbound {inbound_id}")
+            except Exception as rst_err:
+                logger.warning(f"Could not reset traffic stats for '{email}': {rst_err}")
 
         else:
             client_uuid = str(uuid.uuid4())
@@ -448,12 +495,51 @@ def update_or_create_client_on_panel(api: Api, inbound_id: int, email: str, days
 import asyncio
 
 async def create_or_update_key_on_host(host_name: str, email: str, days_to_add: int, telegram_id: str = None) -> Dict | None:
-    return await asyncio.to_thread(_create_or_update_key_on_host_sync, host_name, email, days_to_add, None, telegram_id)
+    return await asyncio.to_thread(
+        _create_or_update_key_on_host_sync,
+        host_name,
+        email,
+        days_to_add,
+        None,
+        telegram_id,
+        None,
+    )
 
 async def create_or_update_key_on_host_seconds(host_name: str, email: str, seconds_to_add: int, telegram_id: str = None) -> Dict | None:
-    return await asyncio.to_thread(_create_or_update_key_on_host_sync, host_name, email, 0, int(seconds_to_add), telegram_id)
+    return await asyncio.to_thread(
+        _create_or_update_key_on_host_sync,
+        host_name,
+        email,
+        0,
+        int(seconds_to_add),
+        telegram_id,
+        None,
+    )
 
-def _create_or_update_key_on_host_sync(host_name: str, email: str, days_to_add: int, seconds_to_add: int | None, telegram_id: str = None) -> Dict | None:
+async def create_or_update_key_on_host_absolute_expiry(
+    host_name: str,
+    email: str,
+    target_expiry_ms: int,
+    telegram_id: str = None,
+) -> Dict | None:
+    return await asyncio.to_thread(
+        _create_or_update_key_on_host_sync,
+        host_name,
+        email,
+        0,
+        None,
+        telegram_id,
+        int(target_expiry_ms),
+    )
+
+def _create_or_update_key_on_host_sync(
+    host_name: str,
+    email: str,
+    days_to_add: int,
+    seconds_to_add: int | None,
+    telegram_id: str = None,
+    absolute_expiry_ms: int | None = None,
+) -> Dict | None:
     host_data = get_host(host_name)
     if not host_data:
         logger.error(f"Workflow failed: Host '{host_name}' not found in the database.")
@@ -469,7 +555,15 @@ def _create_or_update_key_on_host_sync(host_name: str, email: str, days_to_add: 
         logger.error(f"Workflow failed: Could not log in or find inbound on host '{host_name}'.")
         return None
         
-    client_uuid, new_expiry_ms = update_or_create_client_on_panel(api, inbound.id, email, days_to_add=days_to_add, seconds_to_add=seconds_to_add, telegram_id=telegram_id)
+    client_uuid, new_expiry_ms = update_or_create_client_on_panel(
+        api,
+        inbound.id,
+        email,
+        days_to_add=days_to_add,
+        seconds_to_add=seconds_to_add,
+        telegram_id=telegram_id,
+        absolute_expiry_ms=absolute_expiry_ms,
+    )
     if not client_uuid:
         logger.error(f"Workflow failed: Could not create/update client '{email}' on host '{host_name}'.")
         return None

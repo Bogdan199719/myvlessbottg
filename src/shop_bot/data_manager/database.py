@@ -302,6 +302,17 @@ def run_migration():
                 logging.info(" -> Index on users.is_banned created.")
             except sqlite3.OperationalError:
                 logging.info(" -> Index on users.is_banned already exists.")
+
+            # Hard guard: one paid key per user per host.
+            # Prevents accidental duplicates that inflate "servers count" and break global expiry logic.
+            try:
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_vpn_keys_user_host_paid_unique "
+                    "ON vpn_keys(user_id, host_name) WHERE plan_id > 0"
+                )
+                logging.info(" -> Partial unique index on paid keys (user_id, host_name) created.")
+            except sqlite3.OperationalError as e:
+                logging.warning(f" -> Could not create paid-keys unique index: {e}")
             
             logging.info("The table 'users' has been successfully updated.")
 
@@ -550,6 +561,10 @@ def update_setting(key: str, value: str):
             logging.info(f"Setting '{key}' updated.")
     except sqlite3.Error as e:
         logging.error(f"Failed to update setting '{key}': {e}")
+
+
+def set_setting(key: str, value: str):
+    update_setting(key, value)
 
 def create_plan(host_name: str, plan_name: str, months: int, price: float):
     try:
@@ -882,9 +897,10 @@ def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: s
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             expiry_date = time_utils.from_timestamp_ms(expiry_timestamp_ms)
+            created_date = time_utils.get_msk_now()
             cursor.execute(
-                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date, connection_string, plan_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, host_name, xui_client_uuid, key_email, expiry_date, connection_string, plan_id)
+                "INSERT INTO vpn_keys (user_id, host_name, xui_client_uuid, key_email, expiry_date, created_date, connection_string, plan_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, host_name, xui_client_uuid, key_email, expiry_date, created_date, connection_string, plan_id)
             )
             new_key_id = cursor.lastrowid
             
@@ -910,6 +926,40 @@ def add_new_key(user_id: int, host_name: str, xui_client_uuid: str, key_email: s
                 if updated:
                     return existing_key.get('key_id')
             logging.warning(f"Key '{key_email}' already exists but could not be updated.")
+            return None
+        if (
+            "idx_vpn_keys_user_host_paid_unique" in message
+            or "UNIQUE constraint failed: vpn_keys.user_id, vpn_keys.host_name" in message
+        ):
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT key_id, key_email FROM vpn_keys WHERE user_id = ? AND host_name = ? AND plan_id > 0 ORDER BY key_id DESC LIMIT 1",
+                        (user_id, host_name),
+                    )
+                    existing = cursor.fetchone()
+                if existing:
+                    updated = update_key_by_email(
+                        key_email=existing["key_email"],
+                        host_name=host_name,
+                        xui_client_uuid=xui_client_uuid,
+                        expiry_timestamp_ms=expiry_timestamp_ms,
+                        connection_string=connection_string,
+                        plan_id=plan_id
+                    )
+                    if updated:
+                        logging.warning(
+                            "Paid key duplicate prevented by unique index for user=%s host=%s. "
+                            "Updated existing key_id=%s instead.",
+                            user_id,
+                            host_name,
+                            existing["key_id"],
+                        )
+                        return existing["key_id"]
+            except sqlite3.Error as inner_error:
+                logging.error(f"Failed to recover from paid-key duplicate for user {user_id}: {inner_error}")
             return None
         logging.error(f"Failed to add new key for user {user_id}: {e}")
         return None
@@ -1103,15 +1153,6 @@ def get_user_trial_keys(user_id: int):
     except sqlite3.Error as e:
         logging.error(f"Failed to get trial keys for user {user_id}: {e}")
         return []
-
-def update_key_plan_id(key_id: int, plan_id: int):
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE vpn_keys SET plan_id = ? WHERE key_id = ?", (plan_id, key_id))
-            conn.commit()
-    except sqlite3.Error as e:
-        logging.error(f"Failed to update plan_id for key {key_id}: {e}")
 
 def update_key_info(key_id: int, expiry_date: datetime, connection_string: str | None = None):
     try:

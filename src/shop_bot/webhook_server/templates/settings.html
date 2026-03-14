@@ -5,10 +5,10 @@
 
 <div class="settings-container">
 	<div class="settings-column-left">
-		<section class="settings-section">
+		<section class="settings-section" id="hosts">
 			<h2>Управление Хостами (Серверами)</h2>
 
-			<div class="host-card" style="border: 2px solid #ff9800;">
+			<div class="host-card host-card-global">
 				<div class="host-header">
 					<h3>🌍 Глобальные тарифы (Все серверы + Подписка)</h3>
 					<form action="{{ url_for('toggle_global_plans_route') }}" method="post">
@@ -106,12 +106,11 @@
 					<h3>
 						{{ host.host_name }}
 						<span
-							class="status-badge {% if host.is_enabled %}status-active{% else %}status-stopped{% endif %}"
-							style="margin-left: 10px; font-size: 0.7em;">
+							class="status-badge host-status-badge {% if host.is_enabled %}status-active{% else %}status-stopped{% endif %}">
 							{% if host.is_enabled %}Активен{% else %}Отключен{% endif %}
 						</span>
 					</h3>
-					<div class="host-actions" style="display: flex; gap: 5px;">
+					<div class="host-actions">
 						<form action="{{ url_for('toggle_host_route', host_name=host.host_name) }}" method="post">
 							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 							{% if host.is_enabled %}
@@ -138,7 +137,7 @@
 					</div>
 				</div>
 				<p><strong>URL:</strong> {{ host.host_url }}
-					{% if not host.is_enabled %} <span style="color: red; font-weight: bold;">(ОТКЛЮЧЕН)</span>{% endif
+					{% if not host.is_enabled %} <span class="host-disabled-label">(ОТКЛЮЧЕН)</span>{% endif
 					%}
 				</p>
 				<div class="plans-section">
@@ -183,7 +182,7 @@
 	</div>
 
 	<div class="settings-column-right">
-		<section class="settings-section backup-card">
+		<section class="settings-section backup-card" id="backup">
 			<div class="backup-header">
 				<div>
 					<h2>Резервное копирование</h2>
@@ -214,7 +213,18 @@
 
 		<form action="{{ url_for('settings_page') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-			<section class="settings-section">
+			<nav class="settings-quicknav">
+				<a href="#panel-settings">Панель</a>
+				<a href="#bot-settings">Бот</a>
+				<a href="#support-settings">Поддержка</a>
+				<a href="#ref-settings">Рефералка</a>
+				<a href="#trial-settings">Триал</a>
+				<a href="#payment-settings">Платежи</a>
+				<a href="#content-settings">Контент</a>
+				<a href="#backup">Бэкап</a>
+				<a href="#hosts">Хосты</a>
+			</nav>
+			<section class="settings-section" id="panel-settings">
 				<h2>Настройки Панели</h2>
 				<div class="form-group">
 					<label for="panel_login">Логин для входа в панель:</label>
@@ -229,7 +239,7 @@
 				</div>
 			</section>
 
-			<section class="settings-section">
+			<section class="settings-section" id="bot-settings">
 				<h2>Настройка Бота</h2>
 				<div class="form-group password-wrapper">
 					<label for="telegram_bot_token">Токен бота:</label>
@@ -268,7 +278,7 @@
 					<label for="enable_admin_trial_notifications">Включить уведомления о пробных ключах</label>
 				</div>
 			</section>
-			<section class="settings-section">
+			<section class="settings-section" id="support-settings">
 				<h2>Настройки Поддержки и Бота-Саппорта</h2>
 				<div class="form-group">
 					<label for="support_user">URL поддержки или Бота-Саппорта:</label>
@@ -289,7 +299,7 @@
 						value="{{ settings.support_group_id or '' }}" />
 				</div>
 			</section>
-			<section class="settings-section">
+			<section class="settings-section" id="ref-settings">
 				<h2>Настройки Реферальной программы</h2>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_referrals" value="false" />
@@ -313,7 +323,7 @@
 						value="{{ settings.referral_discount or '5' }}" />
 				</div>
 			</section>
-			<section class="settings-section">
+			<section class="settings-section" id="trial-settings">
 				<h2>Настройки Пробного периода</h2>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="trial_enabled" value="false" />
@@ -327,7 +337,7 @@
 						value="{{ settings.trial_duration_days or '3' }}" />
 				</div>
 			</section>
-			<section class="settings-section">
+			<section class="settings-section" id="payment-settings">
 				<h2>Настройки Платежных Систем</h2>
 				<h2>Настройка YooKassa</h2>
 				<div class="form-group form-group-checkbox">
@@ -475,7 +485,7 @@
 				</div>
 			</section>
 
-			<section class="settings-section">
+			<section class="settings-section" id="content-settings">
 				<h2>Настройки Контента</h2>
 				<div class="form-group">
 					<label for="about_text">Текст "О проекте":</label>
@@ -511,9 +521,11 @@
 				</div>
 			</section>
 
-			<button type="submit" class="button button-primary">
-				Сохранить все настройки
-			</button>
+			<div class="settings-save-bar">
+				<button type="submit" class="button button-primary">
+					Сохранить все настройки
+				</button>
+			</div>
 		</form>
 	</div>
 </div>

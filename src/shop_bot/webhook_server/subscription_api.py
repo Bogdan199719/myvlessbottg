@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 import time
-import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from flask import Blueprint, Response, request, abort
@@ -11,7 +10,7 @@ from werkzeug.exceptions import HTTPException
 from shop_bot.data_manager.database import (
     get_user, get_user_paid_keys, get_all_settings,
     get_user_by_token, get_plans_for_host, get_all_hosts, add_new_key,
-    get_missing_keys, get_setting, get_key_by_email, update_key_by_email, get_next_key_number
+    get_missing_keys, get_setting, get_key_by_email, update_key_by_email
 )
 from shop_bot.modules import xui_api
 
@@ -28,7 +27,7 @@ _SUBSCRIPTION_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
-_PROVISION_TIMEOUT_SECONDS = 10
+_DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 
 def _host_slug(host_name: str) -> str:
     return (host_name or "").replace(" ", "").lower()
@@ -44,38 +43,19 @@ def _token_prefix(token: str, limit: int = 5) -> str:
         return "empty"
     return f"{token[:limit]}..."
 
-def _pick_global_key_number(user_id: int, active_paid_keys: list[dict]) -> int:
-    """
-    Pick a stable key number for global auto-provisioning.
-    Prefer existing user key numbers; fallback to next available.
-    """
-    pattern = re.compile(rf"^user{int(user_id)}-key(\d+)-", re.IGNORECASE)
-    numbers: list[int] = []
-
-    for key in active_paid_keys:
-        email = str(key.get("key_email") or "")
-        match = pattern.match(email)
-        if not match:
-            continue
-        try:
-            numbers.append(int(match.group(1)))
-        except Exception:
-            continue
-
-    if numbers:
-        # Keep continuity with already issued keys for this subscription.
-        return max(set(numbers), key=numbers.count)
-
-    try:
-        return int(get_next_key_number(int(user_id)))
-    except Exception:
-        return 1
-
 def _bool_setting(key: str, default: bool = False) -> bool:
     raw = get_setting(key)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+def _provision_timeout_seconds() -> int:
+    raw = get_setting("provision_timeout_seconds")
+    try:
+        timeout = int(raw) if raw is not None else _DEFAULT_PROVISION_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        timeout = _DEFAULT_PROVISION_TIMEOUT_SECONDS
+    return max(10, min(timeout, 180))
 
 def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
     try:
@@ -173,30 +153,29 @@ def get_subscription(token):
             and k.get('key_email') not in missing_emails
         ]
 
+        provision_timeout = _provision_timeout_seconds()
+
         # Auto-provision missing hosts for active global subscriptions
         active_global_keys = [k for k in active_paid_keys if _is_global_key(k, global_plan_ids)]
 
-        # Fallback heuristic for legacy users whose plan_id не выставлен:
-        # если у пользователя 2+ активных платных ключа и есть глобальные тарифы в панели,
-        # считаем, что это глобальная подписка и используем эти ключи как источник срока.
-        if not active_global_keys and global_plan_ids and len(active_paid_keys) >= 2:
-            active_global_keys = active_paid_keys
-
         if active_global_keys and global_plan_ids and auto_provision_enabled:
-            first_global_plan_id = int(next(iter(global_plan_ids)))
-            key_number = _pick_global_key_number(user_id, active_paid_keys)
-            # Remaining validity based on the soonest-expiring global key
+            # Deterministic plan selection for stable writes across workers/restarts.
+            first_global_plan_id = int(min(global_plan_ids))
+            # Target expiry based on the soonest-expiring global key
             try:
                 global_expiries = []
                 for key in active_global_keys:
                     parsed = time_utils.parse_iso_to_msk(key.get('expiry_date'))
                     if parsed:
                         global_expiries.append(parsed)
-                remaining_seconds = int((min(global_expiries) - now).total_seconds()) if global_expiries else 0
+                min_expiry_dt = min(global_expiries) if global_expiries else None
+                remaining_seconds = int((min_expiry_dt - now).total_seconds()) if min_expiry_dt else 0
             except Exception:
+                min_expiry_dt = None
                 remaining_seconds = 0
 
-            if remaining_seconds > 0:
+            if remaining_seconds > 0 and min_expiry_dt:
+                target_expiry_ms = time_utils.get_timestamp_ms(min_expiry_dt)
                 existing_hosts = {k.get('host_name') for k in available_paid_keys}
                 logger.info(f"Global subscription detected. Existing hosts: {existing_hosts}. Remaining seconds: {remaining_seconds}")
                 
@@ -209,19 +188,19 @@ def get_subscription(token):
                         logger.debug(f"Host '{host_name}' already has a key")
                         continue
 
-                    email = f"user{user_id}-key{key_number}-{_host_slug(host_name)}"
+                    email = f"user{user_id}-global-{_host_slug(host_name)}"
                     logger.info(f"Auto-provisioning key for host '{host_name}' with email '{email}'")
                     
                     # Run async helper in a fresh loop (Flask view is sync)
                     async def _provision():
                         return await asyncio.wait_for(
-                            xui_api.create_or_update_key_on_host_seconds(
+                            xui_api.create_or_update_key_on_host_absolute_expiry(
                                 host_name=host_name,
                                 email=email,
-                                seconds_to_add=remaining_seconds,
+                                target_expiry_ms=target_expiry_ms,
                                 telegram_id=str(user_id)
                             ),
-                            timeout=_PROVISION_TIMEOUT_SECONDS
+                            timeout=provision_timeout
                         )
                     try:
                         res = asyncio.run(_provision())
@@ -254,7 +233,7 @@ def get_subscription(token):
                             new_key = {
                                 'host_name': host_name,
                                 'key_email': res['email'],
-                                'expiry_date': datetime.fromtimestamp(res['expiry_timestamp_ms'] / 1000).isoformat(),
+                                'expiry_date': time_utils.from_timestamp_ms(res['expiry_timestamp_ms']).isoformat(),
                                 'connection_string': res.get('connection_string'),
                                 'plan_id': first_global_plan_id,
                             }
@@ -358,14 +337,13 @@ def get_subscription(token):
         
         # Double-check: ensure no duplicate configs in the final list
         unique_configs = []
-        seen_configs = set()
+        seen_configs: set[str] = set()
         for config in configs:
-            config_hash = hash(config)
-            if config_hash in seen_configs:
+            if config in seen_configs:
                 logger.error(f"DUPLICATE CONFIG DETECTED! Config already exists in subscription. This should not happen!")
                 # Skip this duplicate
                 continue
-            seen_configs.add(config_hash)
+            seen_configs.add(config)
             unique_configs.append(config)
         
         if len(unique_configs) < len(configs):

@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Диагностика пользователя{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <h1>Диагностика пользователя</h1>
+    <div class="page-actions">
+        <a href="{{ url_for('users_page') }}" class="button button-secondary">К пользователям</a>
+        <a href="{{ url_for('keys_page') }}" class="button button-secondary">К ключам</a>
+    </div>
+</div>
+
+<section class="settings-section">
+    <div class="diagnostic-summary">
+        <div class="count-pill">Пользователь: <strong>{{ diagnostic_user.telegram_id }}</strong></div>
+        <div class="count-pill">Username: <strong>@{{ diagnostic_user.username or 'N/A' }}</strong></div>
+        <div class="count-pill">Проверено ключей: <strong>{{ checked_total }}</strong></div>
+        <div class="count-pill">Проблемных: <strong>{{ issues_total }}</strong></div>
+    </div>
+
+    <div class="table-scroll">
+        <table class="users-table diagnostics-table">
+            <thead>
+                <tr>
+                    <th>Ключ</th>
+                    <th>Хост</th>
+                    <th>БД</th>
+                    <th>Панель</th>
+                    <th>Трафик</th>
+                    <th>Проблемы</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in diagnostic_rows %}
+                <tr>
+                    <td>
+                        <strong>#{{ row.key_id }}</strong><br>
+                        <small class="key-email-cell">{{ row.key_email }}</small>
+                    </td>
+                    <td>{{ row.host_name or '—' }}</td>
+                    <td>
+                        <div>Активен: <strong>{{ 'Да' if row.db_active else 'Нет' }}</strong></div>
+                        <div>До: <strong>{{ row.db_expiry.strftime('%d.%m.%Y %H:%M') if row.db_expiry else '—' }}</strong></div>
+                    </td>
+                    <td>
+                        <div>Найден: <strong>{{ 'Да' if row.panel_found else 'Нет' }}</strong></div>
+                        <div>Включен: <strong>{% if row.panel_enabled is none %}—{% else %}{{ 'Да' if row.panel_enabled else 'Нет' }}{% endif %}</strong></div>
+                        <div>До: <strong>{{ row.panel_expiry.strftime('%d.%m.%Y %H:%M') if row.panel_expiry else '—' }}</strong></div>
+                    </td>
+                    <td>
+                        <div>up: <strong>{{ row.panel_up if row.panel_up is not none else '—' }}</strong></div>
+                        <div>down: <strong>{{ row.panel_down if row.panel_down is not none else '—' }}</strong></div>
+                        <div>limit: <strong>{{ row.panel_total if row.panel_total is not none else '—' }}</strong></div>
+                    </td>
+                    <td>
+                        {% if row.issues %}
+                            {% for issue in row.issues %}
+                                <div class="diag-issue">{{ issue }}</div>
+                            {% endfor %}
+                        {% else %}
+                            <span class="status-badge status-active">OK</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+{% endblock %}

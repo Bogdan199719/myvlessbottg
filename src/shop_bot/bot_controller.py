@@ -143,6 +143,9 @@ class BotController:
     def start_support_bot(self):
         if self.support_is_running:
             return {"status": "error", "message": "Бот-Саппорт уже запущен."}
+
+        if not self._loop or not self._loop.is_running():
+            return {"status": "error", "message": "Критическая ошибка: цикл событий не установлен."}
             
         token = database.get_setting("support_bot_token")
         group_id = database.get_setting("support_group_id")

@@ -355,6 +355,99 @@ document.addEventListener('DOMContentLoaded', function () {
 		applyFilters()
 	}
 
+	function setupKeyTableFilters() {
+		const searchInput = document.getElementById('keysSearch')
+		const countEl = document.getElementById('keysCount')
+		const filterButtons = document.querySelectorAll('[data-key-filter]')
+		const keyRows = Array.from(document.querySelectorAll('tr[data-key-row]'))
+		const groupRows = Array.from(document.querySelectorAll('tr[data-group-row]'))
+
+		if (!keyRows.length || (!searchInput && !filterButtons.length)) {
+			return
+		}
+
+		let activeFilter = 'all'
+
+		function normalize(value) {
+			return (value || '').toString().toLowerCase()
+		}
+
+		function matchesStatus(rowStatus) {
+			if (activeFilter === 'all') return true
+			if (activeFilter === 'global') return rowStatus.type === 'global'
+			if (activeFilter === 'expired') return rowStatus.status === 'expired'
+			if (activeFilter === 'expiring') return rowStatus.status === 'expiring'
+			if (activeFilter === 'active') return rowStatus.status === 'active'
+			return true
+		}
+
+		function applyFilters() {
+			const query = normalize(searchInput ? searchInput.value : '')
+			let visibleRows = 0
+			const visibleGroups = new Set()
+
+			keyRows.forEach(row => {
+				const rowStatus = {
+					type: normalize(row.dataset.keyType),
+					status: normalize(row.dataset.keyStatus),
+				}
+				const haystack = normalize(row.dataset.keySearch || row.textContent)
+				const matchFilter = matchesStatus(rowStatus)
+				const matchQuery = !query || haystack.includes(query)
+				const show = matchFilter && matchQuery
+				row.style.display = show ? '' : 'none'
+				if (show) {
+					visibleRows += 1
+					visibleGroups.add(row.dataset.group)
+				}
+			})
+
+			groupRows.forEach(groupRow => {
+				const groupId = groupRow.dataset.groupRow
+				groupRow.style.display = visibleGroups.has(groupId) ? '' : 'none'
+			})
+
+			if (countEl) {
+				countEl.textContent = `${visibleRows}/${keyRows.length}`
+			}
+		}
+
+		if (searchInput) {
+			searchInput.addEventListener('input', applyFilters)
+		}
+
+		filterButtons.forEach(button => {
+			button.addEventListener('click', () => {
+				filterButtons.forEach(btn => btn.classList.remove('is-active'))
+				button.classList.add('is-active')
+				activeFilter = button.getAttribute('data-key-filter') || 'all'
+				applyFilters()
+			})
+		})
+
+		applyFilters()
+	}
+
+	function setupMobileNavigation() {
+		const toggle = document.getElementById('mobileNavToggle')
+		const nav = document.getElementById('mainNavigation')
+		if (!toggle || !nav) return
+
+		toggle.addEventListener('click', () => {
+			const isOpen = nav.classList.toggle('is-open')
+			toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false')
+		})
+
+		nav.querySelectorAll('a').forEach(link => {
+			link.addEventListener('click', () => {
+				if (window.innerWidth <= 772) {
+					nav.classList.remove('is-open')
+					toggle.setAttribute('aria-expanded', 'false')
+				}
+			})
+		})
+	}
+
 	initializePasswordToggles()
 	setupBotControlForms()
 	setupConfirmationForms()
@@ -362,4 +455,6 @@ document.addEventListener('DOMContentLoaded', function () {
 	setupCopyButtons()
 	initializeDashboardCharts()
 	setupUserTableFilters()
+	setupKeyTableFilters()
+	setupMobileNavigation()
 })

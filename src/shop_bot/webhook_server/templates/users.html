@@ -8,17 +8,20 @@
 
 	<div class="table-toolbar">
 		<div class="table-tools">
-			<input id="usersSearch" class="search-input" type="text" placeholder="Search by ID or username" />
+			<input id="usersSearch" class="search-input" type="text" placeholder="Поиск по ID или username" />
 			<div class="filter-group">
-				<button type="button" class="filter-chip is-active" data-user-filter="all">All</button>
-				<button type="button" class="filter-chip" data-user-filter="active">Active</button>
-				<button type="button" class="filter-chip" data-user-filter="banned">Banned</button>
+				<button type="button" class="filter-chip is-active" data-user-filter="all">Все</button>
+				<button type="button" class="filter-chip" data-user-filter="active">Активные</button>
+				<button type="button" class="filter-chip" data-user-filter="banned">Забаненные</button>
 			</div>
 		</div>
-		<div class="count-pill">Shown: <span id="usersCount"></span></div>
+		<div class="table-tools">
+			<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Экспорт CSV</a>
+			<div class="count-pill">Показано: <span id="usersCount"></span></div>
+		</div>
 	</div>
 
-	<div style="overflow-x: auto">
+	<div class="table-scroll">
 		<table class="users-table">
 			<thead>
 				<tr>
@@ -31,7 +34,7 @@
 			</thead>
 			<tbody>
 				{% for user in users %}
-				<tr data-status="{{ 'banned' if user.is_banned else 'active' }}" data-search="{{ user.telegram_id }} {{ user.username or '' }}">
+				<tr id="user-{{ user.telegram_id }}" data-status="{{ 'banned' if user.is_banned else 'active' }}" data-search="{{ user.telegram_id }} {{ user.username or '' }}">
 					<td>{{ user.telegram_id }}</td>
 					<td>@{{ user.username or 'N/A' }}</td>
 					<td>
@@ -47,6 +50,10 @@
 					</td>
 					<td class="actions-cell">
 						<div class="actions-wrapper">
+							<a href="{{ url_for('user_diagnostics_page', user_id=user.telegram_id) }}"
+								class="button button-secondary button-small">
+								Диагностика
+							</a>
 							<button type="button" class="button button-success button-small"
 								onclick="openIssueModal('{{ user.telegram_id }}', '{{ user.username }}')">
 								Выдать

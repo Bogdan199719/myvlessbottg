@@ -12,7 +12,10 @@
 <body>
 	<div class="container">
 		<header class="main-header">
-			<nav class="navigation">
+			<button type="button" id="mobileNavToggle" class="mobile-nav-toggle" aria-expanded="false" aria-controls="mainNavigation">
+				Меню
+			</button>
+			<nav class="navigation" id="mainNavigation">
 				<a href="{{ url_for('dashboard_page') }}"
 					class="nav-link {% if request.endpoint == 'dashboard_page' %}active{% endif %}">Главная</a>
 				<a href="{{ url_for('users_page') }}"

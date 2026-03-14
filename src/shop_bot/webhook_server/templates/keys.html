@@ -1,51 +1,96 @@
 {% extends "base.html" %} {% block title %}Управление ключами{% endblock %} {% block
 content %}
 
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+<div class="page-header">
     <h1>Управление ключами</h1>
-    <div style="display: flex; gap: 10px;">
+    <div class="page-actions">
+        <form action="{{ url_for('maintenance_route') }}" method="POST"
+            onsubmit="return confirm('Запустить комплексное обслуживание: синхронизация конфигов + исправление параметров клиентов?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="button button-primary">Комплексное обслуживание</button>
+        </form>
+        <form action="{{ url_for('sync_keys_configs') }}" method="POST"
+            onsubmit="return confirm('Запустить синхронизацию connection string для всех ключей в фоне?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="button button-secondary">Синхронизировать конфиги</button>
+        </form>
         <form action="{{ url_for('fix_client_parameters') }}" method="POST"
             onsubmit="return confirm('Это действие исправит параметры flow и encryption для ВСЕХ клиентов на панелях XUI. Продолжить?');">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button type="submit" class="button button-warning">🔧 Исправить параметры клиентов</button>
+            <button type="submit" class="button button-warning">Исправить параметры клиентов</button>
         </form>
     </div>
 </div>
 
+<div class="maintenance-hint">
+    <strong>Что делают кнопки:</strong>
+    <span><b>Синхронизировать конфиги</b> обновляет ссылки (connection string) в БД.</span>
+    <span><b>Исправить параметры клиентов</b> чинит параметры flow/encryption/limit на панели XUI.</span>
+    <span><b>Комплексное обслуживание</b> выполняет обе операции подряд.</span>
+</div>
+
+<div class="task-status-grid" id="taskStatusGrid">
+    <div class="task-status-card" data-task-name="maintenance">
+        <h3>Комплексное обслуживание</h3>
+        <p class="task-status-pill is-{{ task_statuses.maintenance.status }}">{{ task_statuses.maintenance.status }}</p>
+        <p class="task-status-message">{{ task_statuses.maintenance.message }}</p>
+    </div>
+    <div class="task-status-card" data-task-name="sync_configs">
+        <h3>Синхронизация конфигов</h3>
+        <p class="task-status-pill is-{{ task_statuses.sync_configs.status }}">{{ task_statuses.sync_configs.status }}</p>
+        <p class="task-status-message">{{ task_statuses.sync_configs.message }}</p>
+    </div>
+    <div class="task-status-card" data-task-name="fix_parameters">
+        <h3>Исправление параметров</h3>
+        <p class="task-status-pill is-{{ task_statuses.fix_parameters.status }}">{{ task_statuses.fix_parameters.status }}</p>
+        <p class="task-status-message">{{ task_statuses.fix_parameters.message }}</p>
+    </div>
+</div>
+
+<div class="table-toolbar">
+    <div class="table-tools">
+        <input id="keysSearch" class="search-input" type="text" placeholder="Поиск по ID, хосту или email" />
+        <div class="filter-group">
+            <button type="button" class="filter-chip is-active" data-key-filter="all">Все</button>
+            <button type="button" class="filter-chip" data-key-filter="active">Активные</button>
+            <button type="button" class="filter-chip" data-key-filter="expiring">Скоро истекают</button>
+            <button type="button" class="filter-chip" data-key-filter="expired">Просроченные</button>
+            <button type="button" class="filter-chip" data-key-filter="global">Глобальные</button>
+        </div>
+    </div>
+    <div class="table-tools">
+        <a class="button button-small button-secondary" href="{{ url_for('export_keys_csv') }}">Экспорт CSV</a>
+        <div class="count-pill">Показано: <span id="keysCount"></span></div>
+    </div>
+</div>
+
 <section class="keys-section">
-    <div style="overflow-x: auto">
-        <table class="users-table">
+    <div class="table-scroll">
+        <table class="users-table keys-table">
             <thead>
                 <tr>
                     <th>ID</th>
-                    <!-- User column removed, using group header -->
                     <th>Хост</th>
                     <th>Email</th>
                     <th>Истекает</th>
                     <th>Статус (дней)</th>
-                    <th style="text-align: right">Действия</th>
+                    <th class="keys-actions-head">Действия</th>
                 </tr>
             </thead>
             <tbody>
                 {% for user in grouped_users %}
-                <tr style="background-color: #3b4250; border-bottom: 2px solid var(--border-color);">
-                    <td colspan="6" style="padding: 10px 15px;">
-                        <strong style="font-size: 1.1em; color: var(--primary-color);">
-                            <a href="{{ url_for('users_page') }}#user-{{ user.user_id }}"
-                                style="text-decoration: none; color: inherit;">
-                                {{ user.username }}
-                            </a>
+                <tr class="key-user-group-row" data-group-row="{{ user.user_id }}">
+                    <td colspan="6" class="key-user-group-cell">
+                        <strong class="key-user-name">
+                            <a href="{{ url_for('users_page') }}#user-{{ user.user_id }}">{{ user.username }}</a>
                         </strong>
-                        <small style="color: #adb5bd; margin-left: 10px;">ID: {{ user.user_id }}</small>
+                        <small class="key-user-id">ID: {{ user.user_id }}</small>
                     </td>
                 </tr>
-                
-                {# Separate keys into Global and Regular #}
+
                 {% set global_keys = [] %}
                 {% set regular_keys = [] %}
                 {% for key in user.user_keys %}
-                    {# Heuristic: if key has plan_id > 0 and it's marked as global in your logic #}
-                    {# In app.py we will pre-calculate this or use plan_id check #}
                     {% if key.is_global %}
                         {% set _ = global_keys.append(key) %}
                     {% else %}
@@ -53,21 +98,22 @@ content %}
                     {% endif %}
                 {% endfor %}
 
-                {# Show Global Subscription as ONE row if it exists #}
                 {% if global_keys %}
-                <tr style="background-color: #2d3238; border-left: 4px solid var(--primary-color);">
+                <tr class="key-row-global" data-key-row="1" data-group="{{ user.user_id }}" data-key-type="global"
+                    data-key-status="{% if global_keys[0].days_left is defined and global_keys[0].days_left < 0 %}expired{% elif global_keys[0].days_left is defined and global_keys[0].days_left < 3 %}expiring{% else %}active{% endif %}"
+                    data-key-search="{{ user.user_id }} {{ user.username }} global {% for g in global_keys %}{{ g.host_name }} {{ g.key_email }} {% endfor %}">
                     <td>—</td>
-                    <td><strong>🌍 Глобальная подписка</strong><br><small>Серверов: {{ global_keys|length }}</small></td>
+                    <td><strong>Глобальная подписка</strong><br><small>Серверов: {{ global_keys|length }}</small></td>
                     <td><small>Multi-link</small></td>
                     <td>
                         {% set first_key = global_keys[0] %}
-                        {{ first_key.expiry_date.split('T')[0] if first_key.expiry_date else '∞' }}
+                        {{ first_key.expiry_date.replace('T', ' ').split(' ')[0] if first_key.expiry_date else '∞' }}
                     </td>
                     <td>
                         {% if first_key.days_left is defined %}
-                            {% if first_key.days_left < 0 %} 
+                            {% if first_key.days_left < 0 %}
                                 <span class="status-badge status-banned">Просрочена</span>
-                            {% elif first_key.days_left < 3 %} 
+                            {% elif first_key.days_left < 3 %}
                                 <span class="status-badge status-warning">{{ first_key.days_left }} дн.</span>
                             {% else %}
                                 <span class="status-badge status-active">{{ first_key.days_left }} дн.</span>
@@ -76,82 +122,68 @@ content %}
                     </td>
                     <td class="actions-cell">
                         <form action="{{ url_for('adjust_key_duration', key_id=first_key.key_id) }}" method="POST"
-                            class="form-inline"
-                            onsubmit="return confirm('Вы уверены, что хотите изменить срок ГЛОБАЛЬНОЙ подписки сразу на всех серверах?');"
-                            style="display: flex; gap: 5px; justify-content: flex-end; align-items: center;">
+                            class="duration-form"
+                            onsubmit="return confirm('Вы уверены, что хотите изменить срок ГЛОБАЛЬНОЙ подписки сразу на всех серверах?');">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                            <div style="display: flex; gap: 5px; align-items: center;">
-                                <div style="display: flex; flex-direction: column; align-items: center;">
-                                    <span style="font-size: 0.7em; color: #adb5bd;">Дней</span>
-                                    <input type="number" name="days" value="0" min="-365" max="365"
-                                        style="width: 50px; padding: 2px; text-align: center;"
-                                        oninput="checkChanges(this.form)" />
-                                </div>
-                                <div style="display: flex; flex-direction: column; align-items: center;">
-                                    <span style="font-size: 0.7em; color: #adb5bd;">Часов</span>
-                                    <input type="number" name="hours" value="0" min="-23" max="23"
-                                        style="width: 50px; padding: 2px; text-align: center;"
-                                        oninput="checkChanges(this.form)" />
-                                </div>
-                                <button type="submit" class="button button-small button-success"
-                                    style="display: none; margin-left: 5px;" title="Изменить срок всей подписки">
-                                    OK
-                                </button>
-                            </div>
+
+                            <label class="duration-input-wrap">
+                                <span>Дней</span>
+                                <input type="number" name="days" value="0" min="-365" max="365" oninput="checkChanges(this.form)" />
+                            </label>
+                            <label class="duration-input-wrap">
+                                <span>Часов</span>
+                                <input type="number" name="hours" value="0" min="-23" max="23" oninput="checkChanges(this.form)" />
+                            </label>
+                            <button type="submit" class="button button-small button-success duration-submit" title="Изменить срок всей подписки">
+                                Применить
+                            </button>
                         </form>
                     </td>
                 </tr>
                 {% endif %}
 
-                {# Show Regular/Trial keys as they were #}
                 {% for key in regular_keys %}
-                <tr style="background-color: #2d3238;">
+                <tr data-key-row="1" data-group="{{ user.user_id }}" data-key-type="regular"
+                    data-key-status="{% if key.days_left is defined and key.days_left < 0 %}expired{% elif key.days_left is defined and key.days_left < 3 %}expiring{% else %}active{% endif %}"
+                    data-key-search="{{ user.user_id }} {{ user.username }} {{ key.host_name }} {{ key.key_email }} {{ key.key_id }}">
                     <td>{{ key.key_id }}</td>
                     <td>{{ '🎁 ' if key.plan_id == 0 }}{{ key.host_name }}</td>
-                    <td>
-                        <small>{{ key.key_email }}</small>
-                    </td>
+                    <td class="key-email-cell">{{ key.key_email }}</td>
                     <td>
                         {% if key.expiry_date %}
-                        {{ key.expiry_date.split('T')[0] }}
+                        {{ key.expiry_date.replace('T', ' ').split(' ')[0] }}
                         {% else %}
                         ∞
                         {% endif %}
                     </td>
                     <td>
                         {% if key.days_left is defined %}
-                        {% if key.days_left < 0 %} <span class="status-badge status-banned">Просрочен</span>
-                            {% elif key.days_left < 3 %} <span class="status-badge status-warning">{{ key.days_left }}
-                                дн.</span>
-                                {% else %}
+                            {% if key.days_left < 0 %}
+                                <span class="status-badge status-banned">Просрочен</span>
+                            {% elif key.days_left < 3 %}
+                                <span class="status-badge status-warning">{{ key.days_left }} дн.</span>
+                            {% else %}
                                 <span class="status-badge status-active">{{ key.days_left }} дн.</span>
-                                {% endif %}
-                                {% endif %}
+                            {% endif %}
+                        {% endif %}
                     </td>
                     <td class="actions-cell">
                         <form action="{{ url_for('adjust_key_duration', key_id=key.key_id) }}" method="POST"
-                            class="form-inline"
-                            onsubmit="var d = parseInt(this.days.value) || 0; var h = parseInt(this.hours.value) || 0; if(d === 0 && h === 0) { alert('Укажите количество дней или часов'); return false; } var txt = (d >= 0 && h >= 0) ? 'продлить' : 'уменьшить срок'; return confirm('Вы уверены, что хотите ' + txt + ' ключ #{{ key.key_id }}?');"
-                            style="display: flex; gap: 5px; justify-content: flex-end; align-items: center;">
+                            class="duration-form"
+                            onsubmit="var d = parseInt(this.days.value) || 0; var h = parseInt(this.hours.value) || 0; if(d === 0 && h === 0) { alert('Укажите количество дней или часов'); return false; } var txt = (d >= 0 && h >= 0) ? 'продлить' : 'уменьшить срок'; return confirm('Вы уверены, что хотите ' + txt + ' ключ #{{ key.key_id }}?');">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                            <div style="display: flex; gap: 5px; align-items: center;">
-                                <div style="display: flex; flex-direction: column; align-items: center;">
-                                    <span style="font-size: 0.7em; color: #adb5bd;">Дней</span>
-                                    <input type="number" name="days" value="0" min="-365" max="365"
-                                        style="width: 50px; padding: 2px; text-align: center;"
-                                        oninput="checkChanges(this.form)" />
-                                </div>
-                                <div style="display: flex; flex-direction: column; align-items: center;">
-                                    <span style="font-size: 0.7em; color: #adb5bd;">Часов</span>
-                                    <input type="number" name="hours" value="0" min="-23" max="23"
-                                        style="width: 50px; padding: 2px; text-align: center;"
-                                        oninput="checkChanges(this.form)" />
-                                </div>
-                                <button type="submit" class="button button-small button-success"
-                                    style="display: none; margin-left: 5px;" title="Применить изменения">
-                                    OK
-                                </button>
-                            </div>
+
+                            <label class="duration-input-wrap">
+                                <span>Дней</span>
+                                <input type="number" name="days" value="0" min="-365" max="365" oninput="checkChanges(this.form)" />
+                            </label>
+                            <label class="duration-input-wrap">
+                                <span>Часов</span>
+                                <input type="number" name="hours" value="0" min="-23" max="23" oninput="checkChanges(this.form)" />
+                            </label>
+                            <button type="submit" class="button button-small button-success duration-submit" title="Применить изменения">
+                                Применить
+                            </button>
                         </form>
                     </td>
                 </tr>
@@ -169,12 +201,46 @@ content %}
         const btn = form.querySelector('button[type="submit"]');
 
         if (days !== 0 || hours !== 0) {
-            btn.style.display = 'block';
+            btn.style.display = 'inline-flex';
         } else {
             btn.style.display = 'none';
         }
     }
-</script>
 
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.duration-form').forEach(checkChanges);
+
+        const cards = Array.from(document.querySelectorAll('.task-status-card'));
+        if (!cards.length) return;
+
+        async function refreshTaskStatuses() {
+            try {
+                const response = await fetch('{{ url_for("tasks_status_route") }}', { method: 'GET' });
+                if (!response.ok) return;
+                const payload = await response.json();
+                if (!payload || payload.status !== 'success' || !payload.tasks) return;
+
+                cards.forEach(card => {
+                    const taskName = card.getAttribute('data-task-name');
+                    const task = payload.tasks[taskName];
+                    if (!task) return;
+                    const pill = card.querySelector('.task-status-pill');
+                    const message = card.querySelector('.task-status-message');
+                    if (pill) {
+                        pill.className = `task-status-pill is-${task.status || 'idle'}`;
+                        pill.textContent = task.status || 'idle';
+                    }
+                    if (message) {
+                        message.textContent = task.message || '';
+                    }
+                });
+            } catch (_) {
+                // Silent fail: status polling should not break page actions.
+            }
+        }
+
+        setInterval(refreshTaskStatuses, 5000);
+    });
+</script>
 
 {% endblock %}

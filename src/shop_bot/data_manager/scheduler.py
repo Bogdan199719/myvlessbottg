@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import math
-import re
 import time
 
 from datetime import datetime, timedelta
@@ -15,11 +14,11 @@ from shop_bot.data_manager import database
 from shop_bot.modules import xui_api
 from shop_bot.bot import keyboards
 
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60
 PAID_NOTIFY_HOURS = {24, 1, 0}
 TRIAL_NOTIFY_HOURS = {1, 0}
 
-_PROVISION_TIMEOUT_SECONDS = 10
+_DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,14 @@ def _bool_setting(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+def _provision_timeout_seconds() -> int:
+    raw = database.get_setting("provision_timeout_seconds")
+    try:
+        timeout = int(raw) if raw is not None else _DEFAULT_PROVISION_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        timeout = _DEFAULT_PROVISION_TIMEOUT_SECONDS
+    return max(10, min(timeout, 180))
 
 def format_time_left(hours: int) -> str:
     if hours >= 24:
@@ -47,7 +54,9 @@ def format_time_left(hours: int) -> str:
         else:
             return f"{hours} часов"
 
-async def send_subscription_notification(bot: Bot, user_id: int, key_id: int, time_left_hours: int, expiry_date: datetime, is_trial: bool = False):
+async def send_subscription_notification(
+    bot: Bot, user_id: int, key_id: int, time_left_hours: int, expiry_date: datetime, is_trial: bool = False
+) -> bool:
     try:
         expiry_str = expiry_date.strftime('%d.%m.%Y в %H:%M')
         
@@ -87,11 +96,14 @@ async def send_subscription_notification(bot: Bot, user_id: int, key_id: int, ti
         
         await bot.send_message(chat_id=user_id, text=message, reply_markup=builder.as_markup(), parse_mode='Markdown')
         logger.info(f"Sent subscription notification to user {user_id} for key {key_id} ({time_left_hours} hours left, trial={is_trial}).")
-        
+        return True
     except Exception as e:
         logger.error(f"Error sending subscription notification to user {user_id}: {e}")
+        return False
 
-async def send_global_subscription_notification(bot: Bot, user_id: int, time_left_hours: int, expiry_date: datetime, hosts_count: int):
+async def send_global_subscription_notification(
+    bot: Bot, user_id: int, time_left_hours: int, expiry_date: datetime, hosts_count: int
+) -> bool:
     try:
         expiry_str = expiry_date.strftime('%d.%m.%Y в %H:%M')
 
@@ -129,11 +141,15 @@ async def send_global_subscription_notification(bot: Bot, user_id: int, time_lef
         logger.info(
             f"Sent GLOBAL subscription notification to user {user_id} ({hosts_count} hosts, {time_left_hours} hours left)."
         )
+        return True
     except Exception as e:
         logger.error(f"Error sending GLOBAL subscription notification to user {user_id}: {e}")
+        return False
 
 
-async def _process_notification(bot: Bot, user_id: int, key_id: int | None, expiry_date: datetime, is_trial: bool, hosts_count: int = 1):
+async def _process_notification(
+    bot: Bot, user_id: int, key_id: int | None, expiry_date: datetime, is_trial: bool, hosts_count: int = 1
+) -> bool:
     current_time = time_utils.get_msk_now()
     time_left = expiry_date - current_time
     total_hours_left = math.ceil(time_left.total_seconds() / 3600)
@@ -144,14 +160,30 @@ async def _process_notification(bot: Bot, user_id: int, key_id: int | None, expi
         if hours_mark - 1 < total_hours_left <= hours_mark:
             notification_type = 'global_expiry' if key_id is None else 'expiry'
             
-            if not await asyncio.to_thread(database.is_notification_sent, user_id, key_id, notification_type, hours_mark):
-                if key_id is None: # Global
-                     await send_global_subscription_notification(bot, user_id, hours_mark, expiry_date, hosts_count)
-                else:
-                     await send_subscription_notification(bot, user_id, key_id, hours_mark, expiry_date, is_trial)
-                
+            already_sent = await asyncio.to_thread(
+                database.is_notification_sent, user_id, key_id, notification_type, hours_mark
+            )
+            if already_sent:
+                return True
+
+            if key_id is None:  # Global
+                sent_ok = await send_global_subscription_notification(bot, user_id, hours_mark, expiry_date, hosts_count)
+            else:
+                sent_ok = await send_subscription_notification(bot, user_id, key_id, hours_mark, expiry_date, is_trial)
+
+            if sent_ok:
                 await asyncio.to_thread(database.mark_notification_sent, user_id, key_id, notification_type, hours_mark)
-            return
+                return True
+
+            logger.warning(
+                "Scheduler: Notification send failed for user=%s key_id=%s type=%s mark=%s; not marking as sent.",
+                user_id,
+                key_id,
+                notification_type,
+                hours_mark,
+            )
+            return False
+    return False
 
 async def check_expiring_subscriptions(bot: Bot):
     logger.info("Scheduler: Checking for expiring subscriptions...")
@@ -199,8 +231,11 @@ async def check_expiring_subscriptions(bot: Bot):
                 continue
 
             earliest_expiry = min(expiry_dates)
-            await _process_notification(bot, user_id, None, earliest_expiry, is_trial=False, hosts_count=len(keys))
-            processed_global_users.add(user_id)
+            global_window_processed = await _process_notification(
+                bot, user_id, None, earliest_expiry, is_trial=False, hosts_count=len(keys)
+            )
+            if global_window_processed:
+                processed_global_users.add(user_id)
 
         except Exception as e:
             logger.error(f"Error processing GLOBAL expiry for user {user_id}: {e}")
@@ -246,7 +281,7 @@ async def enforce_clients_state_from_db() -> None:
     total_already_ok = 0
     total_not_found = 0
     total_errors = 0
-    total_deleted = 0
+    total_expired_preserved = 0
 
     now = time_utils.get_msk_now()
 
@@ -257,8 +292,6 @@ async def enforce_clients_state_from_db() -> None:
 
         keys_in_db = await asyncio.to_thread(database.get_keys_for_host, host_name)
         desired_by_email: dict[str, dict] = {}
-        emails_to_delete: list[str] = []
-
         for db_key in keys_in_db:
             key_email = db_key.get("key_email")
             if not key_email:
@@ -272,9 +305,11 @@ async def enforce_clients_state_from_db() -> None:
                 total_errors += 1
                 continue
 
-            if expiry_date < now - timedelta(days=5):
-                emails_to_delete.append(key_email)
-                continue
+            # Preserve expired keys in DB and on panel.
+            # Admin may intentionally move expiry into the past (e.g. reducing term),
+            # and hard-deleting keys here causes data loss and confusing "key not found" flows.
+            if expiry_date <= now:
+                total_expired_preserved += 1
 
             desired_by_email[key_email] = {
                 "enabled": expiry_date > now,
@@ -290,25 +325,13 @@ async def enforce_clients_state_from_db() -> None:
             total_not_found += int(host_result.get("not_found", 0))
             total_errors += int(host_result.get("errors", 0))
 
-        for email in emails_to_delete:
-            try:
-                deleted = await xui_api.delete_client_on_host(host_name, email)
-                if deleted:
-                    total_deleted += 1
-            except Exception as e:
-                logger.error(
-                    f"Scheduler: Failed to delete expired client '{email}' from host '{host_name}': {e}"
-                )
-                total_errors += 1
-            await asyncio.to_thread(database.delete_key_by_email, email)
-
     logger.info(
-        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s deleted=%s errors=%s",
+        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s expired_preserved=%s errors=%s",
         total_checked,
         total_updated,
         total_already_ok,
         total_not_found,
-        total_deleted,
+        total_expired_preserved,
         total_errors,
     )
 
@@ -338,7 +361,19 @@ async def sync_keys_with_panels():
                 continue
             
             full_inbound_details = api.inbound.get_by_id(inbound.id)
-            clients_on_server = {client.email: client for client in (full_inbound_details.settings.clients or [])}
+            if not full_inbound_details or not getattr(full_inbound_details, "settings", None):
+                logger.error(
+                    f"Scheduler: Failed to load full inbound details for host '{host_name}' "
+                    f"(inbound_id={host.get('host_inbound_id')})."
+                )
+                failed_hosts.append(host_name)
+                continue
+
+            clients_on_server = {
+                client.email: client
+                for client in (full_inbound_details.settings.clients or [])
+                if getattr(client, "email", None)
+            }
             logger.info(f"Scheduler: Found {len(clients_on_server)} clients on the '{host_name}' panel.")
 
 
@@ -370,12 +405,30 @@ async def sync_keys_with_panels():
                     )
 
                     # Compare expiry times directly (no reset field logic)
-                    server_expiry_ms = server_client.expiry_time
+                    server_expiry_ms = int(getattr(server_client, "expiry_time", 0) or 0)
                     local_expiry_dt = expiry_date
                     local_expiry_ms = int(local_expiry_dt.timestamp() * 1000)
                     
                     # Update if expiry changed OR connection string needs update (e.g. flag changed)
                     current_db_string = db_key.get('connection_string')
+                    if server_expiry_ms <= 0:
+                        # Defensive guard: some panels can transiently return invalid expiry=0.
+                        # Never overwrite DB expiry with epoch-like values.
+                        logger.warning(
+                            "Scheduler: Invalid server expiry for key '%s' on host '%s' (expiry_ms=%s). "
+                            "Skipping expiry sync for this key.",
+                            key_email,
+                            host_name,
+                            server_expiry_ms,
+                        )
+                        if new_connection_string and new_connection_string != current_db_string:
+                            await asyncio.to_thread(
+                                database.update_key_connection_string,
+                                db_key['key_id'],
+                                new_connection_string,
+                            )
+                            total_affected_records += 1
+                        continue
                     
                     if (abs(server_expiry_ms - local_expiry_ms) > 1000) or (new_connection_string and new_connection_string != current_db_string):
                         # Use update_key_info to update both expiry and string if needed
@@ -426,41 +479,6 @@ def _host_slug(host_name: str) -> str:
     return (host_name or "").replace(" ", "").lower()
 
 
-def _pick_global_key_number(user_id: int, active_paid_keys: list) -> int:
-    """
-    Pick a stable key number for global auto-provisioning.
-    Prefer existing user key numbers; fallback to next available.
-    """
-    pattern = re.compile(rf"^user{int(user_id)}-key(\d+)-", re.IGNORECASE)
-    numbers: list[int] = []
-
-    for key in active_paid_keys:
-        email = str(key.get("key_email") or "")
-        match = pattern.match(email)
-        if not match:
-            continue
-        try:
-            numbers.append(int(match.group(1)))
-        except ValueError:
-            continue
-
-    if numbers:
-        return min(numbers)
-    
-    existing_keys = database.get_all_keys()
-    max_num = 0
-    for k in existing_keys:
-        if k.get("user_id") == user_id:
-            email = str(k.get("key_email") or "")
-            match = pattern.match(email)
-            if match:
-                try:
-                    max_num = max(max_num, int(match.group(1)))
-                except ValueError:
-                    pass
-    return max_num + 1
-
-
 async def auto_provision_new_hosts_for_global_users():
     """
     Auto-provision keys on new hosts for all users with active global subscriptions.
@@ -472,7 +490,7 @@ async def auto_provision_new_hosts_for_global_users():
     logger.info("Scheduler: Checking for new hosts to auto-provision for global users...")
     
     # Get all enabled hosts
-    all_hosts = database.get_all_hosts(only_enabled=True)
+    all_hosts = await asyncio.to_thread(database.get_all_hosts, True)
     if not all_hosts:
         logger.debug("Scheduler: No enabled hosts found.")
         return
@@ -485,7 +503,7 @@ async def auto_provision_new_hosts_for_global_users():
     # Get global plan IDs
     global_plan_ids = set()
     try:
-        global_plans = database.get_plans_for_host("ALL")
+        global_plans = await asyncio.to_thread(database.get_plans_for_host, "ALL")
         for p in global_plans:
             try:
                 global_plan_ids.add(int(p.get("plan_id")))
@@ -500,7 +518,7 @@ async def auto_provision_new_hosts_for_global_users():
         return
     
     # Get all keys and group by user
-    all_keys = database.get_all_keys()
+    all_keys = await asyncio.to_thread(database.get_all_keys)
     
     # Group keys by user_id
     keys_by_user: dict[int, list] = {}
@@ -517,6 +535,8 @@ async def auto_provision_new_hosts_for_global_users():
     total_keys_created = 0
     total_errors = 0
     
+    provision_timeout = _provision_timeout_seconds()
+
     for user_id, user_keys in keys_by_user.items():
         try:
             # Filter to active paid keys (global subscription)
@@ -529,9 +549,6 @@ async def auto_provision_new_hosts_for_global_users():
                         plan_id = k.get("plan_id")
                         # Check if key belongs to global subscription
                         is_global = (plan_id is not None and int(plan_id) in global_plan_ids)
-                        # Fallback: if user has 2+ active paid keys and global plans exist, treat as global
-                        if not is_global and len(user_keys) >= 2 and global_plan_ids:
-                            is_global = True
                         if is_global:
                             active_paid_keys.append(k)
                 except (ValueError, TypeError):
@@ -548,21 +565,26 @@ async def auto_provision_new_hosts_for_global_users():
             if not missing_hosts:
                 continue  # User has keys on all hosts
             
-            # Calculate remaining seconds from soonest-expiring key
+            # Calculate target expiry from the soonest-expiring global key
             try:
-                remaining_seconds = int(
-                    (min(time_utils.parse_iso_to_msk(k["expiry_date"]) for k in active_paid_keys if time_utils.parse_iso_to_msk(k.get("expiry_date"))) - now).total_seconds()
+                min_expiry_dt = min(
+                    time_utils.parse_iso_to_msk(k["expiry_date"])
+                    for k in active_paid_keys
+                    if time_utils.parse_iso_to_msk(k.get("expiry_date"))
                 )
+                remaining_seconds = int((min_expiry_dt - now).total_seconds())
             except (ValueError, TypeError):
+                min_expiry_dt = None
                 remaining_seconds = 0
             
-            if remaining_seconds <= 0:
+            if remaining_seconds <= 0 or not min_expiry_dt:
                 logger.warning(f"Scheduler: User {user_id} has global subscription but no valid expiry. Skipping.")
                 continue
+
+            target_expiry_ms = time_utils.get_timestamp_ms(min_expiry_dt)
             
-            # Pick key number for this user
-            key_number = _pick_global_key_number(user_id, active_paid_keys)
-            first_global_plan_id = int(next(iter(global_plan_ids)))
+            # Pick deterministic global plan id to avoid inconsistent plan assignment across cycles.
+            first_global_plan_id = int(min(global_plan_ids))
             
             logger.info(f"Scheduler: User {user_id} has global subscription. Missing hosts: {missing_hosts}. Auto-provisioning...")
             total_users_processed += 1
@@ -570,25 +592,26 @@ async def auto_provision_new_hosts_for_global_users():
             # Provision keys on missing hosts
             for host_name in missing_hosts:
                 try:
-                    email = f"user{user_id}-key{key_number}-{_host_slug(host_name)}"
+                    email = f"user{user_id}-global-{_host_slug(host_name)}"
                     logger.info(f"Scheduler: Auto-provisioning key for user {user_id} on host '{host_name}' with email '{email}'")
                     
                     # Create key on host
                     res = await asyncio.wait_for(
-                        xui_api.create_or_update_key_on_host_seconds(
+                        xui_api.create_or_update_key_on_host_absolute_expiry(
                             host_name=host_name,
                             email=email,
-                            seconds_to_add=remaining_seconds,
+                            target_expiry_ms=target_expiry_ms,
                             telegram_id=str(user_id)
                         ),
-                        timeout=_PROVISION_TIMEOUT_SECONDS
+                        timeout=provision_timeout
                     )
                     
                     if res:
                         # Persist to database
-                        existing_key = database.get_key_by_email(res["email"])
+                        existing_key = await asyncio.to_thread(database.get_key_by_email, res["email"])
                         if existing_key:
-                            database.update_key_by_email(
+                            await asyncio.to_thread(
+                                database.update_key_by_email,
                                 key_email=res["email"],
                                 host_name=host_name,
                                 xui_client_uuid=res["client_uuid"],
@@ -597,7 +620,8 @@ async def auto_provision_new_hosts_for_global_users():
                                 plan_id=first_global_plan_id
                             )
                         else:
-                            database.add_new_key(
+                            await asyncio.to_thread(
+                                database.add_new_key,
                                 user_id=user_id,
                                 host_name=host_name,
                                 xui_client_uuid=res["client_uuid"],
@@ -613,7 +637,10 @@ async def auto_provision_new_hosts_for_global_users():
                         total_errors += 1
                         
                 except asyncio.TimeoutError:
-                    logger.error(f"Scheduler: Timeout provisioning key for user {user_id} on host '{host_name}'")
+                    logger.error(
+                        f"Scheduler: Timeout provisioning key for user {user_id} on host '{host_name}' "
+                        f"after {provision_timeout}s"
+                    )
                     total_errors += 1
                 except Exception as e:
                     logger.error(f"Scheduler: Error provisioning key for user {user_id} on host '{host_name}': {e}")

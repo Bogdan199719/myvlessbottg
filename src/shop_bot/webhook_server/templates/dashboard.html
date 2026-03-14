@@ -23,6 +23,10 @@ block content %}
 			<h3>Активных хостов</h3>
 			<p class="stat-number">{{ stats.host_count }}</p>
 		</a>
+		<a href="{{ url_for('keys_page') }}" class="stat-card">
+			<h3>Проблемных пользователей</h3>
+			<p class="stat-number">{{ stats.problem_users_count }}</p>
+		</a>
 	</div>
 </section>
 
@@ -43,9 +47,50 @@ block content %}
 
 	<div class="dashboard-column-right">
 		<section>
-			<h2>Недавние транзакции</h2>
+			<h2>Проблемные пользователи</h2>
+			{% if problem_users %}
+			<div class="table-scroll">
+				<table class="users-table">
+					<thead>
+						<tr>
+							<th>ID</th>
+							<th>User</th>
+							<th>Проблемы</th>
+							<th>Действие</th>
+						</tr>
+					</thead>
+					<tbody>
+						{% for item in problem_users %}
+						<tr>
+							<td>{{ item.user_id }}</td>
+							<td>@{{ item.username or 'N/A' }}</td>
+							<td>
+								{% for reason in item.reasons %}
+								<div class="diag-issue">{{ reason }}</div>
+								{% endfor %}
+							</td>
+							<td>
+								<a class="button button-small button-secondary" href="{{ url_for('user_diagnostics_page', user_id=item.user_id) }}">
+									Открыть
+								</a>
+							</td>
+						</tr>
+						{% endfor %}
+					</tbody>
+				</table>
+			</div>
+			{% else %}
+			<p>Явных проблем не обнаружено.</p>
+			{% endif %}
+		</section>
+
+		<section>
+			<div class="section-head">
+				<h2>Недавние транзакции</h2>
+				<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
+			</div>
 			{% if transactions %}
-			<div style="overflow-x: auto">
+			<div class="table-scroll">
 				<table class="transactions-table">
 					<thead>
 						<tr>

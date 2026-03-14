@@ -30,6 +30,7 @@ logs.txt
 .idea/
 .vscode/
 *.DS_Store
+.pytest_cache/
 
 # Misc
 *.bak*

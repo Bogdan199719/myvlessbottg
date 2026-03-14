@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import concurrent.futures
 import json
 import hashlib
 import base64
@@ -9,14 +10,18 @@ import tempfile
 import zipfile
 import shutil
 import sys
+import threading
+import csv
+import io
+import re
 from hmac import compare_digest
-from datetime import datetime
+from datetime import datetime, timedelta
 from shop_bot.utils import time_utils, update_manager
 from shop_bot.version import APP_VERSION
 from functools import wraps
 from math import ceil
 from pathlib import Path
-from flask import Flask, request, render_template, redirect, url_for, flash, session, current_app, send_file, after_this_request
+from flask import Flask, request, render_template, redirect, url_for, flash, session, current_app, send_file, after_this_request, Response
 from werkzeug.security import check_password_hash, generate_password_hash
 
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +46,8 @@ from shop_bot.data_manager.database import (
     set_referral_balance, set_referral_balance_all, get_all_keys_with_usernames,
     update_key_connection_string,
     get_host, update_host, toggle_host_status, get_keys_for_host,
-    add_new_key, get_user, update_user_stats
+    add_new_key, get_user, update_user_stats, get_missing_keys, get_key_by_email,
+    update_key_plan_id
 )
 
 _bot_controller = None
@@ -270,6 +276,28 @@ def create_webhook_app(bot_controller_instance):
 
     flask_app.jinja_env.globals['csrf_token'] = generate_csrf_token
 
+    task_status_lock = threading.Lock()
+    task_statuses = {
+        "sync_configs": {"status": "idle", "message": "Не запускалась"},
+        "fix_parameters": {"status": "idle", "message": "Не запускалась"},
+        "maintenance": {"status": "idle", "message": "Не запускалась"},
+    }
+
+    def _task_status_snapshot() -> dict:
+        with task_status_lock:
+            return json.loads(json.dumps(task_statuses, ensure_ascii=False))
+
+    def _set_task_status(task_name: str, status: str, message: str, details: dict | None = None) -> None:
+        payload = {
+            "status": status,
+            "message": message,
+            "updated_at": time_utils.get_msk_now().isoformat(),
+        }
+        if details:
+            payload["details"] = details
+        with task_status_lock:
+            task_statuses[task_name] = payload
+
     @flask_app.context_processor
     def inject_current_year():
         return {'current_year': time_utils.get_msk_now().year}
@@ -277,7 +305,7 @@ def create_webhook_app(bot_controller_instance):
     def login_required(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if 'logged_in' not in session:
+            if not session.get('logged_in', False):
                 return redirect(url_for('login_page', next=request.url))
             return f(*args, **kwargs)
         return decorated_function
@@ -334,14 +362,180 @@ def create_webhook_app(bot_controller_instance):
         all_settings_ok = all(settings.get(key) for key in required_for_start)
         return {"bot_status": bot_status, "all_settings_ok": all_settings_ok}
 
-    def _run_auto_provision_for_global_users(context_host_name: str) -> None:
+    def _parse_user_id_from_key_email(email: str | None) -> int | None:
+        if not email:
+            return None
+        m = re.search(r'user(\d+)-', str(email), re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _build_problem_users(limit: int = 10) -> list[dict]:
+        users = get_all_users()
+        user_by_id = {int(u['telegram_id']): u for u in users if u.get('telegram_id') is not None}
+
+        reasons_by_user: dict[int, set[str]] = {}
+        now = time_utils.get_msk_now()
+
+        # Problem: missing keys found by sync mechanisms.
+        for missing in get_missing_keys():
+            email = missing.get('key_email')
+            host_name = missing.get('host_name')
+            first_seen_raw = missing.get('first_seen')
+            uid = _parse_user_id_from_key_email(email)
+            if uid is None:
+                continue
+
+            # Ignore legacy/dirty entries without host mapping.
+            if not host_name:
+                continue
+
+            # Ignore stale records older than 48h to reduce false positives.
+            first_seen_dt = time_utils.parse_iso_to_msk(first_seen_raw)
+            if first_seen_dt and first_seen_dt < now - timedelta(hours=48):
+                continue
+
+            # Ignore records that no longer exist in DB or already expired.
+            key = get_key_by_email(email)
+            if not key:
+                continue
+            expiry = time_utils.parse_iso_to_msk(key.get('expiry_date'))
+            if expiry and expiry <= now:
+                continue
+
+            reasons_by_user.setdefault(uid, set()).add("Ключ отсутствует на панели")
+
+        result = []
+        for uid, reasons in reasons_by_user.items():
+            user = user_by_id.get(uid)
+            result.append({
+                "user_id": uid,
+                "username": (user or {}).get("username") or "N/A",
+                "reasons": sorted(reasons),
+                "issues_count": len(reasons),
+            })
+
+        result.sort(key=lambda x: (-x["issues_count"], x["user_id"]))
+        return result[:limit]
+
+    def _csv_response(rows: list[dict], filename: str, fieldnames: list[str]) -> Response:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+        data = output.getvalue()
+        output.close()
+        return Response(
+            data,
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    def _run_async(coro, timeout: int = 45):
+        """Run an async coroutine from a Flask sync route via the shared event loop.
+
+        Replaces bare asyncio.run() calls which create new event loops per request
+        and can hang Waitress worker threads indefinitely if XUI panel is unreachable.
+        """
+        loop = current_app.config.get('EVENT_LOOP')
+        if not loop or not loop.is_running():
+            raise RuntimeError("Основной event loop недоступен или не запущен.")
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"Операция с XUI-панелью превысила лимит ожидания ({timeout}с). Проверьте доступность сервера.")
+
+    def _run_auto_provision_for_global_users(context_host_name: str) -> bool:
         """Run global users auto-provisioning from admin host actions."""
         try:
             from shop_bot.data_manager.scheduler import auto_provision_new_hosts_for_global_users
-            asyncio.run(auto_provision_new_hosts_for_global_users())
-            logger.info(f"Auto-provisioning completed for host '{context_host_name}'")
+
+            loop = current_app.config.get('EVENT_LOOP')
+            if loop and loop.is_running():
+                async def _provision_wrapper():
+                    try:
+                        await auto_provision_new_hosts_for_global_users()
+                        logger.info(f"Auto-provisioning completed for host '{context_host_name}'")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-provision for host '{context_host_name}': {e}", exc_info=True)
+
+                asyncio.run_coroutine_threadsafe(_provision_wrapper(), loop)
+                logger.info(f"Auto-provisioning scheduled for host '{context_host_name}'")
+                return True
+
+            logger.warning(f"Event loop не доступен для автопровижинга хоста '{context_host_name}'. Пропускаем.")
+            return False
         except Exception as e:
-            logger.error(f"Failed to auto-provision for host '{context_host_name}': {e}")
+            logger.error(f"Failed to auto-provision for host '{context_host_name}': {e}", exc_info=True)
+            return False
+
+    async def _sync_keys_job() -> dict:
+        all_keys = get_all_keys_with_usernames()
+        keys_by_host = {}
+        for key in all_keys:
+            host_name = key.get('host_name')
+            if not host_name:
+                continue
+            keys_by_host.setdefault(host_name, []).append(key)
+
+        total_updated = 0
+        total_hosts = 0
+        total_errors = 0
+        hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
+        for host_name in hosts:
+            if host_name not in keys_by_host:
+                continue
+            total_hosts += 1
+            try:
+                mapping = await asyncio.wait_for(
+                    xui_api.get_connection_strings_for_host(host_name),
+                    timeout=15
+                )
+            except Exception as k_e:
+                total_errors += 1
+                logger.warning(f"Failed to sync host '{host_name}': {k_e!r}", exc_info=True)
+                await asyncio.sleep(0.5)
+                continue
+
+            for key in keys_by_host[host_name]:
+                email = key.get('key_email')
+                if not email:
+                    continue
+                conn = mapping.get(email)
+                if conn:
+                    update_key_connection_string(key['key_id'], conn)
+                    total_updated += 1
+
+            await asyncio.sleep(0.5)
+
+        return {"updated": total_updated, "hosts_checked": total_hosts, "errors": total_errors}
+
+    async def _fix_clients_job() -> dict:
+        total_fixed = 0
+        total_hosts = 0
+        total_errors = 0
+        hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
+        for host_name in hosts:
+            total_hosts += 1
+            try:
+                fixed = await asyncio.wait_for(
+                    xui_api.fix_all_client_parameters_on_host(host_name),
+                    timeout=20
+                )
+                total_fixed += int(fixed)
+            except Exception as k_e:
+                total_errors += 1
+                logger.warning(f"Failed to fix clients on host '{host_name}': {k_e!r}", exc_info=True)
+            await asyncio.sleep(1)
+
+        return {"fixed": total_fixed, "hosts_checked": total_hosts, "errors": total_errors}
 
     @flask_app.route('/')
     @login_required
@@ -351,11 +545,13 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/dashboard')
     @login_required
     def dashboard_page():
+        problem_users = _build_problem_users(limit=10)
         stats = {
             "user_count": get_user_count(),
             "total_keys": get_total_keys_count(),
             "total_spent": get_total_spent_sum(),
-            "host_count": len(get_all_hosts())
+            "host_count": len(get_all_hosts()),
+            "problem_users_count": len(problem_users),
         }
         
         page = request.args.get('page', 1, type=int)
@@ -370,6 +566,7 @@ def create_webhook_app(bot_controller_instance):
         return render_template(
             'dashboard.html',
             stats=stats,
+            problem_users=problem_users,
             chart_data=chart_data,
             transactions=transactions,
             current_page=page,
@@ -398,6 +595,194 @@ def create_webhook_app(bot_controller_instance):
 
         common_data = get_common_template_data()
         return render_template('users.html', users=users, issuance_data=issuance_data, **common_data)
+
+    @flask_app.route('/export/users.csv')
+    @login_required
+    def export_users_csv():
+        rows = []
+        now = time_utils.get_msk_now()
+        for user in get_all_users():
+            keys = get_user_keys(int(user['telegram_id']))
+            active_keys = 0
+            for key in keys:
+                expiry = time_utils.parse_iso_to_msk(key.get('expiry_date'))
+                if expiry and expiry > now:
+                    active_keys += 1
+            rows.append({
+                "telegram_id": user.get("telegram_id"),
+                "username": user.get("username") or "",
+                "is_banned": int(bool(user.get("is_banned"))),
+                "trial_used": int(bool(user.get("trial_used"))),
+                "registration_date": user.get("registration_date") or "",
+                "total_spent": user.get("total_spent") or 0,
+                "total_months": user.get("total_months") or 0,
+                "keys_total": len(keys),
+                "keys_active": active_keys,
+            })
+
+        return _csv_response(
+            rows,
+            filename=f"users-{time_utils.get_msk_now().strftime('%Y%m%d-%H%M%S')}.csv",
+            fieldnames=[
+                "telegram_id", "username", "is_banned", "trial_used",
+                "registration_date", "total_spent", "total_months",
+                "keys_total", "keys_active"
+            ],
+        )
+
+    @flask_app.route('/export/keys.csv')
+    @login_required
+    def export_keys_csv():
+        rows = []
+        all_keys = get_all_keys_with_usernames()
+        for key in all_keys:
+            rows.append({
+                "key_id": key.get("key_id"),
+                "user_id": key.get("user_id"),
+                "username": key.get("username") or "",
+                "host_name": key.get("host_name") or "",
+                "key_email": key.get("key_email") or "",
+                "plan_id": key.get("plan_id"),
+                "days_left": key.get("days_left"),
+                "expiry_date": key.get("expiry_date") or "",
+                "created_date": key.get("created_date") or "",
+            })
+
+        return _csv_response(
+            rows,
+            filename=f"keys-{time_utils.get_msk_now().strftime('%Y%m%d-%H%M%S')}.csv",
+            fieldnames=[
+                "key_id", "user_id", "username", "host_name", "key_email",
+                "plan_id", "days_left", "expiry_date", "created_date"
+            ],
+        )
+
+    @flask_app.route('/export/transactions.csv')
+    @login_required
+    def export_transactions_csv():
+        rows = []
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT transaction_id, payment_id, user_id, username, status, amount_rub,
+                       amount_currency, currency_name, payment_method, metadata, created_date
+                FROM transactions
+                ORDER BY created_date DESC
+                """
+            )
+            for row in cursor.fetchall():
+                rows.append(dict(row))
+
+        return _csv_response(
+            rows,
+            filename=f"transactions-{time_utils.get_msk_now().strftime('%Y%m%d-%H%M%S')}.csv",
+            fieldnames=[
+                "transaction_id", "payment_id", "user_id", "username", "status",
+                "amount_rub", "amount_currency", "currency_name", "payment_method",
+                "metadata", "created_date"
+            ],
+        )
+
+    @flask_app.route('/users/diagnostics/<int:user_id>')
+    @login_required
+    def user_diagnostics_page(user_id: int):
+        user = get_user(user_id)
+        if not user:
+            flash(f"Пользователь {user_id} не найден.", "danger")
+            return redirect(url_for('users_page'))
+
+        keys = get_user_keys(user_id)
+        now = time_utils.get_msk_now()
+        rows = []
+        issues_total = 0
+
+        for key in keys:
+            host_name = key.get('host_name')
+            key_email = key.get('key_email')
+            db_expiry = time_utils.parse_iso_to_msk(key.get('expiry_date'))
+            db_active = bool(db_expiry and db_expiry > now)
+            issue_list: list[str] = []
+
+            panel_found = False
+            panel_enabled = None
+            panel_expiry = None
+            panel_total = None
+            panel_up = None
+            panel_down = None
+
+            host_data = get_host(host_name) if host_name else None
+            if not host_data:
+                issue_list.append("Хост отсутствует или удален из настроек")
+            else:
+                try:
+                    api, inbound = xui_api.login_to_host(
+                        host_url=host_data['host_url'],
+                        username=host_data['host_username'],
+                        password=host_data['host_pass'],
+                        inbound_id=host_data['host_inbound_id']
+                    )
+                    if not api or not inbound:
+                        issue_list.append("Не удалось подключиться к панели XUI")
+                    else:
+                        inbound_fresh = api.inbound.get_by_id(inbound.id)
+                        clients = (inbound_fresh.settings.clients or []) if inbound_fresh else []
+                        client = next((c for c in clients if getattr(c, "email", None) == key_email), None)
+                        if not client:
+                            issue_list.append("Клиент отсутствует на панели XUI")
+                        else:
+                            panel_found = True
+                            panel_enabled = bool(getattr(client, "enable", True))
+                            panel_total = getattr(client, "total", None)
+                            panel_up = getattr(client, "up", None)
+                            panel_down = getattr(client, "down", None)
+                            expiry_ms = int(getattr(client, "expiry_time", 0) or 0)
+                            panel_expiry = time_utils.from_timestamp_ms(expiry_ms) if expiry_ms > 0 else None
+
+                            if db_active and not panel_enabled:
+                                issue_list.append("В БД ключ активен, но на панели выключен")
+                            if (not db_active) and panel_enabled:
+                                issue_list.append("В БД ключ просрочен, но на панели включен")
+
+                            if db_expiry and panel_expiry:
+                                diff_seconds = abs((db_expiry - panel_expiry).total_seconds())
+                                if diff_seconds > 90:
+                                    issue_list.append(
+                                        f"Расхождение срока БД/панель: {int(diff_seconds // 60)} мин."
+                                    )
+                except Exception as e:
+                    logger.error(f"Diagnostics failed for user={user_id}, key={key_email}: {e}", exc_info=True)
+                    issue_list.append(f"Ошибка диагностики: {e}")
+
+            if issue_list:
+                issues_total += 1
+
+            rows.append({
+                "key_id": key.get("key_id"),
+                "host_name": host_name,
+                "key_email": key_email,
+                "plan_id": key.get("plan_id"),
+                "db_expiry": db_expiry,
+                "db_active": db_active,
+                "panel_found": panel_found,
+                "panel_enabled": panel_enabled,
+                "panel_expiry": panel_expiry,
+                "panel_total": panel_total,
+                "panel_up": panel_up,
+                "panel_down": panel_down,
+                "issues": issue_list,
+            })
+
+        common_data = get_common_template_data()
+        return render_template(
+            'user_diagnostics.html',
+            diagnostic_user=user,
+            diagnostic_rows=rows,
+            issues_total=issues_total,
+            checked_total=len(rows),
+            **common_data
+        )
 
     @flask_app.route('/keys')
     @login_required
@@ -429,10 +814,42 @@ def create_webhook_app(bot_controller_instance):
             key['is_global'] = bool(key.get('plan_id') and int(key['plan_id']) in global_plan_ids)
             users_map[uid]['user_keys'].append(key)
         
+        def _expiry_ts(key_item: dict) -> float:
+            dt = time_utils.parse_iso_to_msk(key_item.get('expiry_date'))
+            return dt.timestamp() if dt else 0.0
+
+        # Keep only one GLOBAL key per host for display (latest expiry wins).
+        # This prevents "3 servers from 2 hosts" when legacy duplicate rows exist.
+        for user_data in users_map.values():
+            global_by_host: dict[str, dict] = {}
+            regular_keys: list[dict] = []
+            for key in user_data['user_keys']:
+                if not key.get('is_global'):
+                    regular_keys.append(key)
+                    continue
+
+                host_name = key.get('host_name') or ''
+                prev = global_by_host.get(host_name)
+                if not prev or _expiry_ts(key) >= _expiry_ts(prev):
+                    global_by_host[host_name] = key
+
+            deduped_global = sorted(global_by_host.values(), key=_expiry_ts)
+            user_data['user_keys'] = deduped_global + regular_keys
+
         grouped_users = sorted(users_map.values(), key=lambda u: u['username'])
         
         common_data = get_common_template_data()
-        return render_template('keys.html', grouped_users=grouped_users, **common_data)
+        return render_template(
+            'keys.html',
+            grouped_users=grouped_users,
+            task_statuses=_task_status_snapshot(),
+            **common_data
+        )
+
+    @flask_app.route('/api/tasks/status', methods=['GET'])
+    @login_required
+    def tasks_status_route():
+        return {"status": "success", "tasks": _task_status_snapshot()}
 
 
 
@@ -482,7 +899,7 @@ def create_webhook_app(bot_controller_instance):
 
             for k in keys_to_adjust:
                 # Call logic to adjust on panel using seconds for precision
-                result = asyncio.run(xui_api.create_or_update_key_on_host_seconds(
+                result = _run_async(xui_api.create_or_update_key_on_host_seconds(
                     host_name=k['host_name'],
                     email=k['key_email'],
                     seconds_to_add=total_seconds,
@@ -551,52 +968,32 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def sync_keys_configs():
         try:
-            all_keys = get_all_keys_with_usernames()
             loop = current_app.config.get('EVENT_LOOP')
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
                 return redirect(url_for('keys_page'))
 
-            keys_by_host = {}
-            for key in all_keys:
-                host_name = key.get('host_name')
-                if not host_name:
-                    continue
-                keys_by_host.setdefault(host_name, []).append(key)
+            _set_task_status("sync_configs", "running", "Синхронизация конфигов запущена")
 
-            async def _sync_all_keys():
-                total_updated = 0
-                hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
-                for host_name in hosts:
-                    if host_name not in keys_by_host:
-                        continue
-                    try:
-                        mapping = await asyncio.wait_for(
-                            xui_api.get_connection_strings_for_host(host_name),
-                            timeout=15
-                        )
-                    except Exception as k_e:
-                        logger.warning(f"Failed to sync host '{host_name}': {k_e!r}", exc_info=True)
-                        await asyncio.sleep(0.5)
-                        continue
+            async def _sync_all_keys_wrapper():
+                try:
+                    result = await _sync_keys_job()
+                    _set_task_status(
+                        "sync_configs",
+                        "success",
+                        f"Готово: обновлено {result['updated']} ключей",
+                        details=result
+                    )
+                    logger.info(f"Sync keys completed: {result}")
+                except Exception as e:
+                    logger.error(f"Error in sync keys background job: {e}", exc_info=True)
+                    _set_task_status("sync_configs", "error", f"Ошибка синхронизации: {e}")
 
-                    for key in keys_by_host[host_name]:
-                        email = key.get('key_email')
-                        if not email:
-                            continue
-                        conn = mapping.get(email)
-                        if conn:
-                            update_key_connection_string(key['key_id'], conn)
-                            total_updated += 1
-
-                    await asyncio.sleep(0.5)
-
-                logger.info(f"Sync keys completed. Updated connection strings: {total_updated}")
-
-            asyncio.run_coroutine_threadsafe(_sync_all_keys(), loop)
+            asyncio.run_coroutine_threadsafe(_sync_all_keys_wrapper(), loop)
             flash("Синхронизация ключей запущена в фоне. Проверьте логи позже.", "info")
         except Exception as e:
             logger.error(f"Error syncing keys: {e}", exc_info=True)
+            _set_task_status("sync_configs", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить синхронизацию ключей.", "danger")
 
         return redirect(url_for('keys_page'))
@@ -610,27 +1007,75 @@ def create_webhook_app(bot_controller_instance):
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
                 return redirect(url_for('keys_page'))
 
-            async def _fix_all_clients():
-                total_fixed = 0
-                hosts = [h['host_name'] for h in get_all_hosts(only_enabled=True)]
-                for host_name in hosts:
-                    try:
-                        fixed = await asyncio.wait_for(
-                            xui_api.fix_all_client_parameters_on_host(host_name),
-                            timeout=20
-                        )
-                        total_fixed += fixed
-                    except Exception as k_e:
-                        logger.warning(f"Failed to fix clients on host '{host_name}': {k_e!r}", exc_info=True)
-                    await asyncio.sleep(1)
+            _set_task_status("fix_parameters", "running", "Исправление параметров запущено")
 
-                logger.info(f"Fix parameters completed. Updated clients: {total_fixed}")
+            async def _fix_all_clients_wrapper():
+                try:
+                    result = await _fix_clients_job()
+                    _set_task_status(
+                        "fix_parameters",
+                        "success",
+                        f"Готово: исправлено {result['fixed']} клиентов",
+                        details=result
+                    )
+                    logger.info(f"Fix parameters completed: {result}")
+                except Exception as e:
+                    logger.error(f"Fix parameters background job failed: {e}", exc_info=True)
+                    _set_task_status("fix_parameters", "error", f"Ошибка исправления: {e}")
 
-            asyncio.run_coroutine_threadsafe(_fix_all_clients(), loop)
+            asyncio.run_coroutine_threadsafe(_fix_all_clients_wrapper(), loop)
             flash("Исправление параметров запущено в фоне. Проверьте логи позже.", "info")
         except Exception as e:
             logger.error(f"Fix parameters error: {e}", exc_info=True)
+            _set_task_status("fix_parameters", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить исправление параметров клиентов.", "danger")
+        return redirect(url_for('keys_page'))
+
+    @flask_app.route('/keys/maintenance', methods=['POST'])
+    @login_required
+    def maintenance_route():
+        try:
+            loop = current_app.config.get('EVENT_LOOP')
+            if not loop or not loop.is_running():
+                flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for('keys_page'))
+
+            _set_task_status("maintenance", "running", "Комплексное обслуживание запущено")
+            _set_task_status("sync_configs", "running", "Синхронизация конфигов запущена")
+
+            async def _maintenance_wrapper():
+                try:
+                    sync_result = await _sync_keys_job()
+                    _set_task_status(
+                        "sync_configs",
+                        "success",
+                        f"Готово: обновлено {sync_result['updated']} ключей",
+                        details=sync_result
+                    )
+                    _set_task_status("fix_parameters", "running", "Исправление параметров запущено")
+                    fix_result = await _fix_clients_job()
+                    _set_task_status(
+                        "fix_parameters",
+                        "success",
+                        f"Готово: исправлено {fix_result['fixed']} клиентов",
+                        details=fix_result
+                    )
+                    _set_task_status(
+                        "maintenance",
+                        "success",
+                        "Комплексное обслуживание завершено",
+                        details={"sync": sync_result, "fix": fix_result}
+                    )
+                except Exception as e:
+                    logger.error(f"Maintenance background job failed: {e}", exc_info=True)
+                    _set_task_status("maintenance", "error", f"Ошибка обслуживания: {e}")
+
+            asyncio.run_coroutine_threadsafe(_maintenance_wrapper(), loop)
+            flash("Комплексное обслуживание запущено в фоне.", "info")
+        except Exception as e:
+            logger.error(f"Maintenance route error: {e}", exc_info=True)
+            _set_task_status("maintenance", "error", f"Не удалось запустить: {e}")
+            flash("Не удалось запустить комплексное обслуживание.", "danger")
         return redirect(url_for('keys_page'))
 
     @flask_app.route('/settings', methods=['GET', 'POST'])
@@ -741,14 +1186,17 @@ def create_webhook_app(bot_controller_instance):
     def revoke_keys_route(user_id):
         keys_to_revoke = get_user_keys(user_id)
         success_count = 0
-        
+
         for key in keys_to_revoke:
-            result = asyncio.run(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
-            if result:
-                success_count += 1
-        
+            try:
+                result = _run_async(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
+                if result:
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Failed to revoke key '{key.get('key_email')}' for user {user_id}: {e}", exc_info=True)
+
         delete_user_keys(user_id)
-        
+
         if success_count == len(keys_to_revoke):
             flash(f"Все {len(keys_to_revoke)} ключей для пользователя {user_id} были успешно отозваны.", 'success')
         else:
@@ -803,7 +1251,7 @@ def create_webhook_app(bot_controller_instance):
                         
                         if existing_key_db:
                             # Update existing key on panel and DB
-                            result = asyncio.run(xui_api.create_or_update_key_on_host(
+                            result = _run_async(xui_api.create_or_update_key_on_host(
                                 host_name=h['host_name'],
                                 email=existing_key_db['key_email'],
                                 days_to_add=days_to_add,
@@ -812,11 +1260,12 @@ def create_webhook_app(bot_controller_instance):
                             if result:
                                 expiry_dt = time_utils.from_timestamp_ms(result['expiry_timestamp_ms'])
                                 update_key_info(existing_key_db['key_id'], expiry_dt, result['connection_string'])
+                                update_key_plan_id(existing_key_db['key_id'], int(plan['plan_id']))
                                 issued_count += 1
                         else:
                             # Create new key
-                            email = f"user{user_id}-key{key_number}-{h['host_name'].replace(' ', '').lower()}"
-                            result = asyncio.run(xui_api.create_or_update_key_on_host(
+                            email = f"user{user_id}-global-{h['host_name'].replace(' ', '').lower()}"
+                            result = _run_async(xui_api.create_or_update_key_on_host(
                                 host_name=h['host_name'],
                                 email=email,
                                 days_to_add=days_to_add,
@@ -835,7 +1284,10 @@ def create_webhook_app(bot_controller_instance):
                                 issued_count += 1
                      except Exception as e_h:
                           logger.error(f"Failed to issue manual key on host {h['host_name']}: {e_h}")
-                
+                if issued_count == 0:
+                    flash("Не удалось создать/обновить ни один ключ на серверах XUI.", "danger")
+                    return redirect(url_for('users_page'))
+
                 msg = f"Глобальная подписка успешно выдана! ({issued_count} ключей обработано)"
             
             else:
@@ -851,15 +1303,16 @@ def create_webhook_app(bot_controller_instance):
                     
                     if existing_key_db:
                         # Extend existing
-                        result = asyncio.run(xui_api.create_or_update_key_on_host(
+                        result = _run_async(xui_api.create_or_update_key_on_host(
                             host_name=host_name,
                             email=existing_key_db['key_email'],
                             days_to_add=days_to_add,
                             telegram_id=str(user_id)
                         ))
                         if result:
-                            expiry_dt = datetime.fromtimestamp(result['expiry_timestamp_ms'] / 1000)
+                            expiry_dt = time_utils.from_timestamp_ms(result['expiry_timestamp_ms'])
                             update_key_info(existing_key_db['key_id'], expiry_dt, result['connection_string'])
+                            update_key_plan_id(existing_key_db['key_id'], int(plan['plan_id']))
                             primary_key_id = existing_key_db['key_id']
                             issued_count += 1
                     else:
@@ -867,13 +1320,13 @@ def create_webhook_app(bot_controller_instance):
                         key_number = get_next_key_number(user_id)
                         email = f"user{user_id}-key{key_number}-{host_name.replace(' ', '').lower()}"
                         
-                        result = asyncio.run(xui_api.create_or_update_key_on_host(
+                        result = _run_async(xui_api.create_or_update_key_on_host(
                             host_name=host_name,
                             email=email,
                             days_to_add=days_to_add,
                             telegram_id=str(user_id)
                         ))
-                        
+
                         if result:
                             new_key_id = add_new_key(
                                 user_id=user_id,
@@ -927,9 +1380,12 @@ def create_webhook_app(bot_controller_instance):
         success_count = 0
 
         for key in keys_to_revoke:
-            result = asyncio.run(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
-            if result:
-                success_count += 1
+            try:
+                result = _run_async(xui_api.delete_client_on_host(key['host_name'], key['key_email']))
+                if result:
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Failed to delete key '{key.get('key_email')}' for user {user_id}: {e}", exc_info=True)
 
         delete_user_everywhere(user_id)
 
@@ -959,7 +1415,7 @@ def create_webhook_app(bot_controller_instance):
         # Auto-provision keys for all global subscription users immediately
         _run_auto_provision_for_global_users(host_name)
 
-        flash(f"Хост '{host_name}' успешно добавлен. Ключи созданы для всех пользователей с глобальной подпиской.", 'success')
+        flash(f"Хост '{host_name}' успешно добавлен. Автопровижининг глобальных ключей запущен.", 'success')
         return redirect(url_for('settings_page'))
 
     @flask_app.route('/edit-host/<host_name>', methods=['GET'])
@@ -994,8 +1450,8 @@ def create_webhook_app(bot_controller_instance):
         def cleanup(response):
             try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                logger.debug(f"Backup temp cleanup failed for '{temp_dir}': {cleanup_error}")
             return response
 
         return send_file(
@@ -1043,7 +1499,7 @@ def create_webhook_app(bot_controller_instance):
         # Auto-provision keys for all global subscription users if host name changed or enabled
         _run_auto_provision_for_global_users(new_host_name)
 
-        flash(f"Хост '{old_host_name}' успешно обновлен. Ключи обновлены для всех пользователей.", 'success')
+        flash(f"Хост '{old_host_name}' успешно обновлен. Автопровижининг глобальных ключей запущен.", 'success')
         return redirect(url_for('settings_page'))
 
     @flask_app.route('/toggle-host/<host_name>', methods=['POST'])
@@ -1101,7 +1557,8 @@ def create_webhook_app(bot_controller_instance):
                     future = asyncio.run_coroutine_threadsafe(_delete_all_clients_strict(), loop)
                     all_ok = future.result(timeout=305)  # Match the increased timeout
                 else:
-                    all_ok = asyncio.run(_delete_all_clients_strict())
+                    logger.error(f"Cannot delete clients from host '{host_name}': event loop is not running.")
+                    all_ok = False
             except Exception as e:
                 logger.error(f"Failed to delete clients from host '{host_name}': {e}", exc_info=True)
                 all_ok = False
@@ -1143,29 +1600,34 @@ def create_webhook_app(bot_controller_instance):
                 logger.error("YooKassa Webhook: Shop ID or Secret Key not configured. Rejecting request.")
                 return 'Forbidden', 403
 
-            event_json = request.json
+            event_json = request.get_json(silent=True)
+            if not isinstance(event_json, dict):
+                logger.warning("YooKassa Webhook: Invalid JSON payload.")
+                return 'Bad Request', 400
             if event_json.get("event") == "payment.succeeded":
                 obj = event_json.get("object", {})
                 metadata = obj.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
                 payment_id = obj.get("id")
+                if not payment_id:
+                    logger.warning("YooKassa webhook: Missing payment id in succeeded event.")
+                    return 'Bad Request', 400
 
-                if payment_id:
-                    if _is_webhook_processed("yookassa", payment_id):
+                if _is_webhook_processed("yookassa", payment_id):
+                    return 'OK', 200
+
+                Configuration.account_id = shop_id
+                Configuration.secret_key = secret_key
+
+                try:
+                    payment = Payment.find_one(payment_id)
+                    if not payment or getattr(payment, 'status', None) != 'succeeded':
+                        logger.warning(f"YooKassa webhook: Payment {payment_id} is not succeeded according to API.")
                         return 'OK', 200
-
-                    Configuration.account_id = shop_id
-                    Configuration.secret_key = secret_key
-
-                    try:
-                        payment = Payment.find_one(payment_id)
-                        if not payment or getattr(payment, 'status', None) != 'succeeded':
-                            logger.warning(f"YooKassa webhook: Payment {payment_id} is not succeeded according to API.")
-                            return 'OK', 200
-                    except Exception as e:
-                        logger.error(f"YooKassa webhook: API verification failed for payment {payment_id}: {e}")
-                        return 'Error', 500
-
-                    _set_webhook_processed("yookassa", payment_id)
+                except Exception as e:
+                    logger.error(f"YooKassa webhook: API verification failed for payment {payment_id}: {e}")
+                    return 'Error', 500
 
                 bot = _bot_controller.get_bot_instance()
                 payment_processor = handlers.process_successful_payment
@@ -1174,8 +1636,10 @@ def create_webhook_app(bot_controller_instance):
                     loop = current_app.config.get('EVENT_LOOP')
                     if loop and loop.is_running():
                         asyncio.run_coroutine_threadsafe(payment_processor(bot, metadata), loop)
+                        _set_webhook_processed("yookassa", payment_id)
                     else:
-                        logger.error("YooKassa webhook: Event loop is not available!")
+                        logger.error("YooKassa webhook: Event loop is not available! Will retry.")
+                        return 'Service Unavailable', 503
             return 'OK', 200
         except Exception as e:
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
@@ -1188,15 +1652,20 @@ def create_webhook_app(bot_controller_instance):
                 logger.error("CryptoBot Webhook: Secret not configured. Rejecting request for security.")
                 return 'Forbidden', 403
 
-            if configured_secret:
-                if not secret_token or not compare_digest(str(secret_token), str(configured_secret)):
-                    logger.warning("CryptoBot Webhook: Invalid or missing secret token.")
-                    return 'Forbidden', 403
+            if not secret_token or not compare_digest(str(secret_token), str(configured_secret)):
+                logger.warning("CryptoBot Webhook: Invalid or missing secret token.")
+                return 'Forbidden', 403
 
-            request_data = request.json
+            request_data = request.get_json(silent=True)
+            if not isinstance(request_data, dict):
+                logger.warning("CryptoBot Webhook: Invalid JSON payload.")
+                return 'Bad Request', 400
 
             if request_data and request_data.get('update_type') == 'invoice_paid':
                 payload_data = request_data.get('payload', {})
+                if not isinstance(payload_data, dict):
+                    logger.warning("CryptoBot Webhook: Payload is not an object.")
+                    return 'Bad Request', 400
 
                 invoice_status = payload_data.get('status')
                 if invoice_status and invoice_status != 'paid':
@@ -1236,19 +1705,19 @@ def create_webhook_app(bot_controller_instance):
                     "payment_method": parts[8]
                 }
 
-                if external_invoice_id:
-                    _set_webhook_processed("cryptobot", str(external_invoice_id))
-                elif external_id_fallback:
-                    _set_webhook_processed("cryptobot", external_id_fallback)
-
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get('EVENT_LOOP')
                 payment_processor = handlers.process_successful_payment
 
                 if bot and loop and loop.is_running():
                     asyncio.run_coroutine_threadsafe(payment_processor(bot, metadata), loop)
+                    if external_invoice_id:
+                        _set_webhook_processed("cryptobot", str(external_invoice_id))
+                    elif external_id_fallback:
+                        _set_webhook_processed("cryptobot", external_id_fallback)
                 else:
-                    logger.error("cryptobot Webhook: Could not process payment because bot or event loop is not running.")
+                    logger.error("cryptobot Webhook: Could not process payment because bot or event loop is not running. Will retry.")
+                    return 'Service Unavailable', 503
 
             return 'OK', 200
 
@@ -1271,16 +1740,20 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/heleket-webhook', methods=['POST'])
     def heleket_webhook_handler():
         try:
-            data = request.json
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                logger.warning("Heleket webhook: Invalid JSON payload.")
+                return 'Bad Request', 400
             logger.info(f"Received Heleket webhook: {data}")
 
             api_key = get_setting("heleket_api_key")
             if not api_key: return 'Error', 500
 
-            sign = data.pop("sign", None)
+            data_to_verify = dict(data)
+            sign = data_to_verify.pop("sign", None)
             if not sign: return 'Error', 400
                 
-            sorted_data_str = json.dumps(data, sort_keys=True, separators=(",", ":"))
+            sorted_data_str = json.dumps(data_to_verify, sort_keys=True, separators=(",", ":"))
             
             base64_encoded = base64.b64encode(sorted_data_str.encode()).decode()
             raw_string = f"{base64_encoded}{api_key}"
@@ -1290,21 +1763,23 @@ def create_webhook_app(bot_controller_instance):
                 logger.warning("Heleket webhook: Invalid signature.")
                 return 'Forbidden', 403
 
-            if data.get('status') in ["paid", "paid_over"]:
-                metadata_str = data.get('description')
+            if data_to_verify.get('status') in ["paid", "paid_over"]:
+                metadata_str = data_to_verify.get('description')
                 if not metadata_str: return 'Error', 400
                 
                 # Generate unique ID for idempotency check
                 # Use order_id or invoice_id from Heleket if available, otherwise hash metadata
-                external_id = data.get('order_id') or data.get('uuid') or hashlib.sha256(metadata_str.encode('utf-8')).hexdigest()
+                external_id = data_to_verify.get('order_id') or data_to_verify.get('uuid') or hashlib.sha256(metadata_str.encode('utf-8')).hexdigest()
                 
                 if _is_webhook_processed("heleket", str(external_id)):
                     logger.info(f"Heleket webhook: Payment {external_id} already processed, skipping.")
                     return 'OK', 200
                 
-                metadata = json.loads(metadata_str)
-                
-                _set_webhook_processed("heleket", str(external_id))
+                try:
+                    metadata = json.loads(metadata_str)
+                except json.JSONDecodeError:
+                    logger.error("Heleket webhook: description metadata is not valid JSON.")
+                    return 'Error', 400
                 
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get('EVENT_LOOP')
@@ -1312,6 +1787,10 @@ def create_webhook_app(bot_controller_instance):
 
                 if bot and loop and loop.is_running():
                     asyncio.run_coroutine_threadsafe(payment_processor(bot, metadata), loop)
+                    _set_webhook_processed("heleket", str(external_id))
+                else:
+                    logger.error("Heleket webhook: Bot or event loop is not running. Will retry.")
+                    return 'Service Unavailable', 503
             
             return 'OK', 200
         except Exception as e:
@@ -1336,7 +1815,10 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route('/ton-webhook', methods=['POST'])
     def ton_webhook_handler():
         try:
-            data = request.json
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                logger.warning("TON Webhook: Invalid JSON payload.")
+                return 'Bad Request', 400
             logger.info(f"Received TonAPI webhook: {data}")
 
             # Safe verification via TonAPI
