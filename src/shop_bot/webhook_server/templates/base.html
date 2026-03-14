@@ -37,53 +37,54 @@
 
 			<div class="header-controls">
 				<div class="bot-control">
+					<span class="bot-control-name">Shop</span>
 					{% if bot_status.shop_bot_running %}
-					<p class="status-running">Shop: <strong>Запущен</strong></p>
+					<p class="status-running"><strong>Запущен</strong></p>
 					<form action="{{ url_for('stop_shop_bot_route') }}" method="post">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<button type="submit" class="button button-stop button-small">
-							Остановить
+							Стоп
 						</button>
 					</form>
 					{% else %}
-					<p class="status-stopped">Shop: <strong>Остановлен</strong></p>
+					<p class="status-stopped"><strong>Остановлен</strong></p>
 					{% if all_settings_ok %}
 					<form action="{{ url_for('start_shop_bot_route') }}" method="post">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<button type="submit" class="button button-start button-small">
-							Запустить
+							Старт
 						</button>
 					</form>
 					{% else %}
 					<button class="button button-disabled button-small" disabled
 						title="Заполните обязательные настройки Telegram">
-						Запустить
+						Старт
 					</button>
 					{% endif %} {% endif %}
 				</div>
 
 				<div class="bot-control">
+					<span class="bot-control-name">Support</span>
 					{% if bot_status.support_bot_running %}
-					<p class="status-running">Support: <strong>Запущен</strong></p>
+					<p class="status-running"><strong>Запущен</strong></p>
 					<form action="{{ url_for('stop_support_bot_route') }}" method="post">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<button type="submit" class="button button-stop button-small">
-							Остановить
+							Стоп
 						</button>
 					</form>
 					{% else %}
-					<p class="status-stopped">Support: <strong>Остановлен</strong></p>
+					<p class="status-stopped"><strong>Остановлен</strong></p>
 					<form action="{{ url_for('start_support_bot_route') }}" method="post">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<button type="submit" class="button button-start button-small">
-							Запустить
+							Старт
 						</button>
 					</form>
 					{% endif %}
 				</div>
 
 				<div class="user-session-controls">
-					<span>Вы вошли в систему.</span>
 					<form action="{{ url_for('logout_page') }}" method="post" style="display: inline">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<button type="submit" class="button button-logout">Выйти</button>

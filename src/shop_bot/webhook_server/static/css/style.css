@@ -428,6 +428,14 @@ h4 {
 	border: 1px solid var(--card-border);
 }
 
+.button-logout,
+.bot-control .button-small {
+	min-height: 34px;
+	padding: 6px 12px;
+	font-size: 12px;
+	border-radius: 9px;
+}
+
 .button-logout {
 	background-color: #6c757d;
 	padding: 8px 15px;
@@ -466,17 +474,17 @@ body.login-page {
 	justify-content: space-between;
 	align-items: center;
 	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-	padding-bottom: 14px;
-	margin-bottom: 6px;
-	gap: 16px;
+	padding-bottom: 8px;
+	margin-bottom: 2px;
+	gap: 10px;
 	flex-wrap: wrap;
 }
 
 .header-main {
 	display: flex;
 	align-items: center;
-	gap: 16px;
-	flex: 1 1 540px;
+	gap: 10px;
+	flex: 1 1 620px;
 	min-width: 320px;
 	flex-wrap: wrap;
 }
@@ -484,7 +492,7 @@ body.login-page {
 .header-brand {
 	display: inline-flex;
 	align-items: center;
-	gap: 12px;
+	gap: 10px;
 	text-decoration: none;
 	color: inherit;
 	max-width: fit-content;
@@ -495,8 +503,8 @@ body.login-page {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	width: 38px;
-	height: 38px;
+	width: 34px;
+	height: 34px;
 	border-radius: 12px;
 	background: linear-gradient(135deg, #4da3ff, #6ab7ff);
 	color: #09131e;
@@ -514,14 +522,14 @@ body.login-page {
 
 .header-brand-copy strong {
 	font-family: 'Space Grotesk', 'IBM Plex Sans', sans-serif;
-	font-size: 0.98rem;
+	font-size: 0.92rem;
 	font-weight: 700;
 	color: var(--light-color);
 }
 
 .header-brand-copy small {
 	color: var(--text-muted);
-	font-size: 0.76rem;
+	font-size: 0.72rem;
 }
 
 .mobile-nav-toggle {
@@ -529,41 +537,55 @@ body.login-page {
 	border: 1px solid var(--border-color);
 	background: rgba(19, 23, 30, 0.85);
 	color: var(--light-color);
-	padding: 8px 12px;
+	padding: 9px 12px;
 	border-radius: 10px;
 	font-weight: 600;
 	cursor: pointer;
 }
 
+.navigation {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+	padding: 3px;
+	border-radius: 12px;
+	background: rgba(10, 13, 18, 0.54);
+	border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
 .navigation .nav-link {
 	display: inline-flex;
 	align-items: center;
-	font-size: 0.9rem;
-	font-weight: 600;
-	color: var(--text-muted);
+	justify-content: center;
+	font-size: 0.98rem;
+	font-weight: 700;
+	color: #d9e1ec;
 	text-decoration: none;
 	margin-right: 0;
-	padding: 8px 12px;
-	border-radius: 999px;
-	border: 1px solid rgba(255, 255, 255, 0.04);
-	background: rgba(10, 13, 18, 0.46);
-	transition: color 0.2s, background-color 0.2s, border-color 0.2s;
+	padding: 11px 18px;
+	border-radius: 10px;
+	border: 1px solid transparent;
+	background: transparent;
+	min-height: 44px;
+	transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s;
 }
 
 .navigation .nav-link:hover,
 .navigation .nav-link.active {
-	color: #f7fbff;
-	border-color: rgba(77, 163, 255, 0.34);
-	background: rgba(77, 163, 255, 0.12);
+	color: #ffffff;
+	border-color: rgba(77, 163, 255, 0.26);
+	background: rgba(77, 163, 255, 0.16);
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .header-controls {
 	display: flex;
 	justify-content: flex-end;
 	align-items: center;
-	gap: 10px;
+	gap: 6px;
 	flex-wrap: wrap;
-	flex: 1 1 360px;
+	flex: 0 1 auto;
 }
 
 .main-footer {
@@ -645,6 +667,7 @@ a.stat-card:hover {
 		overflow-x: visible;
 		white-space: normal;
 		padding-bottom: 0;
+		gap: 6px;
 	}
 
 	.settings-container {
@@ -763,18 +786,26 @@ a.stat-card:hover {
 .bot-control {
 	display: flex;
 	align-items: center;
-	gap: 10px;
-	padding: 10px 12px;
+	gap: 8px;
+	padding: 8px 10px;
 	border-right: none;
-	border-radius: 12px;
+	border-radius: 10px;
 	border: 1px solid rgba(255, 255, 255, 0.06);
 	background: rgba(10, 13, 18, 0.54);
 	flex-wrap: wrap;
 }
 
+.bot-control-name {
+	font-size: 0.76rem;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--text-muted);
+}
+
 .bot-control p {
 	margin: 0;
-	font-size: 1em;
+	font-size: 0.86rem;
 	white-space: nowrap;
 	color: var(--light-color);
 }
@@ -807,6 +838,24 @@ a.stat-card:hover {
 	grid-template-columns: minmax(0, 1.3fr) minmax(360px, 0.92fr);
 	gap: 18px;
 	align-items: start;
+}
+
+.dashboard-page-head {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-bottom: 2px;
+}
+
+.dashboard-page-head h1 {
+	text-align: left;
+	margin-bottom: 0;
+}
+
+.dashboard-page-head p {
+	color: var(--text-muted);
+	font-size: 0.92rem;
+	margin: 0;
 }
 
 .dashboard-column-left {
@@ -1762,6 +1811,10 @@ canvas {
 
 	.header-brand {
 		width: 100%;
+	}
+
+	.navigation .nav-link {
+		flex: 1 1 calc(50% - 6px);
 	}
 
 	.user-session-controls,
