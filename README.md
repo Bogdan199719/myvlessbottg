@@ -1,84 +1,71 @@
-# MyVlessBot - VPN Sales Bot
+# MyVlessBot
 
-MyVlessBot is a ready-to-run solution for automated VLESS key sales via Telegram. It integrates with **3x-ui** and provides a web admin panel to manage hosts, plans, users, and payments.
+MyVlessBot - Telegram-бот для продажи VLESS/VPN-ключей с веб-панелью управления, интеграцией с 3x-ui и поддержкой нескольких способов оплаты.
 
-## Features
+## Что умеет проект
 
-- Automatic key issuance after payment.
-- Web admin panel.
-- Multi-host support with global subscription support.
-- Flexible plans (month, year, trial, referrals).
-- Payments: YooKassa, CryptoBot, Heleket, TonConnect, Telegram Stars.
-- Built-in support workflow.
+- автоматически выдавать и продлевать ключи после оплаты;
+- управлять тарифами, хостами, пользователями и платежами через веб-панель;
+- работать с несколькими 3x-ui хостами и глобальными подписками;
+- поддерживать trial, рефералы и встроенную поддержку пользователей;
+- принимать платежи через YooKassa, CryptoBot, Heleket, TON и Telegram Stars.
 
-## One-command install (recommended)
+## Быстрый запуск
+
+Рекомендуемый способ установки:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Bogdan199719/myvlessbottg/main/install.sh | sudo bash
 ```
 
-The script installs dependencies (Docker, Nginx, Certbot), asks for settings, and creates `.env`.
+Скрипт установит зависимости, создаст `.env`, настроит Nginx и поднимет контейнеры.
 
-## Environment & security
-
-Project uses `.env` for configuration. Key variables:
-
-| Variable | Description | Required |
-| --- | --- | :---: |
-| `TELEGRAM_BOT_TOKEN` | Bot token | yes |
-| `ADMIN_TELEGRAM_ID` | Admin Telegram ID | yes |
-| `DOMAIN` | Domain for web panel | yes |
-| `PANEL_LOGIN` | Panel login | no |
-| `PANEL_PASSWORD` | Panel password | no |
-
-Full list: see `install.sh` and the admin panel settings.
-Do not commit `.env`, `users.db`, backups, or logs. They are local runtime files and are ignored by Git.
-
-## Manual install (Docker)
+Ручной запуск через Docker:
 
 ```bash
-# 1. Clone
 git clone https://github.com/Bogdan199719/myvlessbottg.git
 cd myvlessbottg
-
-# 2. Create .env
-nano .env
-
-# 3. Run
 docker-compose up -d --build
 ```
 
-After first start, verify panel credentials and change any temporary/default values in the admin panel.
+## Основные файлы
 
-## Development checks
+- `src/shop_bot/` - основная логика бота и приложения;
+- `src/shop_bot/bot/` - Telegram-обработчики и клавиатуры;
+- `src/shop_bot/webhook_server/` - Flask-панель, webhook-маршруты и шаблоны;
+- `src/shop_bot/data_manager/` - работа с SQLite и планировщик;
+- `src/shop_bot/modules/xui_api.py` - интеграция с 3x-ui;
+- `scripts/` - служебные проверки проекта.
 
-- `python3 -m compileall -q src scripts`
-- `python3 scripts/check_callbacks.py`
-- `python3 scripts/check_fsm_transitions.py`
+## Конфигурация
 
-## Updates
+Минимально нужны:
 
-- Application updates should not overwrite `.env` or `users.db`.
-- Review installer and admin settings when adding new payment providers or tokens.
+- `TELEGRAM_BOT_TOKEN`
+- `ADMIN_TELEGRAM_ID`
+- `DOMAIN`
 
-## Recent Stability Updates (No Version Bump)
+Дополнительные токены, платежные ключи и параметры панели задаются через `.env` и админ-панель.
 
-- Safer subscription handling for invalid/legacy `plan_id` values.
-- Fallback recreate flow for `record not found` errors in 3x-ui client updates.
-- Reduced noisy Telegram callback errors (`message is not modified`) in runtime logs.
-- Refactoring of host auto-provision trigger paths in web admin routes.
-- Improved global subscription key handling and safer token logging (prefix only).
+## Проверки перед обновлением
 
-## Security & privacy
+```bash
+python3 -m compileall -q src scripts
+python3 scripts/check_callbacks.py
+python3 scripts/check_fsm_transitions.py
+```
 
-- Do NOT commit `.env` or `users.db` to Git.
-- Keep all tokens and API keys only in `.env` or in the admin panel settings.
-- No live API keys, database files, or personal data should be stored in tracked files.
+## Безопасность
 
-## Support
+- не коммитьте `.env`, `users.db`, резервные копии баз и логи;
+- не храните реальные API-ключи и токены в tracked-файлах;
+- после первой установки задайте собственный логин и пароль панели;
+- перед обновлением сохраняйте `.env` и рабочую базу отдельно.
 
-If you have questions or issues, open an issue or contact the support bot configured in your panel.
+## Обновление
 
-## License
+Обновление кода не должно затирать `.env` и `users.db`. После изменения платежных провайдеров, webhook-логики или настроек 3x-ui проверяйте админ-панель и сценарии оплаты вручную.
+
+## Лицензия
 
 MyVlessBot © 2024 Bogdan199719. All rights reserved.

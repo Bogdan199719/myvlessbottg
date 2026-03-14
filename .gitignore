@@ -25,6 +25,9 @@ logs.txt
 # Environment Variables & Secrets
 .env
 .env.*
+AGENTS.md
+CLAUDE.md
+QWEN.md
 
 # IDEs
 .idea/
