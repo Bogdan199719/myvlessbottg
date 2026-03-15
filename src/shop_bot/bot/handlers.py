@@ -1290,17 +1290,16 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на Windows</b>\n\n"
-            "1. <b>Установите приложение Hiddify:</b> Скачайте и установите приложение по прямой ссылке: <a href='https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix'>Скачать Hiddify для Windows</a>.\n"
-            "2. <b>Запустите Hiddify:</b> Откройте установленное приложение.\n"
-            "3. <b>Настройте язык и регион:</b> При первом запуске выберите Русский язык и регион Россия.\n"
-            "4. <b>Скопируйте в боте</b> либо ключ <code>vless://...</code>, либо ссылку подписки <code>https://.../sub/...</code>.\n"
-            "5. <b>Добавьте в приложение:</b>\n"
-            "   • В Hiddify нажмите кнопку <b>«Новый профиль»</b> или «+».\n"
+            "1. <b>Установите приложение:</b> Скачайте и установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ для Windows</a>.\n"
+            "2. <b>Запустите Happ:</b> Откройте установленное приложение.\n"
+            "3. <b>Скопируйте в боте</b> либо ключ <code>vless://...</code>, либо ссылку подписки <code>https://.../sub/...</code>.\n"
+            "4. <b>Добавьте в приложение:</b>\n"
+            "   • В Happ нажмите кнопку <b>«+»</b> или «Добавить конфигурацию».\n"
             "   • Для <code>vless://</code> выберите <b>«Добавить из буфера обмена»</b>.\n"
-            "   • Для <code>/sub/</code> выберите добавление подписки (Subscription URL).\n"
-            "6. <b>Если добавили подписку</b> — нажмите <b>Обновить подписку</b>.\n"
-            "7. <b>Подключитесь</b> и выберите сервер.\n"
-            "8. <b>Проверьте IP</b> на 2ip.ru.",
+            "   • Для <code>/sub/</code> выберите <b>«Добавить подписку»</b> и вставьте ссылку.\n"
+            "5. <b>Если добавили подписку</b> — нажмите <b>Обновить подписку</b>.\n"
+            "6. <b>Подключитесь</b> и выберите сервер.\n"
+            "7. <b>Проверьте IP</b> на <a href='https://2ip.ru'>2ip.ru</a>.",
         reply_markup=keyboards.create_howto_vless_keyboard(),
         disable_web_page_preview=True
     )
@@ -2707,9 +2706,13 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         return
     except Exception as e:
         logger.error(f"An unexpected error occurred during initial payment processing for user {metadata.get('user_id')}: {e}", exc_info=True)
-        if metadata.get('user_id'):
-            set_pending_payment(int(metadata.get('user_id')), False)
-        await bot.send_message(metadata.get('user_id'), "❌ Произошла непредвиденная ошибка при обработке платежа. Пожалуйста, обратитесь в поддержку.")
+        _err_user_id = metadata.get('user_id')
+        if _err_user_id:
+            set_pending_payment(int(_err_user_id), False)
+            try:
+                await bot.send_message(int(_err_user_id), "❌ Произошла непредвиденная ошибка при обработке платежа. Пожалуйста, обратитесь в поддержку.")
+            except Exception:
+                pass
         return
 
     if chat_id_to_delete and message_id_to_delete:
@@ -2784,7 +2787,7 @@ async def process_successful_payment(bot: Bot, metadata: dict):
         
         log_metadata = json.dumps({
             "plan_id": metadata.get('plan_id'),
-            "plan_name": get_plan_by_id(metadata.get('plan_id')).get('plan_name', 'Unknown') if get_plan_by_id(metadata.get('plan_id')) else 'Unknown',
+            "plan_name": plan.get('plan_name', 'Unknown') if plan else 'Unknown',
             "host_name": metadata.get('host_name'),
             "customer_email": metadata.get('customer_email')
         })

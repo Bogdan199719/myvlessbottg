@@ -445,7 +445,7 @@ async def sync_keys_with_panels():
                 else:
                     # Soft-delete: mark missing, recheck next cycle before removal
                     now_ts = time_utils.get_msk_now().isoformat()
-                    await asyncio.to_thread(database.mark_key_missing, key_email, now_ts)
+                    await asyncio.to_thread(database.mark_key_missing, key_email, now_ts, host_name)
                     logger.warning(f"Scheduler: Key '{key_email}' for host '{host_name}' not found on server. Marked missing for recheck.")
                     total_affected_records += 1
 

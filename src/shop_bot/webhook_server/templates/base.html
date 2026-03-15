@@ -12,7 +12,8 @@
 <body>
 	<div class="container">
 		<header class="main-header">
-			<div class="header-main">
+			<div class="header-inner">
+				<!-- Brand / logo -->
 				<a href="{{ url_for('dashboard_page') }}" class="header-brand">
 					<span class="header-brand-mark">MV</span>
 					<span class="header-brand-copy">
@@ -20,83 +21,89 @@
 						<small>Админ-панель</small>
 					</span>
 				</a>
-				<button type="button" id="mobileNavToggle" class="mobile-nav-toggle" aria-expanded="false" aria-controls="mainNavigation">
-					Меню
-				</button>
+
+				<!-- Navigation (hidden on mobile until burger click) -->
 				<nav class="navigation" id="mainNavigation">
 					<a href="{{ url_for('dashboard_page') }}"
 						class="nav-link {% if request.endpoint == 'dashboard_page' %}active{% endif %}">Главная</a>
 					<a href="{{ url_for('users_page') }}"
 						class="nav-link {% if request.endpoint == 'users_page' %}active{% endif %}">Пользователи</a>
+					<a href="{{ url_for('keys_page') }}"
+						class="nav-link {% if request.endpoint == 'keys_page' %}active{% endif %}">Ключи</a>
 					<a href="{{ url_for('settings_page') }}"
 						class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}">Настройки</a>
 					<a href="{{ url_for('updates_page') }}"
 						class="nav-link {% if request.endpoint == 'updates_page' %}active{% endif %}">Обновления</a>
 				</nav>
-			</div>
 
-			<div class="header-controls">
-				<div class="bot-control">
-					<span class="bot-control-name">Shop</span>
-					{% if bot_status.shop_bot_running %}
-					<p class="status-running"><strong>Запущен</strong></p>
-					<form action="{{ url_for('stop_shop_bot_route') }}" method="post">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<button type="submit" class="button button-stop button-small">
-							Стоп
-						</button>
-					</form>
-					{% else %}
-					<p class="status-stopped"><strong>Остановлен</strong></p>
-					{% if all_settings_ok %}
-					<form action="{{ url_for('start_shop_bot_route') }}" method="post">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<button type="submit" class="button button-start button-small">
-							Старт
-						</button>
-					</form>
-					{% else %}
-					<button class="button button-disabled button-small" disabled
-						title="Заполните обязательные настройки Telegram">
-						Старт
+				<!-- Right side: bot controls + logout + burger -->
+				<div class="header-right">
+					<!-- Bot controls -->
+					<div class="header-controls">
+						<div class="bot-control">
+							<span class="bot-control-name">Shop</span>
+							{% if bot_status.shop_bot_running %}
+							<p class="status-running"><strong>Запущен</strong></p>
+							<form action="{{ url_for('stop_shop_bot_route') }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-stop button-small">Стоп</button>
+							</form>
+							{% else %}
+							<p class="status-stopped"><strong>Остановлен</strong></p>
+							{% if all_settings_ok %}
+							<form action="{{ url_for('start_shop_bot_route') }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-start button-small">Старт</button>
+							</form>
+							{% else %}
+							<button class="button button-disabled button-small" disabled
+								title="Заполните обязательные настройки Telegram">Старт</button>
+							{% endif %}
+							{% endif %}
+						</div>
+
+						<div class="bot-control">
+							<span class="bot-control-name">Support</span>
+							{% if bot_status.support_bot_running %}
+							<p class="status-running"><strong>Запущен</strong></p>
+							<form action="{{ url_for('stop_support_bot_route') }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-stop button-small">Стоп</button>
+							</form>
+							{% else %}
+							<p class="status-stopped"><strong>Остановлен</strong></p>
+							<form action="{{ url_for('start_support_bot_route') }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-start button-small">Старт</button>
+							</form>
+							{% endif %}
+						</div>
+					</div>
+
+					<!-- Logout -->
+					<div class="user-session-controls">
+						<form action="{{ url_for('logout_page') }}" method="post">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<button type="submit" class="button button-logout">Выйти</button>
+						</form>
+					</div>
+
+					<!-- Burger (mobile only) -->
+					<button type="button" id="mobileNavToggle" class="mobile-nav-toggle"
+						aria-expanded="false" aria-controls="mainNavigation">
+						☰ Меню
 					</button>
-					{% endif %} {% endif %}
-				</div>
-
-				<div class="bot-control">
-					<span class="bot-control-name">Support</span>
-					{% if bot_status.support_bot_running %}
-					<p class="status-running"><strong>Запущен</strong></p>
-					<form action="{{ url_for('stop_support_bot_route') }}" method="post">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<button type="submit" class="button button-stop button-small">
-							Стоп
-						</button>
-					</form>
-					{% else %}
-					<p class="status-stopped"><strong>Остановлен</strong></p>
-					<form action="{{ url_for('start_support_bot_route') }}" method="post">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<button type="submit" class="button button-start button-small">
-							Старт
-						</button>
-					</form>
-					{% endif %}
-				</div>
-
-				<div class="user-session-controls">
-					<form action="{{ url_for('logout_page') }}" method="post" style="display: inline">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<button type="submit" class="button button-logout">Выйти</button>
-					</form>
 				</div>
 			</div>
 		</header>
 
-		{% with messages = get_flashed_messages(with_categories=true) %} {% if
-		messages %} {% for category, message in messages %}
+		{% with messages = get_flashed_messages(with_categories=true) %}
+		{% if messages %}
+		{% for category, message in messages %}
 		<div class="flash flash-{{ category }}">{{ message }}</div>
-		{% endfor %} {% endif %} {% endwith %}
+		{% endfor %}
+		{% endif %}
+		{% endwith %}
 
 		<main>{% block content %}{% endblock %}</main>
 	</div>

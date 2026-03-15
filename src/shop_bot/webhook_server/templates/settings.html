@@ -219,7 +219,12 @@
 				<a href="#support-settings">Поддержка</a>
 				<a href="#ref-settings">Рефералка</a>
 				<a href="#trial-settings">Триал</a>
-				<a href="#payment-settings">Платежи</a>
+				<a href="#payment-yookassa">YooKassa</a>
+				<a href="#payment-p2p">P2P</a>
+				<a href="#payment-stars">Stars</a>
+				<a href="#payment-crypto">CryptoBot</a>
+				<a href="#payment-heleket">Heleket</a>
+				<a href="#payment-ton">TON</a>
 				<a href="#content-settings">Контент</a>
 				<a href="#backup">Бэкап</a>
 				<a href="#hosts">Хосты</a>
@@ -339,7 +344,7 @@
 			</section>
 			<section class="settings-section" id="payment-settings">
 				<h2>Настройки Платежных Систем</h2>
-				<h2>Настройка YooKassa</h2>
+				<div class="settings-sub-h" id="payment-yookassa">💳 YooKassa</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="yookassa_enabled" value="false" />
 					<input type="checkbox" id="yookassa_enabled" name="yookassa_enabled" value="true" {% if
@@ -372,7 +377,7 @@
 					</div>
 				</div>
 
-				<h2>Настройка P2P</h2>
+				<div class="settings-sub-h" id="payment-p2p">💵 P2P (карта)</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="p2p_enabled" value="false" />
 					<input type="checkbox" id="p2p_enabled" name="p2p_enabled" value="true" {% if
@@ -387,7 +392,7 @@
 							placeholder="Например: 5536 9137 23XX 4567, Иван Иванов" />
 					</div>
 				</div>
-				<h2>Настройка Telegram Stars</h2>
+				<div class="settings-sub-h" id="payment-stars">⭐ Telegram Stars</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="stars_enabled" value="false" />
 					<input type="checkbox" id="stars_enabled" name="stars_enabled" value="true" {% if
@@ -403,7 +408,7 @@
 							Оставьте 0 для автоматического курса (1.6 RUB).</small>
 					</div>
 				</div>
-				<h2>Настройка CryptoBot</h2>
+				<div class="settings-sub-h" id="payment-crypto">₿ CryptoBot</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="cryptobot_enabled" value="false" />
 					<input type="checkbox" id="cryptobot_enabled" name="cryptobot_enabled" value="true" {% if
@@ -428,7 +433,7 @@
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
 				</div>
-				<h2>Настройка Heleket</h2>
+				<div class="settings-sub-h" id="payment-heleket">🪙 Heleket</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="heleket_enabled" value="false" />
 					<input type="checkbox" id="heleket_enabled" name="heleket_enabled" value="true" {% if
@@ -462,7 +467,7 @@
 					<small class="field-hint">Это имя будет отображаться при импорте
 						подписки.</small>
 				</div>
-				<h2>Настройка TonConnect</h2>
+				<div class="settings-sub-h" id="payment-ton">💎 TonConnect</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="tonconnect_enabled" value="false" />
 					<input type="checkbox" id="tonconnect_enabled" name="tonconnect_enabled" value="true" {% if

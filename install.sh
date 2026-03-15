@@ -25,7 +25,7 @@ print_header() {
 check_dependencies() {
     echo -e "\n${CYAN}📦 Checking system dependencies...${NC}"
     
-    deps=("git" "docker" "docker-compose" "nginx" "curl" "certbot")
+    deps=("git" "docker" "nginx" "curl" "certbot")
     
     for dep in "${deps[@]}"; do
         if ! command -v $dep &> /dev/null; then
@@ -169,8 +169,8 @@ finalize_installation() {
     echo -e "\n${CYAN}🚀 Launching Docker Containers...${NC}"
     cd "$PROJECT_DIR" || exit
     
-    sudo docker-compose down --remove-orphans
-    if sudo docker-compose up -d --build; then
+    sudo docker compose down --remove-orphans
+    if sudo docker compose up -d --build; then
         echo -e "\n${GREEN}==============================================${NC}"
         echo -e "${GREEN}      🎉 Installation Successful! 🎉      ${NC}"
         echo -e "${GREEN}==============================================${NC}"
@@ -179,7 +179,7 @@ finalize_installation() {
         echo -e "${YELLOW}Use the panel password you entered during setup.${NC}"
         echo -e "Running in Docker."
     else
-        echo -e "${RED}Docker Launch Failed! Check logs with 'docker-compose logs -f'${NC}"
+        echo -e "${RED}Docker Launch Failed! Check logs with 'docker compose logs -f'${NC}"
     fi
 }
 
