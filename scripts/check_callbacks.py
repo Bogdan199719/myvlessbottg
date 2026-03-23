@@ -55,7 +55,9 @@ def _covered_by_handler(callback: str, handlers: set[str]) -> bool:
         return any(literal_prefix(h).startswith(prefix) for h in handlers)
 
     # Callback may map to a startswith handler.
-    return any(h.endswith("*") and callback.startswith(literal_prefix(h)) for h in handlers)
+    return any(
+        h.endswith("*") and callback.startswith(literal_prefix(h)) for h in handlers
+    )
 
 
 def main() -> int:
@@ -66,8 +68,10 @@ def main() -> int:
     handler_patterns = _extract_handler_patterns(handlers_text)
 
     unhandled = sorted(
-        cb for cb in kb_callbacks
-        if cb not in ALLOW_UNHANDLED_KEYBOARD_CALLBACKS and not _covered_by_handler(cb, handler_patterns)
+        cb
+        for cb in kb_callbacks
+        if cb not in ALLOW_UNHANDLED_KEYBOARD_CALLBACKS
+        and not _covered_by_handler(cb, handler_patterns)
     )
 
     print(f"Keyboard callbacks: {len(kb_callbacks)}")
@@ -79,7 +83,9 @@ def main() -> int:
             print(f" - {cb}")
         return 1
 
-    print("\nOK: all keyboard callbacks are covered by handlers (with allowlist exceptions).")
+    print(
+        "\nOK: all keyboard callbacks are covered by handlers (with allowlist exceptions)."
+    )
     return 0
 
 

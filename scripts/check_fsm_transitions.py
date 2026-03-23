@@ -14,17 +14,20 @@ HANDLERS = ROOT / "src" / "shop_bot" / "bot" / "handlers.py"
 
 # State -> required callback values (exact matches) in @user_router.callback_query(...)
 REQUIRED_STATE_CALLBACKS: dict[str, set[str]] = {
-    "Onboarding.waiting_for_subscription_and_agreement": {"check_subscription_and_agree"},
-    "Broadcast.waiting_for_button_option": {"broadcast_add_button", "broadcast_skip_button"},
+    "Onboarding.waiting_for_subscription_and_agreement": {
+        "check_subscription_and_agree"
+    },
+    "Broadcast.waiting_for_button_option": {
+        "broadcast_add_button",
+        "broadcast_skip_button",
+    },
     "Broadcast.waiting_for_confirmation": {"confirm_broadcast"},
     "PaymentProcess.waiting_for_email": {"back_to_plans", "skip_email"},
     "PaymentProcess.waiting_for_payment_method": {
         "pay_yookassa",
         "pay_stars",
         "pay_cryptobot",
-        "pay_heleket",
         "pay_p2p",
-        "pay_tonconnect",
     },
 }
 
@@ -49,12 +52,38 @@ REQUIRED_STATEFILTER_GUARDS: set[str] = {
 }
 
 
+def _extract_balanced_args(text: str, start: int) -> str | None:
+    """Extract content between balanced parentheses starting at position `start`."""
+    if start >= len(text) or text[start] != "(":
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : i]
+    return None
+
+
 def _extract_callback_decorators(text: str):
-    # Matches one-line decorators:
+    # Matches single-line and multi-line decorators with balanced parentheses:
     # @user_router.callback_query(State, F.data == "x")
-    pattern = re.compile(r"@user_router\.callback_query\(([^\n]+)\)")
-    for m in pattern.finditer(text):
-        args = m.group(1)
+    # @user_router.callback_query(\n    State,\n    F.data == "x",\n)
+    marker = "@user_router.callback_query("
+    idx = 0
+    while True:
+        pos = text.find(marker, idx)
+        if pos == -1:
+            break
+        paren_start = pos + len(marker) - 1  # position of '('
+        args_raw = _extract_balanced_args(text, paren_start)
+        idx = paren_start + 1
+        if args_raw is None:
+            continue
+        args = " ".join(args_raw.split())  # normalize whitespace
+
         state = None
         callback = None
         starts = None
@@ -76,9 +105,18 @@ def _extract_callback_decorators(text: str):
 
 
 def _extract_message_decorators(text: str):
-    pattern = re.compile(r"@user_router\.message\(([^\n]+)\)")
-    for m in pattern.finditer(text):
-        args = m.group(1)
+    marker = "@user_router.message("
+    idx = 0
+    while True:
+        pos = text.find(marker, idx)
+        if pos == -1:
+            break
+        paren_start = pos + len(marker) - 1
+        args_raw = _extract_balanced_args(text, paren_start)
+        idx = paren_start + 1
+        if args_raw is None:
+            continue
+        args = " ".join(args_raw.split())
         yield args
 
 
@@ -125,15 +163,21 @@ def main() -> int:
         if state not in message_states:
             errors.append(f"State {state} missing message handler")
 
-    missing_global = sorted(cb for cb in REQUIRED_GLOBAL_CALLBACKS if cb not in global_callbacks)
+    missing_global = sorted(
+        cb for cb in REQUIRED_GLOBAL_CALLBACKS if cb not in global_callbacks
+    )
     if missing_global:
         errors.append(f"Missing global callbacks: {', '.join(missing_global)}")
 
-    missing_guards = sorted(g for g in REQUIRED_STATEFILTER_GUARDS if g not in statefilter_guards)
+    missing_guards = sorted(
+        g for g in REQUIRED_STATEFILTER_GUARDS if g not in statefilter_guards
+    )
     if missing_guards:
         errors.append(f"Missing StateFilter guards: {', '.join(missing_guards)}")
 
-    print(f"State callbacks tracked: {sum(len(v) for v in callbacks_by_state.values())}")
+    print(
+        f"State callbacks tracked: {sum(len(v) for v in callbacks_by_state.values())}"
+    )
     print(f"Message states tracked: {len(message_states)}")
     print(f"Global callbacks tracked: {len(global_callbacks)}")
 

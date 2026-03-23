@@ -1,38 +1,61 @@
-CHOOSE_PLAN_MESSAGE = "Выберите подходящий тариф:"
-CHOOSE_PAYMENT_METHOD_MESSAGE = "Выберите удобный способ оплаты:"
-VPN_INACTIVE_TEXT = "❌ <b>Статус VPN:</b> Неактивен (срок истек)"
-VPN_NO_DATA_TEXT = "ℹ️ <b>Статус VPN:</b> У вас пока нет активных ключей."
+CHOOSE_PLAN_MESSAGE = "Выберите тариф:"
+CHOOSE_PROXY_HOST_MESSAGE = "Выберите сервер Telegram Proxy:"
+CHOOSE_PAYMENT_METHOD_MESSAGE = "Выберите способ оплаты:"
+VPN_INACTIVE_TEXT = "❌ истёк"
+VPN_NO_DATA_TEXT = "нет подписки"
+
 
 def get_profile_text(username, total_spent, vpn_status_text):
-    return (
-        f"👤 <b>Профиль:</b> {username}\n\n"
-        f"💰 <b>Потрачено всего:</b> {total_spent:.0f} RUB\n\n"
-        f"{vpn_status_text}"
-    )
+    # Kept for backward compatibility — profile is built inline in the handler
+    return f"👤 <b>{username}</b>\n\n{vpn_status_text}"
+
 
 def get_vpn_active_text(days_left, hours_left):
-    return (
-        f"✅ <b>Статус VPN:</b> Активен\n"
-        f"⏳ <b>Осталось:</b> {days_left} д. {hours_left} ч."
-    )
+    return f"✅ активен · ещё {days_left} дн. {hours_left} ч."
+
 
 def get_key_info_text(key_number, expiry_date, created_date, connection_string):
-    expiry_formatted = expiry_date.strftime('%d.%m.%Y в %H:%M')
-    created_formatted = created_date.strftime('%d.%m.%Y в %H:%M')
-    
+    expiry_fmt = expiry_date.strftime("%d.%m.%Y в %H:%M")
+    created_fmt = created_date.strftime("%d.%m.%Y")
     return (
-        f"<b>🔑 Информация о ключе #{key_number}</b>\n\n"
-        f"<b>➕ Приобретён:</b> {created_formatted} (МСК)\n"
-        f"<b>⏳ Действителен до:</b> {expiry_formatted} (МСК)\n\n"
+        f"🔑 <b>Ключ #{key_number}</b>\n"
+        f"<blockquote>📅 Действует до {expiry_fmt} (МСК)\n"
+        f"🗓 Куплен {created_fmt}</blockquote>\n\n"
         f"<code>{connection_string}</code>"
     )
 
-def get_purchase_success_text(action: str, key_number: int, expiry_date, connection_string: str):
-    action_text = "обновлен" if action == "extend" else "готов"
-    expiry_formatted = expiry_date.strftime('%d.%m.%Y в %H:%M')
 
+def get_purchase_success_text(
+    action: str, key_number: int, expiry_date, connection_string: str
+):
+    verb = "продлён" if action == "extend" else "готов"
+    expiry_fmt = expiry_date.strftime("%d.%m.%Y в %H:%M")
     return (
-        f"🎉 <b>Ваш ключ #{key_number} {action_text}!</b>\n\n"
-        f"⏳ <b>Он будет действовать до:</b> {expiry_formatted}\n\n"
+        f"🎉 <b>Ключ #{key_number} {verb}!</b>\n"
+        f"<blockquote>📅 Действует до {expiry_fmt} (МСК)</blockquote>\n\n"
         f"<code>{connection_string}</code>"
+    )
+
+
+def get_proxy_purchase_success_text(
+    action: str, key_number: int, expiry_date, proxy_link: str
+):
+    verb = "продлён" if action == "extend" else "готов"
+    expiry_fmt = expiry_date.strftime("%d.%m.%Y в %H:%M")
+    return (
+        f"🎉 <b>Telegram Proxy #{key_number} {verb}!</b>\n"
+        f"<blockquote>📅 Действует до {expiry_fmt} (МСК)</blockquote>\n\n"
+        f"Нажмите <b>🔌 Подключить</b> или скопируйте ссылку:\n\n"
+        f"<code>{proxy_link}</code>"
+    )
+
+
+def get_proxy_info_text(key_number: int, expiry_date, created_date, proxy_link: str):
+    expiry_fmt = expiry_date.strftime("%d.%m.%Y в %H:%M")
+    created_fmt = created_date.strftime("%d.%m.%Y")
+    return (
+        f"📡 <b>Telegram Proxy #{key_number}</b>\n"
+        f"<blockquote>📅 Действует до {expiry_fmt} (МСК)\n"
+        f"🗓 Куплен {created_fmt}</blockquote>\n\n"
+        f"<code>{proxy_link}</code>"
     )
