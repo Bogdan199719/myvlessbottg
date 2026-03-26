@@ -1,12 +1,109 @@
 {% extends "base.html" %} {% block title %}Настройки Бота и Хостов{% endblock %}
 {% block content %}
 
+<style>
+.payment-rules-section { margin-top: 12px; border-top: 1px dashed #e0e0e0; padding-top: 10px; }
+.payment-rules-section h4 { font-size: 13px; color: var(--text-secondary, #888); margin: 0 0 8px; display:flex; align-items:center; gap:6px; }
+.pay-methods-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+.pay-item-form { margin: 0; }
+.pay-method-btn { display: flex; align-items: center; gap: 5px; font-size: 12px;
+  padding: 3px 9px; border: 1px solid #ddd; border-radius: 5px; background: #fafafa;
+  cursor: pointer; user-select: none; white-space: nowrap;
+  font-family: inherit; transition: background .15s, border-color .15s; }
+.pay-method-btn:hover { background: #f0f4ff; border-color: #a0b0ff; }
+.pay-method-btn.is-on  { background: #e8f5e9; border-color: #81c784; color: #2e7d32; }
+.pay-method-btn.is-off { background: #ffeaea; border-color: #ef9a9a; color: #c62828; text-decoration: line-through; }
+.pay-method-btn.inherited { color: #aaa; font-style: italic; }
+.plan-pay-methods { margin: 6px 0 2px 12px; display: flex; flex-wrap: wrap; gap: 4px; }
+.plan-pay-methods .pay-method-btn { font-size: 11px; padding: 2px 7px; }
+</style>
+
+
 <h1>Настройки</h1>
+
+{% macro pay_rules_section(context_key, host_plans, pay_rules) %}
+{%- set ml = [
+  ('yookassa',   '🏦 YooKassa'),
+  ('stars',      '⭐ Stars'),
+  ('p2p',        '💳 P2P'),
+  ('cryptobot',  '🤖 CryptoBot'),
+] -%}
+<div class="payment-rules-section">
+  <h4>💳 Методы оплаты
+    <small style="font-weight:normal;color:#aaa;font-style:italic">курсив = глобальная настройка</small>
+    <form action="/payment-rules/reset" method="post" style="margin:0">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="context_key" value="{{ context_key }}">
+      <button type="submit" class="button button-warning button-tiny" title="Сбросить все правила для этого контекста"
+        onclick="return confirm('Сбросить правила оплаты?')">↺ сброс</button>
+    </form>
+  </h4>
+  <div class="pay-methods-grid">
+    {%- set ctx_rules = pay_rules.get(context_key, {}) -%}
+    {%- for method, label in ml %}
+      {%- set is_on = ctx_rules.get(method, none) -%}
+      {%- set next_val = '0' if (is_on is none or is_on) else '1' -%}
+      {%- set btn_class = 'pay-method-btn ' ~ ('inherited' if is_on is none else ('is-on' if is_on else 'is-off')) -%}
+      <form action="/payment-rules/set" method="post" class="pay-item-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="context_key" value="{{ context_key }}">
+        <input type="hidden" name="method" value="{{ method }}">
+        <input type="hidden" name="is_enabled" value="{{ next_val }}">
+        <button type="submit" class="{{ btn_class }}" title="{{ 'нажмите чтобы отключить' if (is_on is none or is_on) else 'нажмите чтобы включить' }}">
+          {{ '✓' if (is_on is none or is_on) else '✗' }} {{ label }}
+        </button>
+      </form>
+    {%- endfor %}
+  </div>
+  {%- if host_plans %}
+  <div style="margin-top:8px;">
+    {%- for plan in host_plans %}
+    {%- set plan_key = 'plan:' ~ plan.plan_id %}
+    {%- set plan_rules = pay_rules.get(plan_key, {}) %}
+    <div style="margin-bottom:5px;">
+      <div style="font-size:12px;color:#666;margin-bottom:3px;display:flex;align-items:center;gap:6px;">
+        ↳ <b>{{ plan.plan_name }}</b> <span style="color:#aaa">({{ plan.months }} мес., {{ plan.price|int }} ₽)</span>
+        <form action="/payment-rules/reset" method="post" style="margin:0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="context_key" value="{{ plan_key }}">
+          <button type="submit" class="button button-warning button-tiny"
+            onclick="return confirm('Сбросить?')" title="Сбросить правила тарифа">↺</button>
+        </form>
+      </div>
+      <div class="plan-pay-methods">
+        {%- for method, label in ml %}
+          {%- set is_on = plan_rules.get(method, none) -%}
+          {%- set next_val = '0' if (is_on is none or is_on) else '1' -%}
+          {%- set btn_class = 'pay-method-btn ' ~ ('inherited' if is_on is none else ('is-on' if is_on else 'is-off')) -%}
+          <form action="/payment-rules/set" method="post" class="pay-item-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="context_key" value="{{ plan_key }}">
+            <input type="hidden" name="method" value="{{ method }}">
+            <input type="hidden" name="is_enabled" value="{{ next_val }}">
+            <button type="submit" class="{{ btn_class }}">
+              {{ '✓' if (is_on is none or is_on) else '✗' }} {{ label }}
+            </button>
+          </form>
+        {%- endfor %}
+      </div>
+    </div>
+    {%- endfor %}
+  </div>
+  {%- endif %}
+</div>
+{% endmacro %}
+
 
 <div class="settings-container">
 	<div class="settings-column-left">
-		<section class="settings-section" id="hosts">
+		<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+			<hr style="flex:1;border:none;border-top:2px solid #6c8ebf;margin:0;">
+			<span style="font-size:13px;font-weight:600;color:#6c8ebf;white-space:nowrap;letter-spacing:.5px;">🔒 VPN / VLESS</span>
+			<hr style="flex:1;border:none;border-top:2px solid #6c8ebf;margin:0;">
+		</div>
+		<section class="settings-section" id="hosts" style="border-left:4px solid #6c8ebf;">
 			<h2>Управление Хостами (Серверами)</h2>
+			<p style="margin-top:-8px;margin-bottom:16px;color:var(--text-secondary,#888);font-size:13px;">Серверы 3x-ui для продажи VPN/VLESS подписок.</p>
 
 			<div class="host-card host-card-global">
 				<div class="host-header">
@@ -54,6 +151,7 @@
 							+
 						</button>
 					</form>
+				{{ pay_rules_section('global', global_plans, payment_rules) }}
 				</div>
 			</div>
 
@@ -128,7 +226,7 @@
 						</form>
 
 						<form action="{{ url_for('delete_host_route', host_name=host.host_name) }}" method="post"
-							data-confirm="Вы уверены, что хотите удалить этот хост и все его тарифы?">
+							data-confirm="Удалить хост '{{ host.host_name }}'? Будут удалены все тарифы и ВСЕ КЛЮЧИ пользователей на этом хосте. Это действие необратимо.">
 							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 							<button type="submit" class="button button-danger button-small" title="Удалить">
 								🗑️
@@ -173,10 +271,130 @@
 							+
 						</button>
 					</form>
+				{{ pay_rules_section('xui:' ~ host.host_name, host.plans, payment_rules) }}
 				</div>
 			</div>
 			{% endfor %} {% else %}
 			<p>Хосты еще не добавлены.</p>
+			{% endif %}
+		</section>
+
+		{# ── MTG Proxy Hosts ────────────────────────────────────────────── #}
+		<div style="display:flex;align-items:center;gap:12px;margin:32px 0 16px;">
+			<hr style="flex:1;border:none;border-top:2px solid #4a9de0;margin:0;">
+			<span style="font-size:13px;font-weight:600;color:#4a9de0;white-space:nowrap;letter-spacing:.5px;">📡 TELEGRAM PROXY</span>
+			<hr style="flex:1;border:none;border-top:2px solid #4a9de0;margin:0;">
+		</div>
+		<section class="settings-section" id="mtg-hosts" style="border-left:4px solid #4a9de0;">
+			<h2>📡 MTG Proxy хосты</h2>
+			<p style="margin-top:-8px;margin-bottom:16px;color:var(--text-secondary,#888);font-size:13px;">Управление серверами Telegram MTProto Proxy. Отдельная сущность — не связана с VPN подписками.</p>
+
+			<div class="host-card">
+				<h4>{% if edit_mtg_host is defined and edit_mtg_host %}Редактировать MTG-хост{% else %}Добавить MTG Proxy хост{% endif %}</h4>
+				<form action="{{ url_for('update_mtg_host_route') if (edit_mtg_host is defined and edit_mtg_host) else url_for('add_mtg_host_route') }}" method="post">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					{% if edit_mtg_host is defined and edit_mtg_host %}
+					<input type="hidden" name="old_host_name" value="{{ edit_mtg_host.host_name }}">
+					{% endif %}
+					<div class="form-group">
+						<label for="mtg_host_name">Название хоста:</label>
+						<input type="text" id="mtg_host_name" name="host_name" required maxlength="26"
+							placeholder="TelegramProxy1"
+							value="{{ edit_mtg_host.host_name if (edit_mtg_host is defined and edit_mtg_host) else '' }}" />
+						<small class="field-hint">Короткое имя, отображаемое в боте.</small>
+					</div>
+					<div class="form-group">
+						<label for="mtg_host_url">URL MTG панели:</label>
+						<input type="url" id="mtg_host_url" name="host_url" placeholder="http://123.45.67.89:3000" required
+							value="{{ edit_mtg_host.host_url if (edit_mtg_host is defined and edit_mtg_host) else '' }}" />
+						<small class="field-hint">Адрес вашей MTG AdminPanel.</small>
+					</div>
+					<div class="form-group">
+						<label for="mtg_host_username">Логин MTG панели:</label>
+						<input type="text" id="mtg_host_username" name="host_username" required placeholder="admin"
+							value="{{ edit_mtg_host.username if (edit_mtg_host is defined and edit_mtg_host) else '' }}" />
+					</div>
+					<div class="form-group password-wrapper">
+						<label for="mtg_host_pass">Пароль {% if edit_mtg_host is defined and edit_mtg_host %}(оставьте пустым, чтобы не менять){% endif %}:</label>
+						<input type="password" id="mtg_host_pass" name="host_pass" {% if not (edit_mtg_host is defined and edit_mtg_host) %}required{% endif %} />
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
+					<button type="submit" class="button button-primary">
+						{% if edit_mtg_host is defined and edit_mtg_host %}Сохранить изменения{% else %}Добавить{% endif %}
+					</button>
+					{% if edit_mtg_host is defined and edit_mtg_host %}
+					<a href="{{ url_for('settings_page') }}" class="button button-secondary">Отмена</a>
+					{% endif %}
+				</form>
+			</div>
+
+			{% if mtg_hosts %}
+			{% for host in mtg_hosts %}
+			<div class="host-card">
+				<div class="host-header">
+					<h3>
+						📡 {{ host.host_name }}
+						<span class="status-badge host-status-badge {% if host.is_enabled %}status-active{% else %}status-stopped{% endif %}">
+							{% if host.is_enabled %}Активен{% else %}Отключен{% endif %}
+						</span>
+					</h3>
+					<div class="host-actions">
+						<form action="{{ url_for('toggle_mtg_host_route', host_name=host.host_name) }}" method="post">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							{% if host.is_enabled %}
+							<button type="submit" class="button button-warning button-small" title="Отключить">⏸️</button>
+							{% else %}
+							<button type="submit" class="button button-success button-small" title="Включить">▶️</button>
+							{% endif %}
+						</form>
+						<form action="{{ url_for('edit_mtg_host_page', host_name=host.host_name) }}" method="get">
+							<button type="submit" class="button button-primary button-small" title="Редактировать">✏️</button>
+						</form>
+						<form action="{{ url_for('delete_mtg_host_route', host_name=host.host_name) }}" method="post"
+							data-confirm="Удалить MTG-хост '{{ host.host_name }}' и все его тарифы?">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<button type="submit" class="button button-danger button-small" title="Удалить">🗑️</button>
+						</form>
+					</div>
+				</div>
+				<p><strong>URL:</strong> {{ host.host_url }}
+					{% if not host.is_enabled %}<span class="host-disabled-label">(ОТКЛЮЧЕН)</span>{% endif %}
+				</p>
+
+				<div class="plans-section">
+					<h4>Тарифы:</h4>
+					{% if host.plans %}
+					<ul class="plan-list">
+						{% for plan in host.plans %}
+						<li>
+							<span>{{ plan.plan_name }} - {{ plan.price|round(0) }} RUB</span>
+							<form action="{{ url_for('delete_plan_route', plan_id=plan.plan_id) }}" method="post"
+								data-confirm="Удалить тариф?">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-danger button-tiny">×</button>
+							</form>
+						</li>
+						{% endfor %}
+					</ul>
+					{% else %}
+					<p>Тарифы не добавлены.</p>
+					{% endif %}
+					<h5>Добавить тариф:</h5>
+					<form action="{{ url_for('add_plan_route') }}" method="post" class="form-inline">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<input type="hidden" name="host_name" value="{{ host.host_name }}" />
+						<input type="hidden" name="service_type" value="mtg" />
+						<input type="text" name="plan_name" placeholder="Название" required />
+						<input type="number" name="months" placeholder="Мес." required />
+						<input type="number" step="0.01" name="price" placeholder="Цена" required />
+						<button type="submit" class="button button-primary button-small">+</button>
+					</form>
+				</div>
+				{{ pay_rules_section('mtg:' ~ host.host_name, host.plans, payment_rules) }}
+			</div>
+			{% endfor %}
+			{% else %}
+			<p>MTG Proxy хосты не добавлены.</p>
 			{% endif %}
 		</section>
 	</div>
@@ -223,8 +441,6 @@
 				<a href="#payment-p2p">P2P</a>
 				<a href="#payment-stars">Stars</a>
 				<a href="#payment-crypto">CryptoBot</a>
-				<a href="#payment-heleket">Heleket</a>
-				<a href="#payment-ton">TON</a>
 				<a href="#content-settings">Контент</a>
 				<a href="#backup">Бэкап</a>
 				<a href="#hosts">Хосты</a>
@@ -433,27 +649,6 @@
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
 				</div>
-				<div class="settings-sub-h" id="payment-heleket">🪙 Heleket</div>
-				<div class="form-group form-group-checkbox">
-					<input type="hidden" name="heleket_enabled" value="false" />
-					<input type="checkbox" id="heleket_enabled" name="heleket_enabled" value="true" {% if
-						settings.heleket_enabled=='true' %}checked{% endif %}>
-					<label for="heleket_enabled">Включить оплату Heleket (Криптовалюта)</label>
-				</div>
-				<div class="toggle-section" data-toggle-section="heleket_enabled">
-					<div class="form-group">
-						<label for="heleket_merchant_id">Heleket Merchant ID:</label>
-						<input type="text" id="heleket_merchant_id" name="heleket_merchant_id"
-							value="{{ settings.heleket_merchant_id or '' }}" />
-					</div>
-					<div class="form-group password-wrapper">
-						<label for="heleket_api_key">Heleket API Key:</label>
-						<input type="password" id="heleket_api_key" name="heleket_api_key"
-							value="{{ settings.heleket_api_key or '' }}" />
-						<button type="button" class="copy-button" data-copy-target="heleket_api_key">📋</button>
-						<button type="button" class="toggle-password">👁️</button>
-					</div>
-				</div>
 				<div class="form-group">
 					<label for="domain">Ваш домен (например, my-shop.com):</label>
 					<input type="text" id="domain" name="domain" placeholder="example.com" value="{{ settings.domain or '' }}" />
@@ -466,27 +661,6 @@
 						value="{{ settings.subscription_name or 'AresVPN' }}" placeholder="Например: AresVPN" />
 					<small class="field-hint">Это имя будет отображаться при импорте
 						подписки.</small>
-				</div>
-				<div class="settings-sub-h" id="payment-ton">💎 TonConnect</div>
-				<div class="form-group form-group-checkbox">
-					<input type="hidden" name="tonconnect_enabled" value="false" />
-					<input type="checkbox" id="tonconnect_enabled" name="tonconnect_enabled" value="true" {% if
-						settings.tonconnect_enabled=='true' %}checked{% endif %}>
-					<label for="tonconnect_enabled">Включить оплату TON Connect</label>
-				</div>
-				<div class="toggle-section" data-toggle-section="tonconnect_enabled">
-					<div class="form-group">
-						<label for="ton_wallet_address">Ton Wallet:</label>
-						<input type="text" id="ton_wallet_address" name="ton_wallet_address"
-							value="{{ settings.ton_wallet_address or '' }}" />
-					</div>
-					<div class="form-group password-wrapper">
-						<label for="tonapi_key">TonAPI Key:</label>
-						<input type="password" id="tonapi_key" name="tonapi_key"
-							value="{{ settings.tonapi_key or '' }}" />
-						<button type="button" class="copy-button" data-copy-target="tonapi_key">📋</button>
-						<button type="button" class="toggle-password">👁️</button>
-					</div>
 				</div>
 			</section>
 

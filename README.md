@@ -4,13 +4,13 @@
 
 **Telegram-бот для автоматической продажи VLESS/VPN-ключей**
 
-[![Version](https://img.shields.io/badge/version-2.4.19-blue?style=flat-square)](https://github.com/Bogdan199719/myvlessbottg/releases)
+[![Version](https://img.shields.io/badge/version-2.4.20-blue?style=flat-square)](https://github.com/Bogdan199719/myvlessbottg/releases)
 [![Python](https://img.shields.io/badge/python-3.10+-green?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/license-Proprietary-red?style=flat-square)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker)](docker-compose.yml)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2AABEE?style=flat-square&logo=telegram)](https://aiogram.dev)
 
-*Полностью автоматизированная торговля VPN-подписками с 6 способами оплаты, веб-панелью управления и поддержкой нескольких 3x-ui серверов*
+*Полностью автоматизированная торговля VPN-подписками с 4 способами оплаты, веб-панелью управления и поддержкой нескольких 3x-ui серверов*
 
 </div>
 
@@ -27,7 +27,7 @@
 | **Триал-доступ** | Настраиваемый пробный период для новых пользователей |
 | **Встроенная поддержка** | Тикет-система через отдельного support-бота |
 | **Веб-панель администратора** | Flask-интерфейс для управления тарифами, хостами, пользователями и платежами |
-| **6 способов оплаты** | YooKassa, Telegram Stars, CryptoBot, Heleket, TON Connect, P2P-перевод |
+| **4 способа оплаты** | YooKassa, Telegram Stars, CryptoBot, P2P-перевод |
 
 ---
 
@@ -38,8 +38,6 @@
 | **YooKassa** | RUB | Банковские карты, СБП |
 | **Telegram Stars** | Stars | Нативные платежи в Telegram |
 | **CryptoBot** | USDT, TON, BTC и др. | Криптовалюта |
-| **Heleket** | USDT, крипта | Криптовалютный шлюз |
-| **TON Connect** | TON | Блокчейн-кошелёк |
 | **P2P (карта)** | RUB | Ручное подтверждение администратором |
 
 ---
@@ -111,10 +109,6 @@ docker-compose logs -f
 | `YOOKASSA_SECRET_KEY` | Секретный ключ YooKassa |
 | `CRYPTOBOT_TOKEN` | API-токен CryptoBot |
 | `CRYPTOBOT_WEBHOOK_SECRET` | Webhook-секрет CryptoBot |
-| `HELEKET_MERCHANT_ID` | ID мерчанта Heleket |
-| `HELEKET_API_KEY` | API-ключ Heleket |
-| `TON_WALLET_ADDRESS` | Адрес TON-кошелька |
-| `TONAPI_KEY` | Ключ TonAPI для верификации платежей |
 
 > **Примечание:** Большинство настроек (тарифы, тексты, реферальная система, включение/отключение способов оплаты) настраиваются через веб-панель администратора, а не через `.env`.
 
