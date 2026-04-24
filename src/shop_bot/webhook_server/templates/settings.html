@@ -1,24 +1,6 @@
 {% extends "base.html" %} {% block title %}Настройки Бота и Хостов{% endblock %}
 {% block content %}
 
-<style>
-.payment-rules-section { margin-top: 12px; border-top: 1px dashed #e0e0e0; padding-top: 10px; }
-.payment-rules-section h4 { font-size: 13px; color: var(--text-secondary, #888); margin: 0 0 8px; display:flex; align-items:center; gap:6px; }
-.pay-methods-grid { display: flex; flex-wrap: wrap; gap: 5px; }
-.pay-item-form { margin: 0; }
-.pay-method-btn { display: flex; align-items: center; gap: 5px; font-size: 12px;
-  padding: 3px 9px; border: 1px solid #ddd; border-radius: 5px; background: #fafafa;
-  cursor: pointer; user-select: none; white-space: nowrap;
-  font-family: inherit; transition: background .15s, border-color .15s; }
-.pay-method-btn:hover { background: #f0f4ff; border-color: #a0b0ff; }
-.pay-method-btn.is-on  { background: #e8f5e9; border-color: #81c784; color: #2e7d32; }
-.pay-method-btn.is-off { background: #ffeaea; border-color: #ef9a9a; color: #c62828; text-decoration: line-through; }
-.pay-method-btn.inherited { color: #aaa; font-style: italic; }
-.plan-pay-methods { margin: 6px 0 2px 12px; display: flex; flex-wrap: wrap; gap: 4px; }
-.plan-pay-methods .pay-method-btn { font-size: 11px; padding: 2px 7px; }
-</style>
-
-
 <h1>Настройки</h1>
 
 {% macro pay_rules_section(context_key, host_plans, pay_rules) %}
@@ -178,12 +160,12 @@
 						<input type="text" id="host_username" name="host_username" required placeholder="admin" value="{{ edit_host.host_username if edit_host else '' }}" />
 						<small class="field-hint">XUI panel login.</small>
 					</div>
-					<div class="form-group password-wrapper">
-						<label for="host_pass">Пароль XUI {% if edit_host %}(оставьте пустым, чтобы не менять){% endif
-							%}:</label>
-						<input type="password" id="host_pass" name="host_pass" {% if not edit_host %}required{% endif
-							%} />
-						<button type="button" class="toggle-password">👁️</button>
+					<div class="form-group">
+						<label for="host_pass">Пароль XUI {% if edit_host %}(оставьте пустым, чтобы не менять){% endif %}:</label>
+						<div class="password-wrapper">
+							<input type="password" id="host_pass" name="host_pass" {% if not edit_host %}required{% endif %} />
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
 					</div>
 					<div class="form-group">
 						<label for="host_inbound_id">ID входящего подключения:</label>
@@ -314,10 +296,12 @@
 						<input type="text" id="mtg_host_username" name="host_username" required placeholder="admin"
 							value="{{ edit_mtg_host.username if (edit_mtg_host is defined and edit_mtg_host) else '' }}" />
 					</div>
-					<div class="form-group password-wrapper">
+					<div class="form-group">
 						<label for="mtg_host_pass">Пароль {% if edit_mtg_host is defined and edit_mtg_host %}(оставьте пустым, чтобы не менять){% endif %}:</label>
-						<input type="password" id="mtg_host_pass" name="host_pass" {% if not (edit_mtg_host is defined and edit_mtg_host) %}required{% endif %} />
-						<button type="button" class="toggle-password">👁️</button>
+						<div class="password-wrapper">
+							<input type="password" id="mtg_host_pass" name="host_pass" {% if not (edit_mtg_host is defined and edit_mtg_host) %}required{% endif %} />
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
 					</div>
 					<button type="submit" class="button button-primary">
 						{% if edit_mtg_host is defined and edit_mtg_host %}Сохранить изменения{% else %}Добавить{% endif %}
@@ -409,25 +393,33 @@
 				<span class="chip chip-safe">Безопасно</span>
 			</div>
 
-			<div class="backup-actions">
-				<form id="backup-form" action="{{ url_for('backup_route') }}" method="post">
-					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-					<button type="submit" class="button button-primary button-wide">⬇️ Скачать бэкап</button>
-				</form>
+				<div class="backup-actions">
+					<form id="backup-form" action="{{ url_for('backup_route') }}" method="post">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<label class="toggle-row">
+							<input type="checkbox" name="include_env" value="true" />
+							<span>Включить `.env` в архив</span>
+						</label>
+						<button type="submit" class="button button-primary button-wide">⬇️ Скачать бэкап</button>
+					</form>
 
-				<form action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data"
-					class="import-form">
-					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-					<label class="file-drop">
-						<input type="file" id="backup_file" name="backup_file" accept=".zip" required />
-						<span>Перетащите .zip сюда или нажмите для выбора</span>
-					</label>
-					<p class="warning-text">Импорт остановит ботов, заменит всю базу и .env. Продолжайте только если
-						уверены.</p>
-					<button type="submit" class="button button-danger button-wide">⬆️ Импортировать бэкап</button>
-				</form>
-			</div>
-		</section>
+					<form action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data"
+						class="import-form">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<label class="file-drop">
+							<input type="file" id="backup_file" name="backup_file" accept=".zip" required />
+							<span>Перетащите .zip сюда или нажмите для выбора</span>
+						</label>
+						<label class="toggle-row">
+							<input type="checkbox" name="apply_env" value="true" />
+							<span>Применить `.env` из архива вместе с базой</span>
+						</label>
+						<p class="warning-text">Импорт остановит ботов и заменит базу. `.env` будет заменён только если
+							включить опцию выше.</p>
+						<button type="submit" class="button button-danger button-wide">⬆️ Импортировать бэкап</button>
+					</form>
+				</div>
+			</section>
 
 		<form action="{{ url_for('settings_page') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -452,22 +444,26 @@
 					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}" placeholder="admin" required />
 					<small class="field-hint">Admin login for the web panel.</small>
 				</div>
-				<div class="form-group password-wrapper">
+				<div class="form-group">
 					<label for="panel_password">Новый пароль (оставьте пустым, чтобы не менять):</label>
-					<input type="password" id="panel_password" name="panel_password" placeholder="new-password" />
+					<div class="password-wrapper">
+						<input type="password" id="panel_password" name="panel_password" placeholder="new-password" />
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 					<small class="field-hint">Leave empty to keep current password.</small>
-					<button type="button" class="toggle-password">👁️</button>
 				</div>
 			</section>
 
 			<section class="settings-section" id="bot-settings">
 				<h2>Настройка Бота</h2>
-				<div class="form-group password-wrapper">
+				<div class="form-group">
 					<label for="telegram_bot_token">Токен бота:</label>
-					<input type="password" id="telegram_bot_token" name="telegram_bot_token" placeholder="123456:ABCDEF" value="{{ settings.telegram_bot_token or '' }}" required />
+					<div class="password-wrapper">
+						<input type="password" id="telegram_bot_token" name="telegram_bot_token" placeholder="123456:ABCDEF" value="{{ settings.telegram_bot_token or '' }}" required />
+						<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 					<small class="field-hint">Keep this token secret.</small>
-					<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
-					<button type="button" class="toggle-password">👁️</button>
 				</div>
 				<div class="form-group">
 					<label for="telegram_bot_username">Username бота (без @):</label>
@@ -486,15 +482,9 @@
 						settings.enable_admin_payment_notifications=='true' %}checked{% endif %}>
 					<label for="enable_admin_payment_notifications">Включить уведомления о покупках</label>
 				</div>
-				<div class="form-group form-group-checkbox">
-					<input type="hidden" name="email_prompt_enabled" value="false" />
-					<input type="checkbox" id="email_prompt_enabled" name="email_prompt_enabled" value="true" {% if
-						settings.email_prompt_enabled=='true' %}checked{% endif %}>
-					<label for="email_prompt_enabled">Спрашивать Email перед оплатой</label>
-				</div>
-				<div class="form-group form-group-checkbox">
-					<input type="hidden" name="enable_admin_trial_notifications" value="false" />
-					<input type="checkbox" id="enable_admin_trial_notifications" name="enable_admin_trial_notifications"
+					<div class="form-group form-group-checkbox">
+						<input type="hidden" name="enable_admin_trial_notifications" value="false" />
+						<input type="checkbox" id="enable_admin_trial_notifications" name="enable_admin_trial_notifications"
 						value="true" {% if settings.enable_admin_trial_notifications=='true' %}checked{% endif %}>
 					<label for="enable_admin_trial_notifications">Включить уведомления о пробных ключах</label>
 				</div>
@@ -506,12 +496,14 @@
 					<input type="text" id="support_user" name="support_user"
 						value="{{ settings.support_user or '' }}" />
 				</div>
-				<div class="form-group password-wrapper">
+				<div class="form-group">
 					<label for="support_bot_token">Токен Support-бота (если используется):</label>
-					<input type="password" id="support_bot_token" name="support_bot_token"
-						value="{{ settings.support_bot_token or '' }}" />
-					<button type="button" class="copy-button" data-copy-target="support_bot_token">📋</button>
-					<button type="button" class="toggle-password">👁️</button>
+					<div class="password-wrapper">
+						<input type="password" id="support_bot_token" name="support_bot_token"
+							value="{{ settings.support_bot_token or '' }}" />
+						<button type="button" class="copy-button" data-copy-target="support_bot_token">📋</button>
+						<button type="button" class="toggle-password">👁️</button>
+					</div>
 				</div>
 				<div class="form-group">
 					<label for="support_group_id">ID Группы поддержки (должна быть включена функция форума
@@ -545,15 +537,21 @@
 				</div>
 			</section>
 			<section class="settings-section" id="trial-settings">
-				<h2>Настройки Пробного периода</h2>
+				<h2>Настройки пробного периода VPN</h2>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="trial_enabled" value="false" />
 					<input type="checkbox" id="trial_enabled" name="trial_enabled" value="true" {% if
 						settings.trial_enabled=='true' %}checked{% endif %}>
-					<label for="trial_enabled">Включить пробный период</label>
+					<label for="trial_enabled">Включить пробный период глобальной VPN-подписки</label>
 				</div>
 				<div class="form-group">
-					<label for="trial_duration_days">Длительность пробного периода (в днях):</label>
+					<p class="field-help">
+						Пользователь получает один пробный период для всей VPN-подписки сразу, а не отдельный пробный ключ.
+						После активации ему выдаётся общая <code>/sub/...</code> ссылка, которую потом можно продлить как обычную глобальную подписку.
+					</p>
+				</div>
+				<div class="form-group">
+					<label for="trial_duration_days">Длительность пробного периода глобальной подписки (в днях):</label>
 					<input type="number" id="trial_duration_days" name="trial_duration_days"
 						value="{{ settings.trial_duration_days or '3' }}" />
 				</div>
@@ -567,23 +565,34 @@
 						settings.yookassa_enabled=='true' %}checked{% endif %}>
 					<label for="yookassa_enabled">Включить оплату YooKassa</label>
 				</div>
-				<div class="toggle-section" data-toggle-section="yookassa_enabled">
-					<div class="form-group">
-						<label for="receipt_email">Почта для чеков:</label>
-						<input type="text" id="receipt_email" name="receipt_email"
-							value="{{ settings.receipt_email or '' }}" />
+					<div class="toggle-section" data-toggle-section="yookassa_enabled">
+						<div class="form-group form-group-checkbox">
+							<input type="hidden" name="email_prompt_enabled" value="false" />
+							<input type="checkbox" id="email_prompt_enabled" name="email_prompt_enabled" value="true" {% if
+								settings.email_prompt_enabled=='true' %}checked{% endif %}>
+							<label for="email_prompt_enabled">Спрашивать Email перед оплатой YooKassa</label>
+						</div>
+						<div class="form-group">
+							<label for="receipt_email">Почта для чеков YooKassa:</label>
+							<input type="text" id="receipt_email" name="receipt_email"
+								value="{{ settings.receipt_email or '' }}" />
+							<p class="field-help">
+								Используется как fallback, если запрос email перед оплатой YooKassa выключен или пользователь пропустил ввод.
+							</p>
 					</div>
 					<div class="form-group">
 						<label for="yookassa_shop_id">YooKassa Shop ID:</label>
 						<input type="text" id="yookassa_shop_id" name="yookassa_shop_id"
 							value="{{ settings.yookassa_shop_id or '' }}" />
 					</div>
-					<div class="form-group password-wrapper">
+					<div class="form-group">
 						<label for="yookassa_secret_key">YooKassa Secret Key:</label>
-						<input type="password" id="yookassa_secret_key" name="yookassa_secret_key"
-							value="{{ settings.yookassa_secret_key or '' }}" />
-						<button type="button" class="copy-button" data-copy-target="yookassa_secret_key">📋</button>
-						<button type="button" class="toggle-password">👁️</button>
+						<div class="password-wrapper">
+							<input type="password" id="yookassa_secret_key" name="yookassa_secret_key"
+								value="{{ settings.yookassa_secret_key or '' }}" />
+							<button type="button" class="copy-button" data-copy-target="yookassa_secret_key">📋</button>
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
 					</div>
 					<div class="form-group form-group-checkbox">
 						<input type="hidden" name="sbp_enabled" value="false" />
@@ -632,21 +641,25 @@
 					<label for="cryptobot_enabled">Включить оплату CryptoBot</label>
 				</div>
 				<div class="toggle-section" data-toggle-section="cryptobot_enabled">
-					<div class="form-group password-wrapper">
+					<div class="form-group">
 						<label for="cryptobot_token">CryptoBot Token:</label>
-						<input type="password" id="cryptobot_token" name="cryptobot_token"
-							value="{{ settings.cryptobot_token or '' }}" />
-						<button type="button" class="copy-button" data-copy-target="cryptobot_token">📋</button>
-						<button type="button" class="toggle-password">👁️</button>
+						<div class="password-wrapper">
+							<input type="password" id="cryptobot_token" name="cryptobot_token"
+								value="{{ settings.cryptobot_token or '' }}" />
+							<button type="button" class="copy-button" data-copy-target="cryptobot_token">📋</button>
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
 					</div>
-					<div class="form-group password-wrapper">
-						<label for="cryptobot_webhook_secret">CryptoBot Webhook Secret (URL token):</label>
-						<input type="password" id="cryptobot_webhook_secret" name="cryptobot_webhook_secret"
-							autocomplete="off" value="{{ settings.cryptobot_webhook_secret or '' }}"
-							placeholder="Например: my-super-secret-token" />
-						<button type="button" class="copy-button"
-							data-copy-target="cryptobot_webhook_secret">📋</button>
-						<button type="button" class="toggle-password">👁️</button>
+					<div class="form-group">
+						<label for="cryptobot_webhook_secret">CryptoBot Webhook Secret (legacy fallback):</label>
+						<div class="password-wrapper">
+							<input type="password" id="cryptobot_webhook_secret" name="cryptobot_webhook_secret"
+								autocomplete="off" value="{{ settings.cryptobot_webhook_secret or '' }}"
+								placeholder="Например: my-super-secret-token" />
+							<button type="button" class="copy-button"
+								data-copy-target="cryptobot_webhook_secret">📋</button>
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
 					</div>
 				</div>
 				<div class="form-group">

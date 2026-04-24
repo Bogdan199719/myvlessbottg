@@ -7,8 +7,11 @@ WORKDIR /app/project
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc docker.io git \
+    gcc git \
     && rm -rf /var/lib/apt/lists/*
+
+# Prefer IPv4 when a hostname has both A and AAAA records.
+RUN printf 'precedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1

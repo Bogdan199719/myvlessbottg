@@ -20,14 +20,16 @@
 		<h2>Управление</h2>
 
 		<h3>Запустить Бота</h3>
-		<form action="{{ url_for('start_bot_route') }}" method="post">
+		<form action="{{ url_for('start_shop_bot_route') }}" method="post">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 			<button type="submit">ЗАПУСТИТЬ</button>
 		</form>
 
 		<br />
 
 		<h3>Остановить Бота</h3>
-		<form action="{{ url_for('stop_bot_route') }}" method="post">
+		<form action="{{ url_for('stop_shop_bot_route') }}" method="post">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 			<button type="submit">ОСТАНОВИТЬ</button>
 		</form>
 

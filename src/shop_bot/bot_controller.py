@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import requests
 
 from yookassa import Configuration
 from aiogram import Bot, Dispatcher
@@ -13,6 +14,31 @@ from shop_bot.bot import handlers, support_handlers
 from shop_bot.bot.support_handlers import get_support_router
 
 logger = logging.getLogger(__name__)
+TRUTHY_VALUES = {"1", "true", "yes", "on"}
+DEFAULT_STARS_RUB_RATE = 1.6
+
+
+def _fetch_bot_username_sync(token: str) -> str:
+    response = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Bot API getMe failed: {payload}")
+    username = str(payload.get("result", {}).get("username") or "").strip()
+    if not username:
+        raise RuntimeError("Bot API returned empty username")
+    return username
+
+
+def _is_truthy(value) -> bool:
+    return str(value).strip().lower() in TRUTHY_VALUES
+
+
+def _parse_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value) if value else default
+    except (TypeError, ValueError):
+        return default
 
 
 class BotController:
@@ -37,30 +63,93 @@ class BotController:
         return self.shop_bot
 
     async def _start_polling(self, bot, dp, name):
-        logger.info(f"BotController: Polling task for '{name}' has been started.")
+        logger.info("BotController: Polling task for '%s' has been started.", name)
+        retry_delay = 5
         try:
-            await dp.start_polling(bot)
-        except asyncio.CancelledError:
-            logger.info(f"BotController: Polling task for '{name}' was cancelled.")
-        except Exception as e:
-            logger.error(
-                f"BotController: An error occurred during polling for '{name}': {e}",
-                exc_info=True,
-            )
+            while self._is_bot_marked_running(name):
+                try:
+                    await dp.start_polling(bot)
+                    break
+                except asyncio.CancelledError:
+                    logger.info(
+                        "BotController: Polling task for '%s' was cancelled.", name
+                    )
+                    break
+                except Exception as e:
+                    if not self._is_bot_marked_running(name):
+                        logger.info(
+                            "BotController: Polling for '%s' is stopping after an internal error during shutdown.",
+                            name,
+                        )
+                        break
+
+                    logger.error(
+                        "BotController: An error occurred during polling for '%s': %s. Retrying in %s seconds.",
+                        name,
+                        e,
+                        retry_delay,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+                else:
+                    retry_delay = 5
         finally:
-            logger.info(f"BotController: Polling for '{name}' has gracefully stopped.")
+            logger.info("BotController: Polling for '%s' has gracefully stopped.", name)
             if bot:
                 await bot.close()
-            if name == "ShopBot":
-                self.shop_is_running = False
-                self.shop_task = None
-                self.shop_bot = None
-                self.shop_dp = None
-            elif name == "SupportBot":
-                self.support_is_running = False
-                self.support_task = None
-                self.support_bot = None
-                self.support_dp = None
+            self._reset_bot_state(name)
+
+    def _is_bot_marked_running(self, name: str) -> bool:
+        if name == "ShopBot":
+            return self.shop_is_running
+        if name == "SupportBot":
+            return self.support_is_running
+        return False
+
+    def _reset_bot_state(self, name: str) -> None:
+        if name == "ShopBot":
+            self.shop_is_running = False
+            self.shop_task = None
+            self.shop_bot = None
+            self.shop_dp = None
+            return
+        if name == "SupportBot":
+            self.support_is_running = False
+            self.support_task = None
+            self.support_bot = None
+            self.support_dp = None
+
+    def _prepare_shop_bot_payment_settings(self) -> tuple[bool, bool, bool, float]:
+        yookassa_shop_id = database.get_setting("yookassa_shop_id")
+        yookassa_secret_key = database.get_setting("yookassa_secret_key")
+        yookassa_enabled = _is_truthy(
+            database.get_setting("yookassa_enabled")
+        ) and bool(yookassa_shop_id and yookassa_secret_key)
+
+        cryptobot_token = database.get_setting("cryptobot_token")
+        cryptobot_enabled = _is_truthy(
+            database.get_setting("cryptobot_enabled")
+        ) and bool(cryptobot_token)
+
+        stars_enabled_setting = _is_truthy(database.get_setting("stars_enabled"))
+        stars_rub_per_star = _parse_float(database.get_setting("stars_rub_per_star"))
+
+        if stars_rub_per_star == 0.0 and stars_enabled_setting:
+            stars_rub_per_star = DEFAULT_STARS_RUB_RATE
+            database.update_setting("stars_rub_per_star", str(stars_rub_per_star))
+            logger.info(
+                "Telegram Stars: using auto-rate (%s RUB per star), saved to DB",
+                stars_rub_per_star,
+            )
+
+        stars_enabled = bool(stars_enabled_setting and stars_rub_per_star > 0)
+
+        if yookassa_enabled:
+            Configuration.account_id = yookassa_shop_id
+            Configuration.secret_key = yookassa_secret_key
+
+        return yookassa_enabled, stars_enabled, cryptobot_enabled, stars_rub_per_star
 
     def start_shop_bot(self):
         if self.shop_is_running:
@@ -76,16 +165,29 @@ class BotController:
         bot_username = database.get_setting("telegram_bot_username")
         admin_id = database.get_setting("admin_telegram_id")
 
-        if not all([token, bot_username, admin_id]):
+        if not token or not admin_id:
             return {
                 "status": "error",
-                "message": "Невозможно запустить: не все обязательные настройки Telegram заполнены (токен, username, ID админа).",
+                "message": "Невозможно запустить: не все обязательные настройки Telegram заполнены (токен и ID админа).",
             }
 
         try:
             self.shop_bot = Bot(
                 token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
             )
+
+            if not bot_username:
+                try:
+                    bot_username = _fetch_bot_username_sync(token)
+                    database.update_setting("telegram_bot_username", bot_username)
+                    logger.info(
+                        "Telegram bot username fetched from Bot API and saved to DB"
+                    )
+                except requests.Timeout as exc:
+                    raise RuntimeError(
+                        "Не удалось получить username бота: запрос к Bot API превысил лимит ожидания."
+                    ) from exc
+
             self.shop_dp = Dispatcher()
             self.shop_dp.update.middleware(SafeCallbackMiddleware())
             self.shop_dp.update.middleware(BanMiddleware())
@@ -93,53 +195,24 @@ class BotController:
 
             self.shop_is_running = True
 
-            yookassa_enabled_setting = (
-                database.get_setting("yookassa_enabled") == "true"
-            )
-            yookassa_shop_id = database.get_setting("yookassa_shop_id")
-            yookassa_secret_key = database.get_setting("yookassa_secret_key")
-            yookassa_enabled = yookassa_enabled_setting and bool(
-                yookassa_shop_id and yookassa_secret_key
-            )
-
-            cryptobot_enabled_setting = (
-                database.get_setting("cryptobot_enabled") == "true"
-            )
-            cryptobot_token = database.get_setting("cryptobot_token")
-            cryptobot_enabled = cryptobot_enabled_setting and bool(cryptobot_token)
-
-            stars_enabled_setting = database.get_setting("stars_enabled") == "true"
-            stars_rate_setting = database.get_setting("stars_rub_per_star")
-            try:
-                stars_rub_per_star = (
-                    float(stars_rate_setting) if stars_rate_setting else 0.0
-                )
-            except (TypeError, ValueError):
-                stars_rub_per_star = 0.0
-
-            # Auto-rate: if 0 or not set, use 1.6 RUB per star and persist it so
-            # handlers.py reads the same value instead of falling back independently.
-            if stars_rub_per_star == 0.0 and stars_enabled_setting:
-                stars_rub_per_star = 1.6
-                database.update_setting("stars_rub_per_star", str(stars_rub_per_star))
-                logger.info(
-                    "Telegram Stars: using auto-rate (1.6 RUB per star), saved to DB"
-                )
-
-            stars_enabled = bool(stars_enabled_setting and stars_rub_per_star > 0)
-
-            if yookassa_enabled:
-                Configuration.account_id = yookassa_shop_id
-                Configuration.secret_key = yookassa_secret_key
+            (
+                yookassa_enabled,
+                stars_enabled,
+                cryptobot_enabled,
+                stars_rub_per_star,
+            ) = self._prepare_shop_bot_payment_settings()
 
             handlers.TELEGRAM_BOT_USERNAME = bot_username
             handlers.ADMIN_ID = admin_id
 
             logger.info(
-                f"Payment methods initialized: YooKassa={yookassa_enabled}, Stars={stars_enabled}, CryptoBot={cryptobot_enabled}"
+                "Payment methods initialized: YooKassa=%s, Stars=%s, CryptoBot=%s",
+                yookassa_enabled,
+                stars_enabled,
+                cryptobot_enabled,
             )
             if stars_enabled:
-                logger.info(f"Telegram Stars rate: {stars_rub_per_star} RUB per star")
+                logger.info("Telegram Stars rate: %s RUB per star", stars_rub_per_star)
 
             self.shop_task = asyncio.run_coroutine_threadsafe(
                 self._start_polling(self.shop_bot, self.shop_dp, "ShopBot"), self._loop
@@ -151,9 +224,8 @@ class BotController:
             }
 
         except Exception as e:
-            logger.error(f"Failed to start bot: {e}", exc_info=True)
-            self.shop_bot = None
-            self.shop_dp = None
+            logger.error("Failed to start bot: %s", e, exc_info=True)
+            self._reset_bot_state("ShopBot")
             return {"status": "error", "message": f"Ошибка при запуске: {e}"}
 
     def start_support_bot(self):
@@ -198,9 +270,8 @@ class BotController:
                 "message": "Команда на запуск бота отправлена.",
             }
         except Exception as e:
-            self.support_bot = None
-            self.support_dp = None
-            logger.error(f"Failed to start Support Bot: {e}", exc_info=True)
+            self._reset_bot_state("SupportBot")
+            logger.error("Failed to start Support Bot: %s", e, exc_info=True)
             return {"status": "error", "message": f"Error starting Support Bot: {e}"}
 
     def stop_shop_bot(self):

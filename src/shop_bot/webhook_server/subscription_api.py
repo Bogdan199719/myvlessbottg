@@ -10,6 +10,7 @@ from werkzeug.exceptions import HTTPException
 from shop_bot.data_manager.database import (
     get_user,
     get_user_paid_keys,
+    get_user_trial_keys,
     get_all_settings,
     get_user_by_token,
     get_plans_for_host,
@@ -36,6 +37,28 @@ _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
+
+
+def _run_on_event_loop(coro, timeout_seconds: int, operation: str):
+    loop = current_app.config.get("EVENT_LOOP")
+    if not loop or not loop.is_running():
+        logger.warning(
+            f"Subscription: EVENT_LOOP unavailable for {operation}; skipping async operation"
+        )
+        return None
+
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        future.cancel()
+        logger.warning(
+            f"Subscription: timeout waiting for {operation} after {timeout_seconds}s"
+        )
+        return None
+    except Exception as e:
+        logger.error(f"Subscription: {operation} failed: {e}", exc_info=True)
+        return None
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -127,6 +150,63 @@ def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
     )
 
 
+def _expiry_sort_key(key: dict) -> float:
+    try:
+        dt = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        return dt.timestamp() if dt else 0.0
+    except Exception:
+        return 0.0
+
+
+def _resolve_connection_string(key: dict, allow_fallback_fetch: bool) -> str | None:
+    cached_config = (key.get("connection_string") or "").strip()
+    if cached_config:
+        return cached_config
+
+    host_name = key.get("host_name")
+    key_email = key.get("key_email")
+    if not allow_fallback_fetch:
+        logger.warning(
+            "Key %s on host %s has no cached connection_string; fallback disabled.",
+            key_email,
+            host_name,
+        )
+        return None
+
+    logger.warning(
+        "Key %s on host %s has no cached connection_string, attempting fallback.",
+        key_email,
+        host_name,
+    )
+    try:
+
+        async def _fetch_fallback():
+            return await asyncio.wait_for(
+                xui_api.get_key_details_from_host(key),
+                timeout=_FALLBACK_TIMEOUT_SECONDS,
+            )
+
+        fallback_config = _run_on_event_loop(
+            _fetch_fallback(),
+            timeout_seconds=_FALLBACK_TIMEOUT_SECONDS + 2,
+            operation=f"fallback config fetch for key '{key_email}'",
+        )
+        connection_string = (
+            (fallback_config or {}).get("connection_string") or ""
+        ).strip()
+        if connection_string:
+            key["connection_string"] = connection_string
+            logger.info("Successfully regenerated config for key %s", key_email)
+            return connection_string
+    except Exception as e:
+        logger.error("Fallback config regeneration failed for %s: %s", key_email, e)
+
+    logger.warning(
+        "Failed to regenerate config for key %s on host %s", key_email, host_name
+    )
+    return None
+
+
 @subscription_bp.route("/sub/<token>", methods=["GET"])
 def get_subscription(token):
     try:
@@ -153,7 +233,7 @@ def get_subscription(token):
         )
 
         user_id = user["telegram_id"]
-        keys = get_user_paid_keys(user_id)
+        keys = get_user_paid_keys(user_id) + get_user_trial_keys(user_id)
         now = time_utils.get_msk_now()
 
         active_paid_keys = []
@@ -256,21 +336,11 @@ def get_subscription(token):
                             timeout=provision_timeout,
                         )
 
-                    try:
-                        loop = current_app.config.get("EVENT_LOOP")
-                        if loop and loop.is_running():
-                            future = asyncio.run_coroutine_threadsafe(
-                                _provision(), loop
-                            )
-                            res = future.result(timeout=provision_timeout + 5)
-                        else:
-                            logger.warning(
-                                "EVENT_LOOP not available, falling back to asyncio.run()"
-                            )
-                            res = asyncio.run(_provision())
-                    except Exception as e:
-                        logger.error(f"Provisioning failed for host '{host_name}': {e}")
-                        res = None
+                    res = _run_on_event_loop(
+                        _provision(),
+                        timeout_seconds=provision_timeout + 5,
+                        operation=f"global auto-provision for host '{host_name}'",
+                    )
                     if res:
                         try:
                             existing_key = get_key_by_email(res["email"])
@@ -348,115 +418,78 @@ def get_subscription(token):
             f"User {user_id}: Active keys after host/missing filter: {len(active_paid_keys)}"
         )
 
-        # Deduplicate by host_name: keep the key with the latest expiry per host
-        keys_by_host = {}
+        # Group by host_name and preserve all candidates ordered by expiry.
+        keys_by_host: dict[str, list[dict]] = {}
         for key in active_paid_keys:
             host_name = key.get("host_name") or ""
-            prev = keys_by_host.get(host_name)
-            if not prev:
-                keys_by_host[host_name] = key
-                logger.debug(
-                    f"Added first key for host '{host_name}': {key.get('key_email')}"
-                )
-                continue
+            keys_by_host.setdefault(host_name, []).append(key)
 
-            try:
-                prev_expiry = time_utils.parse_iso_to_msk(prev.get("expiry_date"))
-                cur_expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-
-                if cur_expiry > prev_expiry:
-                    logger.warning(
-                        f"Dedup: Replacing key {prev.get('key_email')} with newer key {key.get('key_email')} for host '{host_name}' (same host)"
-                    )
-                    keys_by_host[host_name] = key
-                else:
-                    logger.debug(
-                        f"Dedup: Keeping key {prev.get('key_email')} for host '{host_name}' (newer)"
-                    )
-            except Exception as e:
-                logger.error(f"Error comparing expiry dates: {e}")
-                continue
+        for host_name, host_keys in keys_by_host.items():
+            host_keys.sort(key=_expiry_sort_key, reverse=True)
+            logger.debug(
+                "Subscription host '%s' has %s candidate keys after filtering.",
+                host_name,
+                len(host_keys),
+            )
 
         logger.info(
-            f"User {user_id}: After deduplication: {len(keys_by_host)} hosts with 1 key each. Total keys before dedup: {len(active_paid_keys)}"
+            "User %s: grouped %s active keys into %s hosts.",
+            user_id,
+            len(active_paid_keys),
+            len(keys_by_host),
         )
         if len(active_paid_keys) > len(keys_by_host):
             logger.warning(
-                f"DEDUP ALERT: {len(active_paid_keys) - len(keys_by_host)} duplicate keys were removed!"
+                "DEDUP ALERT: %s duplicate host entries require candidate fallback selection.",
+                len(active_paid_keys) - len(keys_by_host),
             )
 
         if live_sync_enabled:
             _maybe_sync_xtls_for_hosts({h for h in keys_by_host.keys() if h})
 
-        configs = []
+        configs: list[str] = []
+        selected_keys: list[dict] = []
+        seen_configs: set[str] = set()
         for host_name in sorted(keys_by_host.keys()):
-            key = keys_by_host[host_name]
-            # If we have connection_string in DB (new keys), use it.
-            # Otherwise we might need to fetch it (slow) or just skip it if it's legacy without cache.
-            # Or better, we try to reconstruct it if missing, but we lack server keys.
-            # So we rely on connection_string being present.
-            if key.get("connection_string"):
-                config = key["connection_string"]
-                configs.append(config)
-                logger.debug(
-                    f"Added config for {key.get('key_email')} on host '{host_name}'"
+            selected_key = None
+            selected_config = None
+            for candidate in keys_by_host[host_name]:
+                candidate_config = _resolve_connection_string(
+                    candidate, allow_fallback_fetch
                 )
-            else:
-                if not allow_fallback_fetch:
-                    logger.warning(
-                        f"Key {key.get('key_email')} on host {host_name} has NO connection_string; "
-                        "fallback disabled, skipping."
-                    )
-                    continue
+                if candidate_config:
+                    selected_key = candidate
+                    selected_config = candidate_config
+                    break
+
+            if not selected_key or not selected_config:
                 logger.warning(
-                    f"Key {key.get('key_email')} on host {host_name} has NO connection_string, attempting fallback..."
+                    "No usable subscription config found for host '%s' after checking %s candidate(s).",
+                    host_name,
+                    len(keys_by_host[host_name]),
                 )
-                try:
+                continue
 
-                    async def _fetch_fallback():
-                        return await asyncio.wait_for(
-                            xui_api.get_key_details_from_host(key),
-                            timeout=_FALLBACK_TIMEOUT_SECONDS,
-                        )
+            if selected_config in seen_configs:
+                logger.error(
+                    "DUPLICATE CONFIG DETECTED for host '%s'; skipping repeated payload.",
+                    host_name,
+                )
+                continue
 
-                    fallback_config = asyncio.run(_fetch_fallback())
-                    if fallback_config and fallback_config.get("connection_string"):
-                        config = fallback_config["connection_string"]
-                        configs.append(config)
-                        logger.info(
-                            f"Successfully regenerated config for key {key.get('key_email')}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Failed to regenerate config for key {key.get('key_email')} on host {host_name}"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Fallback config regeneration failed for {key.get('key_email')}: {e}"
-                    )
+            seen_configs.add(selected_config)
+            configs.append(selected_config)
+            selected_keys.append(selected_key)
+            logger.debug(
+                "Added config for %s on host '%s'",
+                selected_key.get("key_email"),
+                host_name,
+            )
 
         logger.info(f"User {user_id}: Final config count: {len(configs)}")
 
-        # Double-check: ensure no duplicate configs in the final list
-        unique_configs = []
-        seen_configs: set[str] = set()
-        for config in configs:
-            if config in seen_configs:
-                logger.error(
-                    f"DUPLICATE CONFIG DETECTED! Config already exists in subscription. This should not happen!"
-                )
-                # Skip this duplicate
-                continue
-            seen_configs.add(config)
-            unique_configs.append(config)
-
-        if len(unique_configs) < len(configs):
-            logger.error(
-                f"REMOVED {len(configs) - len(unique_configs)} DUPLICATE CONFIGS from subscription!"
-            )
-
         # Join with newlines
-        subscription_data = "\n".join(unique_configs)
+        subscription_data = "\n".join(configs)
 
         # Base64 encode for wide compatibility
         encoded_data = base64.b64encode(subscription_data.encode("utf-8")).decode(
@@ -470,7 +503,7 @@ def get_subscription(token):
         is_unlimited = False
 
         # Gather stats only for keys that are actually present in the final subscription.
-        stats_source_keys = list(keys_by_host.values())
+        stats_source_keys = selected_keys
 
         # Gather stats from XUI for active keys
         # Note: This might be slow if many keys.
@@ -510,6 +543,9 @@ def get_subscription(token):
             "Profile-Title": subscription_name,
             "Profile-Update-Interval": "12",
             "Subscription-Userinfo": f"upload={total_up}; download={total_down}; total={final_total}; expire=0",
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
         }
 
         return Response(encoded_data, mimetype="text/plain", headers=headers)

@@ -54,8 +54,10 @@
 								class="button button-secondary button-small">
 								Диагностика
 							</a>
-							<button type="button" class="button button-success button-small"
-								onclick="openIssueModal('{{ user.telegram_id }}', '{{ user.username }}')">
+							<button type="button"
+								class="button button-success button-small js-open-issue-modal"
+								data-user-id="{{ user.telegram_id }}"
+								data-username="{{ user.username or '' }}">
 								Выдать
 							</button>
 
@@ -167,6 +169,15 @@
 		var modal = document.getElementById("issueKeyModal");
 		modal.style.display = "none";
 	}
+
+	document.querySelectorAll(".js-open-issue-modal").forEach(function (button) {
+		button.addEventListener("click", function () {
+			openIssueModal(
+				button.getAttribute("data-user-id"),
+				button.getAttribute("data-username")
+			);
+		});
+	});
 
 	// Close modal if clicked outside
 	window.onclick = function (event) {

@@ -72,6 +72,7 @@ content %}
                     <th>ID</th>
                     <th>Хост</th>
                     <th>Email</th>
+                    <th>Показать ключ</th>
                     <th>Истекает</th>
                     <th>Статус (дней)</th>
                     <th class="keys-actions-head">Действия</th>
@@ -80,7 +81,7 @@ content %}
             <tbody>
                 {% for user in grouped_users %}
                 <tr class="key-user-group-row" data-group-row="{{ user.user_id }}">
-                    <td colspan="6" class="key-user-group-cell">
+                    <td colspan="7" class="key-user-group-cell">
                         <strong class="key-user-name">
                             <a href="{{ url_for('users_page') }}#user-{{ user.user_id }}">{{ user.username }}</a>
                         </strong>
@@ -103,15 +104,47 @@ content %}
                     data-key-status="{% if global_keys[0].days_left is defined and global_keys[0].days_left < 0 %}expired{% elif global_keys[0].days_left is defined and global_keys[0].days_left < 3 %}expiring{% else %}active{% endif %}"
                     data-key-search="{{ user.user_id }} {{ user.username }} global {% for g in global_keys %}{{ g.host_name }} {{ g.key_email }} {% endfor %}">
                     <td>—</td>
-                    <td><strong>Глобальная подписка</strong><br><small>Серверов: {{ global_keys|length }}</small></td>
+                    <td>
+                        <strong>{{ "Пробная подписка" if user.is_trial else "Глобальная подписка" }}</strong><br>
+                        <small>Серверов: {{ global_keys|length }}</small>
+                        {% if user.is_trial %}
+                        <br><small class="secret-hint">Триальный период</small>
+                        {% endif %}
+                    </td>
                     <td><small>Multi-link</small></td>
+                    <td class="key-link-cell">
+                        {% if user.subscription_link %}
+                        <div class="key-copy-tools">
+                            <button type="button" class="button button-small button-primary js-toggle-secret"
+                                data-target="secret-global-{{ user.user_id }}">
+                                Показать
+                            </button>
+                            <button type="button" class="button button-small button-secondary js-copy-secret"
+                                data-copy="{{ user.subscription_link }}">
+                                Копировать
+                            </button>
+                        </div>
+                        <div id="secret-global-{{ user.user_id }}" class="secret-value" hidden>
+                            <code>{{ user.subscription_link }}</code>
+                        </div>
+                        <small class="secret-hint">Subscription URL пользователя</small>
+                        {% else %}
+                        <span class="secret-empty">Домен или токен не настроен</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% set first_key = global_keys[0] %}
                         {{ first_key.expiry_date.replace('T', ' ').split(' ')[0] if first_key.expiry_date else '∞' }}
                     </td>
                     <td>
                         {% if first_key.days_left is defined %}
-                            {% if first_key.days_left < 0 %}
+                            {% if user.is_trial and first_key.days_left < 0 %}
+                                <span class="status-badge status-banned">Триал истек</span>
+                            {% elif user.is_trial and first_key.days_left < 1 %}
+                                <span class="status-badge status-warning">Триал до конца дня</span>
+                            {% elif user.is_trial and first_key.days_left < 3 %}
+                                <span class="status-badge status-warning">Триал {{ first_key.days_left }} дн.</span>
+                            {% elif first_key.days_left < 0 %}
                                 <span class="status-badge status-banned">Просрочена</span>
                             {% elif first_key.days_left < 3 %}
                                 <span class="status-badge status-warning">{{ first_key.days_left }} дн.</span>
@@ -142,13 +175,34 @@ content %}
                 </tr>
                 {% endif %}
 
-                {% for key in regular_keys %}
+                {% if not global_keys and regular_keys %}
+                {% set key = regular_keys[0] %}
                 <tr data-key-row="1" data-group="{{ user.user_id }}" data-key-type="regular"
                     data-key-status="{% if key.days_left is defined and key.days_left < 0 %}expired{% elif key.days_left is defined and key.days_left < 3 %}expiring{% else %}active{% endif %}"
                     data-key-search="{{ user.user_id }} {{ user.username }} {{ key.host_name }} {{ key.key_email }} {{ key.key_id }}">
                     <td>{{ key.key_id }}</td>
-                    <td>{{ '🎁 ' if key.plan_id == 0 }}{{ key.host_name }}</td>
-                    <td class="key-email-cell">{{ key.key_email }}</td>
+                    <td><strong>Ключ подписки</strong><br><small>Подписка пользователя</small></td>
+                    <td><small>Multi-link</small></td>
+                    <td class="key-link-cell">
+                        {% if user.subscription_link %}
+                        <div class="key-copy-tools">
+                            <button type="button" class="button button-small button-primary js-toggle-secret"
+                                data-target="secret-key-{{ key.key_id }}">
+                                Показать
+                            </button>
+                            <button type="button" class="button button-small button-secondary js-copy-secret"
+                                data-copy="{{ user.subscription_link }}">
+                                Копировать
+                            </button>
+                        </div>
+                        <div id="secret-key-{{ key.key_id }}" class="secret-value" hidden>
+                            <code>{{ user.subscription_link }}</code>
+                        </div>
+                        <small class="secret-hint">Subscription URL пользователя</small>
+                        {% else %}
+                        <span class="secret-empty">Домен или токен не настроен</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if key.expiry_date %}
                         {{ key.expiry_date.replace('T', ' ').split(' ')[0] }}
@@ -187,7 +241,7 @@ content %}
                         </form>
                     </td>
                 </tr>
-                {% endfor %}
+                {% endif %}
                 {% endfor %}
             </tbody>
         </table>
@@ -240,6 +294,39 @@ content %}
         }
 
         setInterval(refreshTaskStatuses, 5000);
+
+        document.querySelectorAll('.js-toggle-secret').forEach(button => {
+            button.addEventListener('click', () => {
+                const targetId = button.getAttribute('data-target');
+                const block = document.getElementById(targetId);
+                if (!block) return;
+                const isHidden = block.hasAttribute('hidden');
+                if (isHidden) {
+                    block.removeAttribute('hidden');
+                    button.textContent = 'Скрыть';
+                } else {
+                    block.setAttribute('hidden', '');
+                    button.textContent = 'Показать';
+                }
+            });
+        });
+
+        document.querySelectorAll('.js-copy-secret').forEach(button => {
+            button.addEventListener('click', async () => {
+                const value = button.getAttribute('data-copy');
+                if (!value) return;
+                const originalText = button.textContent;
+                try {
+                    await navigator.clipboard.writeText(value);
+                    button.textContent = 'Скопировано';
+                } catch (_) {
+                    button.textContent = 'Ошибка';
+                }
+                window.setTimeout(() => {
+                    button.textContent = originalText;
+                }, 1600);
+            });
+        });
     });
 </script>
 

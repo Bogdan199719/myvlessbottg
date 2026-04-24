@@ -119,6 +119,29 @@ def create_support_keyboard(support_user: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def create_p2p_payment_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Подтвердить", callback_data=f"p2p_paid_{request_id}", style="success"
+    )
+    builder.button(text="← Назад", callback_data="back_to_payment_methods")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def create_p2p_submitted_keyboard(
+    support_user: str | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if support_user:
+        builder.button(
+            text="🆘 Написать в поддержку", url=support_user, style="primary"
+        )
+    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def create_host_selection_keyboard(
     hosts: list, action: str, back_callback: str = "manage_keys"
 ) -> InlineKeyboardMarkup:
@@ -142,13 +165,16 @@ def create_plans_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for plan in plans:
-        callback_data = f"buy_{host_name}_{plan['plan_id']}_{action}_{key_id}"
+        plan_host_name = plan.get("host_name", host_name)
+        callback_data = f"buy_{plan_host_name}_{plan['plan_id']}_{action}_{key_id}"
         builder.button(
-            text=f"{plan['plan_name']} — {plan['price']:.0f} ₽",
+            text=plan.get(
+                "display_name", f"{plan['plan_name']} — {plan['price']:.0f} ₽"
+            ),
             callback_data=callback_data,
             style="primary",
         )
-    back_callback = "manage_keys" if action == "extend" else "back_to_host_selection"
+    back_callback = "manage_keys" if action == "extend" else "back_to_main_menu"
     builder.button(text="← Назад", callback_data=back_callback)
     builder.adjust(1)
     return builder.as_markup()
@@ -159,7 +185,7 @@ def create_skip_email_keyboard() -> InlineKeyboardMarkup:
     builder.button(
         text="➡️ Продолжить без почты", callback_data="skip_email", style="primary"
     )
-    builder.button(text="← Назад", callback_data="back_to_plans")
+    builder.button(text="← Назад", callback_data="back_to_payment_methods")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -195,7 +221,7 @@ def create_payment_method_keyboard(
             text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary"
         )
 
-    builder.button(text="← Назад", callback_data="back_to_email_prompt")
+    builder.button(text="← Назад", callback_data="back_to_plans")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -203,7 +229,7 @@ def create_payment_method_keyboard(
 def create_payment_keyboard(payment_url: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Перейти к оплате", url=payment_url, style="success")
-    builder.button(text="← Назад", callback_data="back_to_email_prompt")
+    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -240,11 +266,8 @@ def create_keys_management_keyboard(keys: list) -> InlineKeyboardMarkup:
                 builder.button(text="📱 QR", callback_data=f"show_qr_{key['key_id']}")
                 row_widths.append(2)
 
-    builder.button(
-        text="💳 Купить VPN подписку", callback_data="buy_new_key", style="primary"
-    )
     builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
-    row_widths.extend([1, 1])
+    row_widths.append(1)
     builder.adjust(*row_widths)
     return builder.as_markup()
 
@@ -327,13 +350,10 @@ def create_unified_keys_keyboard(
 
     if trial_keys_count > 0:
         builder.button(
-            text=f"🎁 Пробный ключ ({trial_keys_count})",
+            text=f"🎁 Пробный период VPN ({trial_keys_count})",
             callback_data="show_trial_keys",
         )
 
-    builder.button(
-        text="💳 Купить VPN подписку", callback_data="buy_new_key", style="primary"
-    )
     builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -344,7 +364,7 @@ def create_trial_only_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
-        text=f"🎁 Пробный ключ ({trial_keys_count})",
+        text=f"🎁 Пробный период VPN ({trial_keys_count})",
         callback_data="show_trial_keys",
         style="primary",
     )
@@ -354,9 +374,6 @@ def create_trial_only_keyboard(
             callback_data="show_proxy_keys",
             style="primary",
         )
-    builder.button(
-        text="💳 Купить VPN подписку", callback_data="buy_new_key", style="primary"
-    )
     builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
     builder.adjust(1)
     return builder.as_markup()

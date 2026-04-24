@@ -15,6 +15,10 @@ DEFAULT_DB_PATH = Path(os.getcwd()) / "users.db"
 DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
 
 
+def _now_iso() -> str:
+    return time_utils.get_msk_now().isoformat()
+
+
 def host_slug(host_name: str) -> str:
     """Generate the compact host slug used in key_email values (e.g. 'my server' → 'myserver')."""
     return (host_name or "").replace(" ", "").lower()
@@ -22,6 +26,59 @@ def host_slug(host_name: str) -> str:
 
 # Keep the private alias so existing internal callers don't break.
 _host_slug = host_slug
+
+
+DEFAULT_BOT_SETTINGS = {
+    "panel_login": os.getenv("PANEL_LOGIN", "admin"),
+    "panel_password": os.getenv("PANEL_PASSWORD", "admin"),
+    "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
+    "about_text": None,
+    "terms_url": None,
+    "privacy_url": None,
+    "support_user": None,
+    "support_text": None,
+    "channel_url": None,
+    "force_subscription": "true",
+    "receipt_email": "example@example.com",
+    "email_prompt_enabled": "false",
+    "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "support_bot_token": os.getenv("SUPPORT_BOT_TOKEN"),
+    "telegram_bot_username": os.getenv("TELEGRAM_BOT_USERNAME"),
+    "trial_enabled": "true",
+    "trial_duration_days": "3",
+    "trial_duration_value": "24",
+    "trial_duration_unit": "hours",
+    "trial_host_name": None,
+    "enable_referrals": "true",
+    "referral_percentage": "10",
+    "referral_discount": "5",
+    "minimum_withdrawal": "100",
+    "support_group_id": None,
+    "admin_telegram_id": os.getenv("ADMIN_TELEGRAM_ID"),
+    "enable_admin_payment_notifications": "true",
+    "enable_admin_trial_notifications": "true",
+    "yookassa_shop_id": os.getenv("YOOKASSA_SHOP_ID"),
+    "yookassa_secret_key": os.getenv("YOOKASSA_SECRET_KEY"),
+    "yookassa_enabled": os.getenv("YOOKASSA_ENABLED", "false"),
+    "sbp_enabled": "false",
+    "stars_enabled": "false",
+    "stars_rub_per_star": "0",
+    "cryptobot_enabled": os.getenv("CRYPTOBOT_ENABLED", "false"),
+    "cryptobot_token": os.getenv("CRYPTOBOT_TOKEN"),
+    "cryptobot_webhook_secret": os.getenv("CRYPTOBOT_WEBHOOK_SECRET"),
+    "domain": os.getenv("DOMAIN"),
+    "subscription_name": "AresVPN",
+    "p2p_enabled": "false",
+    "p2p_card_number": None,
+    "enable_global_plans": "true",
+    "subscription_live_sync": "false",
+    "subscription_live_stats": "false",
+    "subscription_allow_fallback_host_fetch": "false",
+    "subscription_auto_provision": "false",
+    "provision_timeout_seconds": "45",
+    "panel_sync_enabled": "false",
+    "xtls_sync_enabled": "false",
+}
 
 
 def initialize_db():
@@ -93,6 +150,41 @@ def initialize_db():
                 )
             """)
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS support_tickets (
+                    ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    username TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    current_thread_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    reopen_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_at TEXT,
+                    last_user_message_at TEXT,
+                    last_admin_message_at TEXT,
+                    last_delivery_error TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS support_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    sender_telegram_id INTEGER,
+                    sender_name TEXT,
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    text TEXT,
+                    created_at TEXT NOT NULL,
+                    source_chat_id INTEGER,
+                    source_message_id INTEGER,
+                    source_thread_id INTEGER,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    delivery_error TEXT
+                )
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS xui_hosts(
                     host_name TEXT NOT NULL,
                     host_url TEXT NOT NULL,
@@ -142,52 +234,8 @@ def initialize_db():
                     created_at TEXT NOT NULL
                 )
             """)
-            default_settings = {
-                "panel_login": os.getenv("PANEL_LOGIN", "admin"),
-                "panel_password": os.getenv("PANEL_PASSWORD", "admin"),
-                "about_text": None,
-                "terms_url": None,
-                "privacy_url": None,
-                "support_user": None,
-                "support_text": None,
-                "channel_url": None,
-                "force_subscription": "true",
-                "receipt_email": "example@example.com",
-                "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
-                "support_bot_token": os.getenv("SUPPORT_BOT_TOKEN"),
-                "telegram_bot_username": os.getenv("TELEGRAM_BOT_USERNAME"),
-                "trial_enabled": "true",
-                "trial_duration_days": "3",
-                "trial_duration_value": "24",
-                "trial_duration_unit": "hours",
-                "trial_host_name": None,
-                "enable_referrals": "true",
-                "referral_percentage": "10",
-                "referral_discount": "5",
-                "minimum_withdrawal": "100",
-                "support_group_id": None,
-                "admin_telegram_id": os.getenv("ADMIN_TELEGRAM_ID"),
-                "yookassa_shop_id": os.getenv("YOOKASSA_SHOP_ID"),
-                "yookassa_secret_key": os.getenv("YOOKASSA_SECRET_KEY"),
-                "yookassa_enabled": os.getenv("YOOKASSA_ENABLED", "false"),
-                "sbp_enabled": "false",
-                "stars_enabled": "false",
-                "stars_rub_per_star": "0",
-                "cryptobot_enabled": os.getenv("CRYPTOBOT_ENABLED", "false"),
-                "cryptobot_token": os.getenv("CRYPTOBOT_TOKEN"),
-                "cryptobot_webhook_secret": os.getenv("CRYPTOBOT_WEBHOOK_SECRET"),
-                "domain": os.getenv("DOMAIN"),
-                "p2p_enabled": "false",
-                "p2p_card_number": None,
-                "subscription_live_sync": "false",
-                "subscription_live_stats": "false",
-                "subscription_allow_fallback_host_fetch": "false",
-                "subscription_auto_provision": "false",
-                "panel_sync_enabled": "false",
-                "xtls_sync_enabled": "false",
-            }
             run_migration()
-            for key, value in default_settings.items():
+            for key, value in DEFAULT_BOT_SETTINGS.items():
                 cursor.execute(
                     "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
                     (key, value),
@@ -504,6 +552,86 @@ def run_migration():
             """)
             logging.info(" -> Table 'sent_notifications' is ready.")
 
+            logging.info("The migration of support ticket tables ...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS support_tickets (
+                    ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    username TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    current_thread_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    reopen_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_at TEXT,
+                    last_user_message_at TEXT,
+                    last_admin_message_at TEXT,
+                    last_delivery_error TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS support_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    sender_telegram_id INTEGER,
+                    sender_name TEXT,
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    text TEXT,
+                    created_at TEXT NOT NULL,
+                    source_chat_id INTEGER,
+                    source_message_id INTEGER,
+                    source_thread_id INTEGER,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    delivery_error TEXT
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_support_tickets_status_updated ON support_tickets(status, updated_at DESC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_support_tickets_thread ON support_tickets(current_thread_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_support_messages_ticket_created ON support_messages(ticket_id, created_at ASC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_support_messages_user_created ON support_messages(user_id, created_at ASC)"
+            )
+
+            backfill_now = _now_iso()
+            cursor.execute("SELECT user_id, thread_id FROM support_threads")
+            for user_id, thread_id in cursor.fetchall():
+                cursor.execute(
+                    "SELECT username FROM users WHERE telegram_id = ?", (user_id,)
+                )
+                user_row = cursor.fetchone()
+                username = user_row[0] if user_row else None
+                cursor.execute(
+                    """
+                    INSERT INTO support_tickets (
+                        user_id, username, status, current_thread_id,
+                        created_at, updated_at, last_message_at
+                    )
+                    VALUES (?, ?, 'open', ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username = COALESCE(excluded.username, support_tickets.username),
+                        current_thread_id = COALESCE(excluded.current_thread_id, support_tickets.current_thread_id),
+                        updated_at = excluded.updated_at,
+                        last_message_at = COALESCE(support_tickets.last_message_at, excluded.last_message_at)
+                    """,
+                    (
+                        user_id,
+                        username,
+                        thread_id,
+                        backfill_now,
+                        backfill_now,
+                        backfill_now,
+                    ),
+                )
+
             # Ensure xui_hosts has a UNIQUE constraint on host_name.
             # First remove any duplicate rows that would block index creation (keep lowest rowid).
             cursor.execute("""
@@ -634,6 +762,18 @@ def update_host(
                     "UPDATE payment_method_rules SET context_key=? WHERE context_key=?",
                     (f"xui:{new_name}", f"xui:{old_name}"),
                 )
+                cursor.execute(
+                    "UPDATE p2p_requests SET host_name=? WHERE host_name=?",
+                    (new_name, old_name),
+                )
+                cursor.execute(
+                    """
+                    UPDATE bot_settings
+                    SET value = ?
+                    WHERE key = 'trial_host_name' AND value = ?
+                    """,
+                    (new_name, old_name),
+                )
 
             conn.commit()
             logging.info(f"Host '{old_name}' updated to '{new_name}'.")
@@ -657,7 +797,7 @@ def toggle_host_status(host_name: str, is_enabled: bool):
         logging.error(f"Failed to toggle status for host '{host_name}': {e}")
 
 
-def delete_host(host_name: str):
+def delete_host(host_name: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -684,8 +824,10 @@ def delete_host(host_name: str):
             )
             conn.commit()
             logging.info(f"Host '{host_name}' deleted.")
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to delete host '{host_name}': {e}")
+        return False
 
 
 def get_host(host_name: str) -> dict | None:
@@ -742,10 +884,27 @@ def create_mtg_host(name: str, url: str, user: str, passwd: str) -> bool:
         return False
 
 
-def update_mtg_host(old_name: str, new_name: str, url: str, user: str, passwd: str):
+def update_mtg_host(
+    old_name: str, new_name: str, url: str, user: str, passwd: str
+) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM mtg_hosts WHERE host_name = ?", (old_name,))
+            if not cursor.fetchone():
+                logging.warning(f"MTG host '{old_name}' not found for update.")
+                return False
+
+            if old_name != new_name:
+                cursor.execute(
+                    "SELECT 1 FROM mtg_hosts WHERE host_name = ?", (new_name,)
+                )
+                if cursor.fetchone():
+                    logging.warning(
+                        f"Cannot rename MTG host '{old_name}' to '{new_name}': target already exists."
+                    )
+                    return False
+
             if passwd:
                 cursor.execute(
                     "UPDATE mtg_hosts SET host_name=?, host_url=?, username=?, password=? WHERE host_name=?",
@@ -769,10 +928,16 @@ def update_mtg_host(old_name: str, new_name: str, url: str, user: str, passwd: s
                     "UPDATE payment_method_rules SET context_key=? WHERE context_key=?",
                     (f"mtg:{new_name}", f"mtg:{old_name}"),
                 )
+                cursor.execute(
+                    "UPDATE p2p_requests SET host_name=? WHERE host_name=?",
+                    (new_name, old_name),
+                )
             conn.commit()
             logging.info(f"MTG host '{old_name}' updated to '{new_name}'.")
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to update MTG host '{old_name}': {e}")
+        return False
 
 
 def toggle_mtg_host_status(host_name: str, is_enabled: bool):
@@ -789,7 +954,7 @@ def toggle_mtg_host_status(host_name: str, is_enabled: bool):
         logging.error(f"Failed to toggle MTG host '{host_name}': {e}")
 
 
-def delete_mtg_host(host_name: str):
+def delete_mtg_host(host_name: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -802,10 +967,17 @@ def delete_mtg_host(host_name: str):
                 "DELETE FROM vpn_keys WHERE host_name = ? AND service_type = 'mtg'",
                 (host_name,),
             )
+            cursor.execute("DELETE FROM p2p_requests WHERE host_name = ?", (host_name,))
+            cursor.execute(
+                "DELETE FROM payment_method_rules WHERE context_key = ?",
+                (f"mtg:{host_name}",),
+            )
             conn.commit()
             logging.info(f"MTG host '{host_name}' deleted.")
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to delete MTG host '{host_name}': {e}")
+        return False
 
 
 def get_mtg_host(host_name: str) -> dict | None:
@@ -860,7 +1032,7 @@ def get_all_keys_with_usernames() -> list[dict]:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT k.*, u.username, 
+                SELECT k.*, u.username, u.subscription_token,
                        (julianday(k.expiry_date) - julianday('now')) as days_left
                 FROM vpn_keys k
                 LEFT JOIN users u ON k.user_id = u.telegram_id
@@ -1253,6 +1425,122 @@ def create_pending_transaction(
         return 0
 
 
+def reserve_pending_transaction(
+    payment_id: str,
+    metadata: dict | None = None,
+    *,
+    payment_method: str | None = None,
+    amount_currency: float | int | None = None,
+    currency_name: str | None = None,
+) -> dict | None:
+    """
+    Atomically reserve a pending transaction for processing.
+    Returns metadata if the transaction was reserved, otherwise None.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT metadata FROM transactions WHERE payment_id = ? AND status = 'pending'",
+                (payment_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            metadata_raw = row["metadata"]
+            if metadata is None:
+                try:
+                    metadata_to_store = json.loads(metadata_raw) if metadata_raw else {}
+                except json.JSONDecodeError:
+                    metadata_to_store = {}
+            else:
+                metadata_to_store = metadata
+
+            cursor.execute(
+                """
+                UPDATE transactions
+                SET status = 'processing',
+                    amount_currency = COALESCE(?, amount_currency),
+                    currency_name = COALESCE(?, currency_name),
+                    payment_method = COALESCE(?, payment_method),
+                    metadata = ?,
+                    created_date = COALESCE(created_date, ?),
+                    username = COALESCE(
+                        username,
+                        (SELECT username FROM users WHERE telegram_id = transactions.user_id)
+                    )
+                WHERE payment_id = ? AND status = 'pending'
+                """,
+                (
+                    amount_currency,
+                    currency_name,
+                    payment_method,
+                    json.dumps(metadata_to_store),
+                    time_utils.get_msk_now(),
+                    payment_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            return metadata_to_store
+    except sqlite3.Error as e:
+        logging.error(f"Failed to reserve pending transaction {payment_id}: {e}")
+        return None
+
+
+def finalize_reserved_transaction(
+    payment_id: str,
+    *,
+    success: bool,
+    metadata: dict | None = None,
+    payment_method: str | None = None,
+    amount_currency: float | int | None = None,
+    currency_name: str | None = None,
+) -> bool:
+    """
+    Complete a reserved transaction.
+    success=True  -> processing -> paid
+    success=False -> processing -> pending
+    """
+    target_status = "paid" if success else "pending"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE transactions
+                SET status = ?,
+                    metadata = COALESCE(?, metadata),
+                    payment_method = COALESCE(?, payment_method),
+                    amount_currency = COALESCE(?, amount_currency),
+                    currency_name = COALESCE(?, currency_name)
+                WHERE payment_id = ? AND status = 'processing'
+                """,
+                (
+                    target_status,
+                    json.dumps(metadata) if metadata is not None else None,
+                    payment_method,
+                    amount_currency,
+                    currency_name,
+                    payment_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to finalize reserved transaction %s with status %s: %s",
+            payment_id,
+            target_status,
+            e,
+        )
+        return False
+
+
 def log_transaction(
     username: str,
     transaction_id: str | None,
@@ -1616,21 +1904,27 @@ def get_user_trial_keys(user_id: int):
 
 
 def update_key_info(
-    key_id: int, expiry_date: datetime, connection_string: str | None = None
+    key_id: int,
+    expiry_date: datetime,
+    connection_string: str | None = None,
+    xui_client_uuid: str | None = None,
 ):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            fields = ["expiry_date = ?"]
+            values: list = [expiry_date]
             if connection_string:
-                cursor.execute(
-                    "UPDATE vpn_keys SET expiry_date = ?, connection_string = ? WHERE key_id = ?",
-                    (expiry_date, connection_string, key_id),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE vpn_keys SET expiry_date = ? WHERE key_id = ?",
-                    (expiry_date, key_id),
-                )
+                fields.append("connection_string = ?")
+                values.append(connection_string)
+            if xui_client_uuid:
+                fields.append("xui_client_uuid = ?")
+                values.append(xui_client_uuid)
+            values.append(key_id)
+            cursor.execute(
+                f"UPDATE vpn_keys SET {', '.join(fields)} WHERE key_id = ?",
+                tuple(values),
+            )
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to update key {key_id}: {e}")
@@ -1811,6 +2105,22 @@ def add_support_thread(user_id: int, thread_id: int):
                 "INSERT OR REPLACE INTO support_threads (user_id, thread_id) VALUES (?, ?)",
                 (user_id, thread_id),
             )
+            now = _now_iso()
+            cursor.execute(
+                """
+                INSERT INTO support_tickets (
+                    user_id, status, current_thread_id, created_at, updated_at
+                )
+                VALUES (?, 'open', ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    status = 'open',
+                    current_thread_id = excluded.current_thread_id,
+                    updated_at = excluded.updated_at,
+                    closed_at = NULL,
+                    last_delivery_error = NULL
+                """,
+                (user_id, thread_id, now, now),
+            )
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to add support thread for user {user_id}: {e}")
@@ -1821,6 +2131,19 @@ def delete_support_thread(user_id: int):
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                """
+                UPDATE support_tickets
+                SET current_thread_id = NULL,
+                    status = CASE
+                        WHEN status = 'closed' THEN 'closed'
+                        ELSE 'waiting_reopen'
+                    END,
+                    updated_at = ?
+                WHERE user_id = ?
+                """,
+                (_now_iso(), user_id),
+            )
             conn.commit()
     except sqlite3.Error as e:
         logging.error(f"Failed to delete support thread for user {user_id}: {e}")
@@ -1831,7 +2154,13 @@ def get_support_thread_id(user_id: int) -> int | None:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT thread_id FROM support_threads WHERE user_id = ?", (user_id,)
+                """
+                SELECT COALESCE(
+                    (SELECT current_thread_id FROM support_tickets WHERE user_id = ?),
+                    (SELECT thread_id FROM support_threads WHERE user_id = ?)
+                )
+                """,
+                (user_id, user_id),
             )
             result = cursor.fetchone()
             return result[0] if result else None
@@ -1845,13 +2174,356 @@ def get_user_id_by_thread(thread_id: int) -> int | None:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT user_id FROM support_threads WHERE thread_id = ?", (thread_id,)
+                """
+                SELECT COALESCE(
+                    (SELECT user_id FROM support_tickets WHERE current_thread_id = ?),
+                    (SELECT user_id FROM support_threads WHERE thread_id = ?)
+                )
+                """,
+                (thread_id, thread_id),
             )
             result = cursor.fetchone()
             return result[0] if result else None
     except sqlite3.Error as e:
         logging.error(f"Failed to get user_id for thread {thread_id}: {e}")
         return None
+
+
+def get_support_ticket(user_id: int) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM support_tickets WHERE user_id = ?", (user_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get support ticket for user {user_id}: {e}")
+        return None
+
+
+def get_support_ticket_by_id(ticket_id: int) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM support_tickets WHERE ticket_id = ?", (ticket_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get support ticket {ticket_id}: {e}")
+        return None
+
+
+def get_support_ticket_by_thread(thread_id: int) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM support_tickets WHERE current_thread_id = ?",
+                (thread_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get support ticket by thread {thread_id}: {e}")
+        return None
+
+
+def ensure_support_ticket(
+    user_id: int,
+    username: str | None = None,
+    thread_id: int | None = None,
+) -> dict | None:
+    now = _now_iso()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO support_tickets (
+                    user_id, username, status, current_thread_id, created_at, updated_at
+                )
+                VALUES (?, ?, 'open', ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, support_tickets.username),
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, username, thread_id, now, now),
+            )
+            if thread_id is not None:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO support_threads (user_id, thread_id) VALUES (?, ?)",
+                    (user_id, thread_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE support_tickets
+                    SET current_thread_id = ?, status = 'open', closed_at = NULL
+                    WHERE user_id = ?
+                    """,
+                    (thread_id, user_id),
+                )
+            conn.commit()
+            cursor.execute(
+                "SELECT * FROM support_tickets WHERE user_id = ?", (user_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to ensure support ticket for user {user_id}: {e}")
+        return None
+
+
+def bind_support_thread(
+    user_id: int,
+    thread_id: int,
+    username: str | None = None,
+    reopened: bool = False,
+):
+    now = _now_iso()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO support_tickets (
+                    user_id, username, status, current_thread_id, created_at, updated_at
+                )
+                VALUES (?, ?, 'open', ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, support_tickets.username),
+                    status = 'open',
+                    current_thread_id = excluded.current_thread_id,
+                    updated_at = excluded.updated_at,
+                    closed_at = NULL,
+                    reopen_count = support_tickets.reopen_count + ?,
+                    last_delivery_error = NULL
+                """,
+                (user_id, username, thread_id, now, now, 1 if reopened else 0),
+            )
+            cursor.execute(
+                "INSERT OR REPLACE INTO support_threads (user_id, thread_id) VALUES (?, ?)",
+                (user_id, thread_id),
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(
+            f"Failed to bind support thread {thread_id} for user {user_id}: {e}"
+        )
+
+
+def mark_support_ticket_closed(user_id: int, error_text: str | None = None):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE support_tickets
+                SET status = 'closed',
+                    closed_at = ?,
+                    updated_at = ?,
+                    last_delivery_error = COALESCE(?, last_delivery_error)
+                WHERE user_id = ?
+                """,
+                (_now_iso(), _now_iso(), error_text, user_id),
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to mark support ticket closed for user {user_id}: {e}")
+
+
+def mark_support_ticket_waiting_reopen(user_id: int, error_text: str | None = None):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                """
+                UPDATE support_tickets
+                SET status = 'waiting_reopen',
+                    current_thread_id = NULL,
+                    updated_at = ?,
+                    last_delivery_error = COALESCE(?, last_delivery_error)
+                WHERE user_id = ?
+                """,
+                (_now_iso(), error_text, user_id),
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(
+            f"Failed to mark support ticket waiting_reopen for user {user_id}: {e}"
+        )
+
+
+def log_support_message(
+    ticket_id: int,
+    user_id: int,
+    direction: str,
+    sender_telegram_id: int | None = None,
+    sender_name: str | None = None,
+    message_type: str = "text",
+    text: str | None = None,
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+    source_thread_id: int | None = None,
+    delivery_status: str = "pending",
+    delivery_error: str | None = None,
+) -> int | None:
+    now = _now_iso()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO support_messages (
+                    ticket_id, user_id, direction, sender_telegram_id, sender_name,
+                    message_type, text, created_at, source_chat_id, source_message_id,
+                    source_thread_id, delivery_status, delivery_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticket_id,
+                    user_id,
+                    direction,
+                    sender_telegram_id,
+                    sender_name,
+                    message_type,
+                    text,
+                    now,
+                    source_chat_id,
+                    source_message_id,
+                    source_thread_id,
+                    delivery_status,
+                    delivery_error,
+                ),
+            )
+            if direction == "user_to_support":
+                cursor.execute(
+                    """
+                    UPDATE support_tickets
+                    SET last_message_at = ?, last_user_message_at = ?, updated_at = ?
+                    WHERE ticket_id = ?
+                    """,
+                    (now, now, now, ticket_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE support_tickets
+                    SET last_message_at = ?, last_admin_message_at = ?, updated_at = ?
+                    WHERE ticket_id = ?
+                    """,
+                    (now, now, now, ticket_id),
+                )
+            conn.commit()
+            return cursor.lastrowid
+    except sqlite3.Error as e:
+        logging.error(f"Failed to log support message for ticket {ticket_id}: {e}")
+        return None
+
+
+def update_support_message_delivery(
+    message_log_id: int, status: str, error_text: str | None = None
+):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE support_messages
+                SET delivery_status = ?, delivery_error = ?
+                WHERE id = ?
+                """,
+                (status, error_text, message_log_id),
+            )
+            if error_text is not None:
+                cursor.execute(
+                    """
+                    UPDATE support_tickets
+                    SET updated_at = ?, last_delivery_error = ?
+                    WHERE ticket_id = (SELECT ticket_id FROM support_messages WHERE id = ?)
+                    """,
+                    (_now_iso(), error_text, message_log_id),
+                )
+            elif status == "delivered":
+                cursor.execute(
+                    """
+                    UPDATE support_tickets
+                    SET updated_at = ?, last_delivery_error = NULL
+                    WHERE ticket_id = (SELECT ticket_id FROM support_messages WHERE id = ?)
+                    """,
+                    (_now_iso(), message_log_id),
+                )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(
+            f"Failed to update support message delivery {message_log_id}: {e}"
+        )
+
+
+def get_support_tickets(limit: int = 200) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    t.*,
+                    u.username AS db_username,
+                    (
+                        SELECT COUNT(*)
+                        FROM support_messages m
+                        WHERE m.ticket_id = t.ticket_id
+                    ) AS message_count
+                FROM support_tickets t
+                LEFT JOIN users u ON u.telegram_id = t.user_id
+                ORDER BY
+                    CASE t.status
+                        WHEN 'open' THEN 0
+                        WHEN 'waiting_reopen' THEN 1
+                        ELSE 2
+                    END,
+                    COALESCE(t.last_message_at, t.updated_at, t.created_at) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get support tickets: {e}")
+        return []
+
+
+def get_support_messages(ticket_id: int, limit: int = 300) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM support_messages
+                WHERE ticket_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (ticket_id, limit),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+            rows.reverse()
+            return rows
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get support messages for ticket {ticket_id}: {e}")
+        return []
 
 
 def get_latest_transaction(user_id: int) -> dict | None:
@@ -1906,17 +2578,38 @@ def unban_user(telegram_id: int):
         logging.error(f"Failed to unban user {telegram_id}: {e}")
 
 
-def delete_user_keys(user_id: int):
+def delete_user_keys(user_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
             conn.commit()
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to delete keys for user {user_id}: {e}")
+        return False
 
 
-def delete_user_everywhere(user_id: int):
+def delete_keys_by_ids(key_ids: list[int]) -> int:
+    if not key_ids:
+        return 0
+
+    placeholders = ",".join("?" for _ in key_ids)
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"DELETE FROM vpn_keys WHERE key_id IN ({placeholders})",
+                tuple(key_ids),
+            )
+            conn.commit()
+            return cursor.rowcount or 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to delete keys by ids {key_ids}: {e}")
+        return 0
+
+
+def delete_user_everywhere(user_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -1931,11 +2624,15 @@ def delete_user_everywhere(user_id: int):
                 "DELETE FROM sent_notifications WHERE user_id = ?", (user_id,)
             )
             cursor.execute("DELETE FROM p2p_requests WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM support_messages WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM support_tickets WHERE user_id = ?", (user_id,))
             cursor.execute("DELETE FROM users WHERE telegram_id = ?", (user_id,))
 
             conn.commit()
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to delete user {user_id} everywhere: {e}")
+        return False
 
 
 def is_notification_sent(

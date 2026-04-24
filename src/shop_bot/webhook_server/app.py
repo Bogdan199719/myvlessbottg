@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import json
 import hashlib
+import hmac
 import base64
 import sqlite3
 import tempfile
@@ -37,6 +38,7 @@ from flask import (
     Response,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,7 +69,6 @@ from shop_bot.data_manager.database import (
     get_user_keys,
     ban_user,
     unban_user,
-    delete_user_keys,
     delete_user_everywhere,
     get_setting,
     DB_FILE,
@@ -82,6 +83,8 @@ from shop_bot.data_manager.database import (
     get_referral_count,
     add_to_referral_balance,
     create_pending_transaction,
+    reserve_pending_transaction,
+    finalize_reserved_transaction,
     run_migration,
     set_referral_balance,
     set_referral_balance_all,
@@ -106,10 +109,21 @@ from shop_bot.data_manager.database import (
     get_all_payment_rules,
     set_payment_rule,
     delete_payment_rules_for_context,
+    delete_keys_by_ids,
     ALL_PAYMENT_METHODS,
 )
 
 _bot_controller = None
+
+
+def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
+    domain_value = (domain or "").strip()
+    token_value = (token or "").strip()
+    if not domain_value or not token_value:
+        return None
+    if not domain_value.startswith(("http://", "https://")):
+        domain_value = f"https://{domain_value}"
+    return f"{domain_value.rstrip('/')}/sub/{token_value}"
 
 
 def _sha256_file(path: Path) -> str:
@@ -178,14 +192,25 @@ def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
 def _safe_extract_zip(zip_ref: zipfile.ZipFile, extract_dir: Path) -> None:
     extract_root = extract_dir.resolve()
     for member in zip_ref.infolist():
-        member_path = (extract_dir / member.filename).resolve()
-        if not str(member_path).startswith(str(extract_root)):
+        member_name = member.filename
+        if Path(member_name).is_absolute():
+            raise ValueError("Недопустимый путь в архиве.")
+        member_path = (extract_dir / member_name).resolve()
+        if os.path.commonpath([str(extract_root), str(member_path)]) != str(
+            extract_root
+        ):
             raise ValueError("Недопустимый путь в архиве.")
     zip_ref.extractall(extract_dir)
 
 
-def _restore_from_backup(zip_file, apply_env: bool = False):
+def _restore_from_backup(zip_file, apply_env: bool = False) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix="restore_"))
+    restart_results: dict[str, dict] = {}
+    previous_status = {
+        "shop_bot_running": False,
+        "support_bot_running": False,
+        "is_running": False,
+    }
     try:
         upload_path = temp_dir / "upload.zip"
         zip_file.save(upload_path)
@@ -212,8 +237,10 @@ def _restore_from_backup(zip_file, apply_env: bool = False):
 
         # Остановить ботов перед заменой БД
         try:
-            if _bot_controller and _bot_controller.get_status().get("is_running"):
-                _bot_controller.stop()
+            if _bot_controller:
+                previous_status = dict(_bot_controller.get_status())
+                if previous_status.get("is_running"):
+                    _bot_controller.stop()
         except Exception as e:
             logger.error(f"Failed to stop bots before restore: {e}", exc_info=True)
 
@@ -233,6 +260,21 @@ def _restore_from_backup(zip_file, apply_env: bool = False):
             env_src = extract_dir / ".env"
             if env_src.exists():
                 shutil.copyfile(env_src, Path(".env"))
+
+        if _bot_controller:
+            if previous_status.get("shop_bot_running"):
+                restart_results["shop"] = _bot_controller.start_shop_bot()
+            if previous_status.get("support_bot_running"):
+                restart_results["support"] = _bot_controller.start_support_bot()
+
+        return {
+            "restart_results": restart_results,
+            "restart_errors": [
+                result.get("message", "unknown error")
+                for result in restart_results.values()
+                if result.get("status") != "success"
+            ],
+        }
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -284,6 +326,57 @@ def _set_webhook_processed(provider: str, external_id: str) -> None:
         logger.error(
             f"Failed to set webhook processed for {provider}:{external_id}: {e}"
         )
+
+
+def _sanitize_csv_cell(value) -> str:
+    text = str(value or "")
+    if text[:1] in {"=", "+", "-", "@"}:
+        return f"'{text}"
+    return text
+
+
+def _reserve_pending_transaction_for_cryptobot(
+    payment_id: str,
+    *,
+    amount_currency=None,
+    currency_name: str | None = None,
+) -> dict | None:
+    return reserve_pending_transaction(
+        payment_id,
+        payment_method="CryptoBot",
+        amount_currency=amount_currency,
+        currency_name=currency_name,
+    )
+
+
+def _extract_cryptobot_secret_from_request() -> str | None:
+    header_secret = (request.headers.get("X-CryptoBot-Secret") or "").strip()
+    if header_secret:
+        return header_secret
+
+    authorization = (request.headers.get("Authorization") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+
+    return None
+
+
+def _is_valid_cryptobot_signature() -> bool:
+    signature = (request.headers.get("crypto-pay-api-signature") or "").strip()
+    if not signature:
+        return False
+
+    cryptobot_token = get_setting("cryptobot_token")
+    if not cryptobot_token:
+        logger.error(
+            "CryptoBot Webhook: cryptobot_token is not configured, cannot verify signature."
+        )
+        return False
+
+    body = request.get_data(cache=True)
+    signing_secret = hashlib.sha256(str(cryptobot_token).encode("utf-8")).digest()
+    calculated_signature = hmac.new(signing_secret, body, hashlib.sha256).hexdigest()
+    return compare_digest(calculated_signature, signature)
 
 
 ALL_SETTINGS_KEYS = [
@@ -344,6 +437,7 @@ def create_webhook_app(bot_controller_instance):
         template_folder=os.path.join(base_dir, "templates"),
         static_folder=os.path.join(base_dir, "static"),
     )
+    flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
 
     flask_app.register_blueprint(subscription_bp)
 
@@ -393,6 +487,46 @@ def create_webhook_app(bot_controller_instance):
 
     flask_app.jinja_env.globals["csrf_token"] = generate_csrf_token
 
+    @flask_app.after_request
+    def add_secure_flag_to_session_cookie(response):
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "geolocation=(), microphone=(), camera=()",
+        )
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "font-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'",
+        )
+
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+        is_https = request.is_secure or forwarded_proto.lower() == "https"
+        if not is_https:
+            return response
+
+        session_cookie_name = flask_app.config.get("SESSION_COOKIE_NAME", "session")
+        set_cookie_headers = response.headers.getlist("Set-Cookie")
+        if not set_cookie_headers:
+            return response
+
+        response.headers.pop("Set-Cookie", None)
+        cookie_prefix = f"{session_cookie_name}="
+        for header_value in set_cookie_headers:
+            if header_value.startswith(cookie_prefix) and "Secure" not in header_value:
+                header_value = f"{header_value}; Secure"
+            response.headers.add("Set-Cookie", header_value)
+        return response
+
     task_status_lock = threading.Lock()
     task_statuses = {
         "sync_configs": {"status": "idle", "message": "Не запускалась"},
@@ -425,7 +559,8 @@ def create_webhook_app(bot_controller_instance):
         @wraps(f)
         def decorated_function(*args, **kwargs):
             if not session.get("logged_in", False):
-                return redirect(url_for("login_page", next=request.url))
+                next_path = request.full_path if request.query_string else request.path
+                return redirect(url_for("login_page", next=next_path))
             return f(*args, **kwargs)
 
         return decorated_function
@@ -481,8 +616,8 @@ def create_webhook_app(bot_controller_instance):
                 session["logged_in"] = True
                 session.permanent = True
                 session.pop("_csrf_token", None)  # Rotate CSRF token on login
-                next_url = request.args.get("next")
-                if next_url and next_url.startswith("/"):  # Validate redirect
+                next_url = (request.args.get("next") or "").strip()
+                if next_url.startswith("/") and not next_url.startswith("//"):
                     return redirect(next_url)
                 return redirect(url_for("dashboard_page"))
             else:
@@ -500,13 +635,23 @@ def create_webhook_app(bot_controller_instance):
     def get_common_template_data():
         bot_status = _bot_controller.get_status()
         settings = get_all_settings()
-        required_for_start = [
+        required_for_shop_start = [
             "telegram_bot_token",
-            "telegram_bot_username",
             "admin_telegram_id",
         ]
-        all_settings_ok = all(settings.get(key) for key in required_for_start)
-        return {"bot_status": bot_status, "all_settings_ok": all_settings_ok}
+        required_for_support_start = [
+            "support_bot_token",
+            "support_group_id",
+        ]
+        all_settings_ok = all(settings.get(key) for key in required_for_shop_start)
+        support_settings_ok = all(
+            settings.get(key) for key in required_for_support_start
+        )
+        return {
+            "bot_status": bot_status,
+            "all_settings_ok": all_settings_ok,
+            "support_settings_ok": support_settings_ok,
+        }
 
     def _parse_user_id_from_key_email(email: str | None) -> int | None:
         if not email:
@@ -578,7 +723,7 @@ def create_webhook_app(bot_controller_instance):
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
+            writer.writerow({k: _sanitize_csv_cell(row.get(k, "")) for k in fieldnames})
 
         data = output.getvalue()
         output.close()
@@ -1066,6 +1211,12 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def keys_page():
         all_keys = get_all_keys_with_usernames()
+        subscription_domain = get_setting("domain")
+        enabled_xui_hosts = {
+            host.get("host_name")
+            for host in get_all_hosts(only_enabled=True)
+            if host.get("host_name")
+        }
 
         # Identify global plan IDs
         try:
@@ -1085,13 +1236,30 @@ def create_webhook_app(bot_controller_instance):
                 users_map[uid] = {
                     "username": key.get("username") or f"User {uid}",
                     "user_id": uid,
+                    "subscription_link": None,
                     "user_keys": [],
                 }
 
             # Mark if key is part of a global subscription
-            key["is_global"] = bool(
-                key.get("plan_id") and int(key["plan_id"]) in global_plan_ids
+            plan_id = key.get("plan_id")
+            host_name = key.get("host_name")
+            is_xui_bundle = (
+                key.get("service_type") == "xui"
+                and bool(key.get("subscription_token"))
+                and host_name in enabled_xui_hosts
             )
+            key["is_global"] = is_xui_bundle or (
+                plan_id is not None and int(plan_id) in global_plan_ids
+            )
+            key["copy_value"] = (key.get("connection_string") or "").strip()
+            key["has_copy_value"] = bool(key["copy_value"])
+            key["copy_kind"] = (
+                "Telegram Proxy" if key.get("service_type") == "mtg" else "VPN ключ"
+            )
+            if not users_map[uid]["subscription_link"]:
+                users_map[uid]["subscription_link"] = _build_subscription_link(
+                    subscription_domain, key.get("subscription_token")
+                )
             users_map[uid]["user_keys"].append(key)
 
         def _expiry_ts(key_item: dict) -> float:
@@ -1115,6 +1283,9 @@ def create_webhook_app(bot_controller_instance):
 
             deduped_global = sorted(global_by_host.values(), key=_expiry_ts)
             user_data["user_keys"] = deduped_global + regular_keys
+            user_data["is_trial"] = bool(deduped_global) and all(
+                int(key.get("plan_id") or 0) == 0 for key in deduped_global
+            )
 
         grouped_users = sorted(users_map.values(), key=lambda u: u["username"])
 
@@ -1154,15 +1325,21 @@ def create_webhook_app(bot_controller_instance):
             # Check if this key belongs to a Global Plan
             is_global = False
             try:
+                enabled_xui_hosts = {
+                    host.get("host_name")
+                    for host in get_all_hosts(only_enabled=True)
+                    if host.get("host_name")
+                }
                 global_plan_ids = {
                     int(p["plan_id"])
                     for p in get_plans_for_host("ALL", service_type="xui")
                     if p.get("plan_id") is not None
                 }
+                plan_id = key_data.get("plan_id")
                 if (
-                    key_data.get("plan_id")
-                    and int(key_data["plan_id"]) in global_plan_ids
-                ):
+                    key_data.get("service_type") == "xui"
+                    and key_data.get("host_name") in enabled_xui_hosts
+                ) or (plan_id is not None and int(plan_id) in global_plan_ids):
                     is_global = True
             except Exception as e:
                 logger.error(f"Error checking global plan status: {e}")
@@ -1172,10 +1349,13 @@ def create_webhook_app(bot_controller_instance):
                 user_keys = get_user_keys(key_data["user_id"])
                 # Find other global keys for this user
                 for k in user_keys:
-                    if (
-                        k["key_id"] != key_id
-                        and k.get("plan_id")
-                        and int(k["plan_id"]) in global_plan_ids
+                    plan_id = k.get("plan_id")
+                    if k["key_id"] != key_id and (
+                        (
+                            k.get("service_type") == "xui"
+                            and k.get("host_name") in enabled_xui_hosts
+                        )
+                        or (plan_id is not None and int(plan_id) in global_plan_ids)
                     ):
                         keys_to_adjust.append(k)
 
@@ -1541,19 +1721,29 @@ def create_webhook_app(bot_controller_instance):
     def revoke_keys_route(user_id):
         keys_to_revoke = get_user_keys(user_id)
         success_count = 0
+        deleted_key_ids: list[int] = []
+        failed_keys: list[str] = []
 
         for key in keys_to_revoke:
             try:
                 result = _delete_remote_user_key(key)
                 if result:
                     success_count += 1
+                    if key.get("key_id") is not None:
+                        deleted_key_ids.append(int(key["key_id"]))
+                else:
+                    failed_keys.append(
+                        key.get("key_email") or f"key:{key.get('key_id')}"
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to revoke key '{key.get('key_email')}' for user {user_id}: {e}",
                     exc_info=True,
                 )
+                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
 
-        delete_user_keys(user_id)
+        if deleted_key_ids:
+            delete_keys_by_ids(deleted_key_ids)
 
         if success_count == len(keys_to_revoke):
             flash(
@@ -1562,9 +1752,16 @@ def create_webhook_app(bot_controller_instance):
             )
         else:
             flash(
-                f"Удалось отозвать {success_count} из {len(keys_to_revoke)} ключей для пользователя {user_id}. Проверьте логи.",
+                f"Удалось отозвать {success_count} из {len(keys_to_revoke)} ключей для пользователя {user_id}. "
+                "Локально удалены только успешно отозванные ключи; остальные сохранены для повторной попытки.",
                 "warning",
             )
+            if failed_keys:
+                logger.warning(
+                    "User %s revoke aborted for keys still present on remote side: %s",
+                    user_id,
+                    ", ".join(failed_keys),
+                )
 
         return redirect(url_for("users_page"))
 
@@ -1595,6 +1792,21 @@ def create_webhook_app(bot_controller_instance):
             user_keys = get_user_keys(user_id)
             key_number = None  # Will be fetched only if a NEW key is actually needed
 
+            def _find_existing_manual_issue_key(host_name: str) -> dict | None:
+                paid_match = None
+                trial_match = None
+                for key in user_keys:
+                    if key.get("service_type", "xui") != "xui":
+                        continue
+                    if key.get("host_name") != host_name:
+                        continue
+                    if int(key.get("plan_id", 0) or 0) > 0:
+                        paid_match = key
+                        break
+                    if trial_match is None:
+                        trial_match = key
+                return paid_match or trial_match
+
             issued_count = 0
             primary_key_id = None
 
@@ -1608,19 +1820,14 @@ def create_webhook_app(bot_controller_instance):
 
                 for h in hosts:
                     try:
-                        existing_key_db = None
-                        for k in user_keys:
-                            # Re-use existing PAID keys on this host
-                            if (
-                                k["host_name"] == h["host_name"]
-                                and k.get("plan_id", 0) > 0
-                            ):
-                                existing_key_db = k
-                                break
+                        existing_key_db = _find_existing_manual_issue_key(
+                            h["host_name"]
+                        )
 
                         if existing_key_db:
                             # Manual issuance should set the exact plan duration from now,
-                            # not extend the user's remaining time.
+                            # not extend the user's remaining time. Reuse trial keys too,
+                            # otherwise admin issuance creates duplicate clients on the panel.
                             result = _run_async(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
@@ -1684,15 +1891,12 @@ def create_webhook_app(bot_controller_instance):
                 try:
                     host_name = plan["host_name"]
 
-                    existing_key_db = None
-                    for k in user_keys:
-                        if k["host_name"] == host_name and k.get("plan_id", 0) > 0:
-                            existing_key_db = k
-                            break
+                    existing_key_db = _find_existing_manual_issue_key(host_name)
 
                     if existing_key_db:
                         # Manual issuance should set the exact plan duration from now,
-                        # not extend the user's remaining time.
+                        # not extend the user's remaining time. Reuse trial keys too,
+                        # otherwise admin issuance creates duplicate clients on the panel.
                         result = _run_async(
                             xui_api.create_or_update_key_on_host_absolute_expiry(
                                 host_name=host_name,
@@ -1788,19 +1992,49 @@ def create_webhook_app(bot_controller_instance):
     def delete_user_route(user_id):
         keys_to_revoke = get_user_keys(user_id)
         success_count = 0
+        deleted_key_ids: list[int] = []
+        failed_keys: list[str] = []
 
         for key in keys_to_revoke:
             try:
                 result = _delete_remote_user_key(key)
                 if result:
                     success_count += 1
+                    if key.get("key_id") is not None:
+                        deleted_key_ids.append(int(key["key_id"]))
+                else:
+                    failed_keys.append(
+                        key.get("key_email") or f"key:{key.get('key_id')}"
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to delete key '{key.get('key_email')}' for user {user_id}: {e}",
                     exc_info=True,
                 )
+                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
 
-        delete_user_everywhere(user_id)
+        if failed_keys:
+            if deleted_key_ids:
+                delete_keys_by_ids(deleted_key_ids)
+            logger.warning(
+                "User %s deletion cancelled because some remote keys remain: %s",
+                user_id,
+                ", ".join(failed_keys),
+            )
+            flash(
+                f"Удаление пользователя {user_id} остановлено: удалось удалить {success_count} из {len(keys_to_revoke)} ключей. "
+                "Пользователь сохранён в БД, а локально удалены только уже удалённые на сервере ключи.",
+                "warning",
+            )
+            return redirect(url_for("users_page"))
+
+        deleted = delete_user_everywhere(user_id)
+        if not deleted:
+            flash(
+                f"Ключи пользователя {user_id} удалены на панелях, но удаление из локальной базы завершилось ошибкой. Проверьте логи.",
+                "danger",
+            )
+            return redirect(url_for("users_page"))
 
         if success_count == len(keys_to_revoke):
             flash(
@@ -1862,7 +2096,7 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/settings/backup", methods=["POST"])
     @login_required
     def backup_route():
-        include_env = True
+        include_env = request.form.get("include_env") == "true"
         try:
             zip_path, temp_dir = _create_backup_zip(include_env=include_env)
         except Exception as e:
@@ -1895,11 +2129,16 @@ def create_webhook_app(bot_controller_instance):
             return redirect(url_for("settings_page"))
 
         backup_file = request.files["backup_file"]
-        apply_env = True
+        apply_env = request.form.get("apply_env") == "true"
 
         try:
-            _restore_from_backup(backup_file, apply_env=apply_env)
+            restore_result = _restore_from_backup(backup_file, apply_env=apply_env)
             flash("Бэкап успешно импортирован. Текущая база заменена.", "success")
+            for message in restore_result.get("restart_errors", []):
+                flash(
+                    f"Боты после импорта не были перезапущены автоматически: {message}",
+                    "warning",
+                )
         except ValueError as e:
             flash(str(e), "warning")
         except Exception as e:
@@ -2046,7 +2285,12 @@ def create_webhook_app(bot_controller_instance):
                 )
                 return redirect(url_for("settings_page"))
 
-        delete_host(host_name)
+        if not delete_host(host_name):
+            flash(
+                "Хост не удалось удалить из локальной базы. Проверьте логи.",
+                "danger",
+            )
+            return redirect(url_for("settings_page"))
         flash(f"Хост '{host_name}' и все его тарифы были удалены.", "success")
         return redirect(url_for("settings_page"))
 
@@ -2114,14 +2358,20 @@ def create_webhook_app(bot_controller_instance):
     def update_mtg_host_route():
         old_host_name = request.form["old_host_name"]
         new_host_name = request.form["host_name"]
-        update_mtg_host(
+        success = update_mtg_host(
             old_name=old_host_name,
             new_name=new_host_name,
             url=request.form["host_url"],
             user=request.form["host_username"],
             passwd=request.form.get("host_pass", ""),
         )
-        flash(f"MTG-хост '{old_host_name}' успешно обновлён.", "success")
+        if success:
+            flash(f"MTG-хост '{old_host_name}' успешно обновлён.", "success")
+        else:
+            flash(
+                "Не удалось обновить MTG-хост. Проверьте имя, уникальность и логи приложения.",
+                "danger",
+            )
         return redirect(url_for("settings_page"))
 
     @flask_app.route("/toggle-mtg-host/<host_name>", methods=["POST"])
@@ -2183,7 +2433,12 @@ def create_webhook_app(bot_controller_instance):
                 )
                 return redirect(url_for("settings_page"))
 
-        delete_mtg_host(host_name)
+        if not delete_mtg_host(host_name):
+            flash(
+                "MTG-хост не удалось удалить из локальной базы. Проверьте логи.",
+                "danger",
+            )
+            return redirect(url_for("settings_page"))
         flash(f"MTG-хост '{host_name}' и все его тарифы удалены.", "success")
         return redirect(url_for("settings_page"))
 
@@ -2219,6 +2474,7 @@ def create_webhook_app(bot_controller_instance):
 
     @flask_app.route("/yookassa-webhook", methods=["POST"])
     def yookassa_webhook_handler():
+        reserved_payment_id: str | None = None
         try:
             shop_id = get_setting("yookassa_shop_id")
             secret_key = get_setting("yookassa_secret_key")
@@ -2269,10 +2525,13 @@ def create_webhook_app(bot_controller_instance):
                     logger.error(
                         f"YooKassa webhook: Payment {payment_id} has no metadata in API response."
                     )
-                    return "OK", 200
+                    return "Service Unavailable", 503
 
                 # Cross-check paid amount against metadata price
                 api_amount = getattr(getattr(payment, "amount", None), "value", None)
+                api_currency = getattr(
+                    getattr(payment, "amount", None), "currency", None
+                )
                 meta_price = metadata.get("price")
                 if api_amount and meta_price is not None:
                     try:
@@ -2281,11 +2540,30 @@ def create_webhook_app(bot_controller_instance):
                                 f"YooKassa webhook: Amount mismatch for {payment_id}: "
                                 f"API amount={api_amount}, metadata price={meta_price}"
                             )
-                            return "OK", 200
+                            return "Service Unavailable", 503
                     except (ValueError, TypeError):
                         pass
 
                 metadata["provider_payment_id"] = payment_id
+                metadata["payment_method"] = "YooKassa"
+
+                reserved_metadata = reserve_pending_transaction(
+                    payment_id,
+                    metadata=metadata,
+                    payment_method="YooKassa",
+                    amount_currency=(
+                        float(api_amount) if api_amount is not None else None
+                    ),
+                    currency_name=api_currency,
+                )
+                if reserved_metadata is None:
+                    logger.warning(
+                        "YooKassa webhook: payment %s is missing, already reserved, or no longer pending.",
+                        payment_id,
+                    )
+                    return "Service Unavailable", 503
+                metadata = reserved_metadata
+                reserved_payment_id = payment_id
 
                 bot = _bot_controller.get_bot_instance()
                 payment_processor = handlers.process_successful_payment
@@ -2296,6 +2574,24 @@ def create_webhook_app(bot_controller_instance):
                         processed_ok = _run_async(
                             payment_processor(bot, metadata), timeout=180
                         )
+                        finalized = finalize_reserved_transaction(
+                            payment_id,
+                            success=bool(processed_ok),
+                            metadata=metadata,
+                            payment_method="YooKassa",
+                            amount_currency=(
+                                float(api_amount) if api_amount is not None else None
+                            ),
+                            currency_name=api_currency,
+                        )
+                        reserved_payment_id = None
+                        if not finalized:
+                            logger.error(
+                                "YooKassa webhook: failed to finalize reserved transaction %s after processing=%s",
+                                payment_id,
+                                processed_ok,
+                            )
+                            return "Service Unavailable", 503
                         if processed_ok:
                             _set_webhook_processed("yookassa", payment_id)
                         else:
@@ -2311,22 +2607,30 @@ def create_webhook_app(bot_controller_instance):
                         return "Service Unavailable", 503
             return "OK", 200
         except Exception as e:
+            if reserved_payment_id:
+                finalize_reserved_transaction(
+                    reserved_payment_id, success=False, payment_method="YooKassa"
+                )
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
             return "Error", 500
 
-    def _cryptobot_webhook_handler_impl(secret_token: str | None = None):
+    def _cryptobot_webhook_handler_impl():
+        reserved_payment_id: str | None = None
         try:
-            configured_secret = get_setting("cryptobot_webhook_secret")
-            if not configured_secret:
-                logger.error(
-                    "CryptoBot Webhook: Secret not configured. Rejecting request for security."
-                )
-                return "Forbidden", 403
+            signature_valid = _is_valid_cryptobot_signature()
 
-            if not secret_token or not compare_digest(
-                str(secret_token), str(configured_secret)
-            ):
-                logger.warning("CryptoBot Webhook: Invalid or missing secret token.")
+            configured_secret = get_setting("cryptobot_webhook_secret")
+            request_secret = _extract_cryptobot_secret_from_request()
+            legacy_secret_valid = bool(
+                configured_secret
+                and request_secret
+                and compare_digest(str(request_secret), str(configured_secret))
+            )
+
+            if not signature_valid and not legacy_secret_valid:
+                logger.warning(
+                    "CryptoBot Webhook: missing valid signature and legacy secret check failed."
+                )
                 return "Forbidden", 403
 
             request_data = request.get_json(silent=True)
@@ -2361,6 +2665,14 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return "OK", 200
 
+                payment_id = None
+                try:
+                    payload_obj = json.loads(payload_string)
+                    if isinstance(payload_obj, dict):
+                        payment_id = str(payload_obj.get("tx_id") or "").strip()
+                except json.JSONDecodeError:
+                    payment_id = None
+
                 external_id_fallback = None
                 if not external_invoice_id:
                     external_id_fallback = hashlib.sha256(
@@ -2369,34 +2681,73 @@ def create_webhook_app(bot_controller_instance):
                     if _is_webhook_processed("cryptobot", external_id_fallback):
                         return "OK", 200
 
-                parts = payload_string.split(":")
-                if len(parts) < 9:
-                    logger.error(
-                        f"cryptobot Webhook: Invalid payload format received: {payload_string}"
-                    )
-                    return "Error", 400
-
-                metadata = {
-                    "user_id": parts[0],
-                    "months": parts[1],
-                    "price": parts[2],
-                    "action": parts[3],
-                    "key_id": parts[4],
-                    "host_name": parts[5],
-                    "plan_id": parts[6],
-                    "customer_email": parts[7] if parts[7] != "None" else None,
-                    "payment_method": parts[8],
-                }
-                metadata["provider_payment_id"] = str(
-                    external_invoice_id or external_id_fallback or ""
+                metadata = None
+                payload_price = None
+                cb_amount = payload_data.get("amount")
+                currency_name = payload_data.get("asset") or payload_data.get(
+                    "currency"
                 )
 
+                if payment_id:
+                    metadata = _reserve_pending_transaction_for_cryptobot(
+                        payment_id,
+                        amount_currency=cb_amount,
+                        currency_name=currency_name,
+                    )
+                    if metadata is None:
+                        logger.warning(
+                            "CryptoBot webhook: pending transaction %s not found or already reserved.",
+                            payment_id,
+                        )
+                        return "OK", 200
+                    payload_price = metadata.get("price")
+                    metadata["payment_method"] = "CryptoBot"
+                    metadata["provider_payment_id"] = payment_id
+                    metadata["cryptobot_invoice_id"] = str(
+                        external_invoice_id or external_id_fallback or ""
+                    )
+                    reserved_payment_id = payment_id
+                else:
+                    parts = payload_string.split(":")
+                    if len(parts) < 9:
+                        logger.error(
+                            f"cryptobot Webhook: Invalid payload format received: {payload_string}"
+                        )
+                        return "Error", 400
+
+                    metadata = {
+                        "user_id": parts[0],
+                        "months": parts[1],
+                        "price": parts[2],
+                        "action": parts[3],
+                        "key_id": parts[4],
+                        "host_name": parts[5],
+                        "plan_id": parts[6],
+                        "customer_email": parts[7] if parts[7] != "None" else None,
+                        "payment_method": "CryptoBot",
+                        "provider_payment_id": str(
+                            external_invoice_id or external_id_fallback or ""
+                        ),
+                        "cryptobot_invoice_id": str(
+                            external_invoice_id or external_id_fallback or ""
+                        ),
+                    }
+                    payload_price = parts[2]
+
                 # Cross-check actual paid amount against payload price
-                cb_amount = payload_data.get("amount")
-                payload_price = parts[2]
                 if cb_amount:
                     try:
                         if abs(float(cb_amount) - float(payload_price)) > 1.0:
+                            if reserved_payment_id:
+                                finalize_reserved_transaction(
+                                    reserved_payment_id,
+                                    success=False,
+                                    metadata=metadata,
+                                    payment_method="CryptoBot",
+                                    amount_currency=cb_amount,
+                                    currency_name=currency_name,
+                                )
+                                reserved_payment_id = None
                             logger.error(
                                 f"CryptoBot webhook: Amount mismatch! "
                                 f"paid={cb_amount}, payload_price={payload_price}"
@@ -2415,6 +2766,22 @@ def create_webhook_app(bot_controller_instance):
                     processed_ok = _run_async(
                         payment_processor(bot, metadata), timeout=180
                     )
+                    if reserved_payment_id:
+                        finalized = finalize_reserved_transaction(
+                            reserved_payment_id,
+                            success=bool(processed_ok),
+                            metadata=metadata,
+                            payment_method="CryptoBot",
+                            amount_currency=cb_amount,
+                            currency_name=currency_name,
+                        )
+                        reserved_payment_id = None
+                        if not finalized:
+                            logger.error(
+                                "CryptoBot webhook: failed to finalize reserved transaction %s after processing=%s",
+                                payment_id,
+                                processed_ok,
+                            )
                     if processed_ok:
                         if external_invoice_id:
                             _set_webhook_processed(
@@ -2429,6 +2796,16 @@ def create_webhook_app(bot_controller_instance):
                         )
                         return "Service Unavailable", 503
                 else:
+                    if reserved_payment_id:
+                        finalize_reserved_transaction(
+                            reserved_payment_id,
+                            success=False,
+                            metadata=metadata,
+                            payment_method="CryptoBot",
+                            amount_currency=cb_amount,
+                            currency_name=currency_name,
+                        )
+                        reserved_payment_id = None
                     logger.error(
                         "cryptobot Webhook: Could not process payment because bot or event loop is not running. Will retry."
                     )
@@ -2437,22 +2814,28 @@ def create_webhook_app(bot_controller_instance):
             return "OK", 200
 
         except Exception as e:
+            if reserved_payment_id:
+                finalize_reserved_transaction(
+                    reserved_payment_id, success=False, payment_method="CryptoBot"
+                )
             logger.error(f"Error in cryptobot webhook handler: {e}", exc_info=True)
             return "Error", 500
 
     @flask_app.route("/cryptobot-webhook", methods=["POST"])
     def cryptobot_webhook_handler():
-        configured_secret = get_setting("cryptobot_webhook_secret")
-        if configured_secret:
-            logger.warning(
-                "CryptoBot Webhook: Secret is configured; use /cryptobot-webhook/<token>."
-            )
-            return "Forbidden", 403
-        return _cryptobot_webhook_handler_impl(secret_token=None)
+        if get_setting("cryptobot_token"):
+            return _cryptobot_webhook_handler_impl()
+        return "Forbidden", 403
 
     @flask_app.route("/cryptobot-webhook/<token>", methods=["POST"])
     def cryptobot_webhook_handler_with_token(token: str):
-        return _cryptobot_webhook_handler_impl(secret_token=token)
+        configured_secret = get_setting("cryptobot_webhook_secret")
+        if configured_secret and compare_digest(str(token), str(configured_secret)):
+            logger.warning(
+                "CryptoBot Webhook: path-based secret is deprecated but temporarily accepted."
+            )
+            return _cryptobot_webhook_handler_impl()
+        return "Forbidden", 403
 
     @flask_app.route("/settings/toggle_global_plans", methods=["POST"])
     @login_required

@@ -72,10 +72,15 @@
 							</form>
 							{% else %}
 							<p class="status-stopped"><strong>Остановлен</strong></p>
+							{% if support_settings_ok %}
 							<form action="{{ url_for('start_support_bot_route') }}" method="post">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<button type="submit" class="button button-start button-small">Старт</button>
 							</form>
+							{% else %}
+							<button class="button button-disabled button-small" disabled
+								title="Заполните токен Support-бота и ID группы поддержки">Старт</button>
+							{% endif %}
 							{% endif %}
 						</div>
 					</div>

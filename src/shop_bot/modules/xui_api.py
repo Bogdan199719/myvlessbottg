@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 # Error rate limiting: track last error per host to avoid log spam
 _host_error_cache: dict[str, tuple[str, float]] = {}
 _ERROR_LOG_INTERVAL = 300  # Log same error once per 5 minutes
+_XUI_LOGIN_ATTEMPTS = 3
+_XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
+_TRANSIENT_NETWORK_ERROR_MARKERS = (
+    "connection aborted",
+    "connection reset",
+    "connect timeout",
+    "max retries exceeded",
+    "name or service not known",
+    "nameresolutionerror",
+    "network is unreachable",
+    "read timed out",
+    "temporary failure in name resolution",
+    "timed out",
+)
 
 COUNTRY_FLAGS = {
     "🇱🇻": ["latvia", "latvija", "riga", "рига", "latvian"],
@@ -117,33 +131,58 @@ def _log_host_error(host_url: str, error: Exception) -> None:
         logger.error(f"Error connecting to '{host_url}': {error_msg}", exc_info=True)
 
 
+def _is_transient_network_error(error: Exception) -> bool:
+    error_type = type(error).__name__.lower()
+    error_msg = str(error).lower()
+
+    if any(token in error_type for token in ("connection", "timeout")):
+        return True
+
+    return any(marker in error_msg for marker in _TRANSIENT_NETWORK_ERROR_MARKERS)
+
+
 def login_to_host(
     host_url: str, username: str, password: str, inbound_id: int
 ) -> tuple[Api | None, Inbound | None]:
-    try:
-        host_url = host_url.rstrip("/")
-        api = Api(host=host_url, username=username, password=password)
-        api.login()
-        inbounds: List[Inbound] = api.inbound.get_list()
-        target_inbound = next(
-            (inbound for inbound in inbounds if inbound.id == inbound_id), None
-        )
+    host_url = host_url.rstrip("/")
 
-        if target_inbound is None:
-            logger.error(
-                f"Inbound with ID '{inbound_id}' not found on host '{host_url}'"
+    for attempt in range(1, _XUI_LOGIN_ATTEMPTS + 1):
+        try:
+            api = Api(host=host_url, username=username, password=password)
+            api.login()
+            inbounds: List[Inbound] = api.inbound.get_list()
+            target_inbound = next(
+                (inbound for inbound in inbounds if inbound.id == inbound_id), None
             )
-            return api, None
-        return api, target_inbound
-    except ValueError as ve:
-        logger.error(f"Configuration error for host '{host_url}': {ve}")
-        return None, None
-    except ConnectionError as ce:
-        _log_host_error(host_url, ce)
-        return None, None
-    except Exception as e:
-        _log_host_error(host_url, e)
-        return None, None
+
+            if target_inbound is None:
+                logger.error(
+                    f"Inbound with ID '{inbound_id}' not found on host '{host_url}'"
+                )
+                return api, None
+            return api, target_inbound
+        except ValueError as ve:
+            logger.error(f"Configuration error for host '{host_url}': {ve}")
+            return None, None
+        except Exception as e:
+            is_retryable = _is_transient_network_error(e)
+            if is_retryable and attempt < _XUI_LOGIN_ATTEMPTS:
+                delay = _XUI_LOGIN_RETRY_DELAYS_SECONDS[attempt - 1]
+                logger.warning(
+                    "Transient XUI login error for '%s' on attempt %s/%s: %s. Retrying in %ss.",
+                    host_url,
+                    attempt,
+                    _XUI_LOGIN_ATTEMPTS,
+                    e,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+
+            _log_host_error(host_url, e)
+            return None, None
+
+    return None, None
 
 
 def _get_stream_network_security(inbound: Inbound) -> tuple[str, str]:
@@ -176,6 +215,63 @@ def _set_unlimited_traffic_fields(client: Client) -> bool:
             continue
 
     return changed
+
+
+def _set_client_enabled_state(
+    api: Api, inbound_id: int, email: str, enabled: bool
+) -> bool:
+    """Best-effort single-client enable toggle via inbound.update."""
+    try:
+        inbound_fresh = api.inbound.get_by_id(inbound_id)
+        if not inbound_fresh:
+            return False
+        if inbound_fresh.settings.clients is None:
+            inbound_fresh.settings.clients = []
+
+        for client in inbound_fresh.settings.clients:
+            if getattr(client, "email", None) != email:
+                continue
+            if bool(getattr(client, "enable", True)) == enabled:
+                return True
+            client.enable = enabled
+            api.inbound.update(inbound_id, inbound_fresh)
+            return True
+    except Exception as e:
+        logger.warning(
+            "Could not set enable=%s for client '%s' on inbound %s: %s",
+            enabled,
+            email,
+            inbound_id,
+            e,
+        )
+    return False
+
+
+def _refresh_reactivated_client_visual_state(
+    api: Api, inbound_id: int, email: str
+) -> None:
+    """
+    Some 3x-ui builds keep a stale red "depleted/exhausted" badge in clientTraffics
+    after an expired client is renewed. Mimic the manual disable/enable fix.
+    """
+    try:
+        _set_client_enabled_state(api, inbound_id, email, False)
+        time.sleep(0.15)
+        _set_client_enabled_state(api, inbound_id, email, True)
+        time.sleep(0.15)
+        api.client.reset_stats(inbound_id, email)
+        logger.debug(
+            "Refreshed visual exhausted-state for reactivated client '%s' on inbound %s",
+            email,
+            inbound_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not refresh visual exhausted-state for '%s' on inbound %s: %s",
+            email,
+            inbound_id,
+            e,
+        )
 
 
 def get_connection_string(
@@ -444,11 +540,16 @@ def update_or_create_client_on_panel(
 
             new_expiry_ms = time_utils.get_timestamp_ms(new_expiry_dt)
 
+        current_ts_ms = time_utils.get_timestamp_ms(time_utils.get_msk_now())
+        should_enable_client = new_expiry_ms > current_ts_ms
+
         if client_index != -1:
             # Update existing client
             client_to_update = inbound_to_modify.settings.clients[client_index]
+            previous_expiry_ms = int(getattr(client_to_update, "expiry_time", 0) or 0)
+            previous_enabled = bool(getattr(client_to_update, "enable", True))
             client_to_update.expiry_time = new_expiry_ms
-            client_to_update.enable = True
+            client_to_update.enable = should_enable_client
 
             # Update flow ONLY if we determined a specific one is required (like Reality Vision)
             # Or if it's explicitly NOT vision anymore (e.g. switched to grpc) we might want to clear it?
@@ -470,35 +571,34 @@ def update_or_create_client_on_panel(
 
             client_uuid = client_to_update.id
             try:
-                # Prefer direct client update endpoint for existing users.
-                # It tends to refresh panel runtime state more reliably than full inbound rewrite.
-                api.client.update(client_uuid, client_to_update)
+                # Update the already-loaded inbound as the primary path.
+                # This is more stable on panels that intermittently reject direct client.update
+                # with "record not found" for otherwise valid existing clients.
+                api.inbound.update(inbound_id, inbound_to_modify)
                 logger.info(
                     f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}"
                 )
-            except Exception as update_error:
-                if not _is_record_not_found_error(update_error):
+            except Exception as inbound_update_error:
+                if not _is_record_not_found_error(inbound_update_error):
                     raise
 
-                # Some panels intermittently return "record not found" on direct update.
-                # Retry via full inbound update before recreate fallback.
                 logger.warning(
-                    f"Client '{email}' update failed with 'record not found' on inbound {inbound_id}. "
-                    "Trying inbound.update fallback."
+                    f"Client '{email}' inbound.update failed with 'record not found' on inbound {inbound_id}. "
+                    "Trying client.update fallback."
                 )
                 try:
-                    api.inbound.update(inbound_id, inbound_to_modify)
+                    api.client.update(client_uuid, client_to_update)
                     logger.info(
                         f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id} "
-                        "via inbound.update fallback."
+                        "via client.update fallback."
                     )
-                except Exception as inbound_update_error:
-                    if not _is_record_not_found_error(inbound_update_error):
+                except Exception as update_error:
+                    if not _is_record_not_found_error(update_error):
                         raise
 
                     # Panel can keep a stale reference in clients list; final fallback is safe recreate.
                     logger.warning(
-                        f"Client '{email}' inbound.update fallback also failed with 'record not found' "
+                        f"Client '{email}' client.update fallback also failed with 'record not found' "
                         f"on inbound {inbound_id}. Trying recreate fallback."
                     )
                     client_uuid = str(uuid.uuid4())
@@ -506,7 +606,7 @@ def update_or_create_client_on_panel(
                     recreated_client = Client(
                         id=client_uuid,
                         email=email,
-                        enable=True,
+                        enable=should_enable_client,
                         flow=target_flow,
                         expiry_time=new_expiry_ms,
                         sub_id=subscription_id,
@@ -532,6 +632,12 @@ def update_or_create_client_on_panel(
                     f"Could not reset traffic stats for '{email}': {rst_err}"
                 )
 
+            reactivated_from_expired = should_enable_client and (
+                previous_expiry_ms <= current_ts_ms or not previous_enabled
+            )
+            if reactivated_from_expired:
+                _refresh_reactivated_client_visual_state(api, inbound_id, email)
+
         else:
             client_uuid = str(uuid.uuid4())
             subscription_id = uuid.uuid4().hex[:16]
@@ -539,7 +645,7 @@ def update_or_create_client_on_panel(
             new_client = Client(
                 id=client_uuid,
                 email=email,
-                enable=True,
+                enable=should_enable_client,
                 flow=target_flow,
                 expiry_time=new_expiry_ms,
                 sub_id=subscription_id,
@@ -1122,12 +1228,21 @@ def _sync_clients_state_on_host_sync(
         }
 
         any_changed = False
-        # Track clients being re-enabled (disabled→enabled) so we can reset their
-        # traffic stats afterwards. 3x-ui sets clientTraffics.enable=0 when it
-        # auto-disables a client (expiry or traffic exhaustion), which shows as
-        # "исчерпано" in the panel UI. The only reliable way to clear this flag is
-        # to call resetClientTraffic, which sets enable=1 directly in that table.
-        emails_to_reset_stats: list[str] = []
+        # Track clients whose clientTraffics row must be normalized after the
+        # inbound update. In 3x-ui the panel can leave clientTraffics.enable=0
+        # after auto-expiry/traffic events, which renders as "исчерпано" even when
+        # DB state says the account should simply be disabled or active again.
+        #
+        # We therefore reset stats in two cases:
+        # - target_enabled=True and the record changed (renew, re-enable, cap fix)
+        # - target_enabled=False and we are disabling the client from DB state
+        #
+        # resetClientTraffic flips that stale traffic-state flag back to enabled in
+        # clientTraffics, while the real access state remains controlled by
+        # client.enable from inbound.update.
+        emails_to_reset_stats: set[str] = set()
+        reactivated_emails: set[str] = set()
+        now_ms = time_utils.get_timestamp_ms(time_utils.get_msk_now())
 
         for email, state in desired_by_email.items():
             result["checked"] += 1
@@ -1139,14 +1254,11 @@ def _sync_clients_state_on_host_sync(
             changed = False
 
             target_enabled = bool(state.get("enabled", True))
-            was_disabled = not bool(getattr(client, "enable", True))
-            if was_disabled != (not target_enabled):
+            was_enabled = bool(getattr(client, "enable", True))
+            enable_state_changed = was_enabled != target_enabled
+            if enable_state_changed:
                 client.enable = target_enabled
                 changed = True
-                # Client is transitioning disabled→enabled: schedule stats reset to
-                # clear the "исчерпано" badge that 3x-ui sets in clientTraffics.
-                if target_enabled and was_disabled:
-                    emails_to_reset_stats.append(email)
 
             target_expiry_ms = state.get("expiry_timestamp_ms")
             if target_expiry_ms is not None:
@@ -1163,6 +1275,19 @@ def _sync_clients_state_on_host_sync(
                 if _set_unlimited_traffic_fields(client):
                     changed = True
 
+            if target_enabled:
+                # Renewals can keep client.enable=true while only expiry/caps change.
+                # In that case 3x-ui may still show a stale exhausted badge until
+                # resetClientTraffic is called explicitly.
+                if changed:
+                    emails_to_reset_stats.add(email)
+                    if current_expiry_ms <= now_ms or not was_enabled:
+                        reactivated_emails.add(email)
+            elif enable_state_changed:
+                # When DB marks a key expired we want the host to show it as disabled,
+                # not as traffic-exhausted due to a stale clientTraffics flag.
+                emails_to_reset_stats.add(email)
+
             if changed:
                 result["updated"] += 1
                 any_changed = True
@@ -1172,13 +1297,13 @@ def _sync_clients_state_on_host_sync(
         if any_changed:
             api.inbound.update(inbound.id, inbound_to_modify)
 
-        # Reset traffic stats for re-enabled clients so 3x-ui clears "исчерпано".
-        # Done after inbound.update so the panel has the new enable=true state first.
+        # Reset traffic stats after inbound.update so 3x-ui clears stale
+        # "исчерпано" state from clientTraffics for both renewals and expiries.
         for email in emails_to_reset_stats:
             try:
                 api.client.reset_stats(inbound.id, email)
                 logger.debug(
-                    "Cleared 'exhausted' state for re-enabled client '%s' on host '%s'.",
+                    "Normalized traffic state for client '%s' on host '%s'.",
                     email,
                     host_name,
                 )
@@ -1189,6 +1314,9 @@ def _sync_clients_state_on_host_sync(
                     host_name,
                     rst_err,
                 )
+
+        for email in reactivated_emails:
+            _refresh_reactivated_client_visual_state(api, inbound.id, email)
 
         return result
 
