@@ -101,9 +101,8 @@ async def send_subscription_notification(
             callback_data = "buy_new_key"
 
         builder = InlineKeyboardBuilder()
-        builder.button(text="🔑 Мои ключи", callback_data="manage_keys")
         builder.button(text=btn_text, callback_data=callback_data)
-        builder.adjust(2)
+        builder.adjust(1)
 
         await bot.send_message(
             chat_id=user_id,
@@ -156,9 +155,8 @@ async def send_global_subscription_notification(
             btn_text = "💳 Купить подписку"
 
         builder = InlineKeyboardBuilder()
-        builder.button(text="🔑 Мои ключи", callback_data="manage_keys")
         builder.button(text=btn_text, callback_data="select_host_new_ALL")
-        builder.adjust(2)
+        builder.adjust(1)
 
         await bot.send_message(
             chat_id=user_id,

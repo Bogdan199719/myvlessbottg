@@ -190,6 +190,13 @@ def create_skip_email_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def create_email_required_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data="back_to_payment_methods")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def create_payment_method_keyboard(
     payment_methods: dict, action: str, key_id: int
 ) -> InlineKeyboardMarkup:
@@ -350,8 +357,8 @@ def create_unified_keys_keyboard(
 
     if trial_keys_count > 0:
         builder.button(
-            text=f"🎁 Пробный период VPN ({trial_keys_count})",
-            callback_data="show_trial_keys",
+            text="🌍 Моя VPN подписка",
+            callback_data="show_global_info",
         )
 
     builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
@@ -364,8 +371,8 @@ def create_trial_only_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
-        text=f"🎁 Пробный период VPN ({trial_keys_count})",
-        callback_data="show_trial_keys",
+        text="🌍 Моя VPN подписка",
+        callback_data="show_global_info",
         style="primary",
     )
     if mtg_keys_count > 0:
@@ -442,9 +449,6 @@ def create_global_info_keyboard(subscription_token: str) -> InlineKeyboardMarkup
     )
     builder.button(text="📱 QR-код", callback_data=f"global_qr_{subscription_token}")
     builder.button(text="📖 Инструкция", callback_data="global_howto")
-    builder.button(
-        text="📋 Список ключей (подробно)", callback_data="show_keys_detailed"
-    )
     builder.button(text="← Назад", callback_data="manage_keys")
     builder.adjust(1)
     return builder.as_markup()

@@ -274,6 +274,24 @@ def _refresh_reactivated_client_visual_state(
         )
 
 
+def _normalize_client_traffic_state(api: Api, inbound_id: int, email: str) -> bool:
+    """Clear stale 3x-ui clientTraffics state for one client."""
+    try:
+        api.client.reset_stats(inbound_id, email)
+        logger.debug(
+            "Traffic state reset for client '%s' on inbound %s", email, inbound_id
+        )
+        return True
+    except Exception as rst_err:
+        logger.warning(
+            "Could not reset traffic stats for client '%s' on inbound %s: %s",
+            email,
+            inbound_id,
+            rst_err,
+        )
+        return False
+
+
 def get_connection_string(
     inbound: Inbound, user_uuid: str, host_url: str, remark: str
 ) -> str | None:
@@ -620,21 +638,12 @@ def update_or_create_client_on_panel(
                         f"Recreated client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}"
                     )
 
-            # Reset traffic counters so the 3x-ui panel no longer shows "exhausted" (исчерпано).
-            # This is a best-effort call: if it fails the key is still functional.
-            try:
-                api.client.reset_stats(inbound_id, email)
-                logger.debug(
-                    f"Traffic stats reset for '{email}' on inbound {inbound_id}"
-                )
-            except Exception as rst_err:
-                logger.warning(
-                    f"Could not reset traffic stats for '{email}': {rst_err}"
-                )
-
             reactivated_from_expired = should_enable_client and (
                 previous_expiry_ms <= current_ts_ms or not previous_enabled
             )
+            # Reset traffic counters/state so 3x-ui no longer shows a stale
+            # "exhausted" (исчерпано) badge after a renewal.
+            _normalize_client_traffic_state(api, inbound_id, email)
             if reactivated_from_expired:
                 _refresh_reactivated_client_visual_state(api, inbound_id, email)
 
@@ -1300,20 +1309,7 @@ def _sync_clients_state_on_host_sync(
         # Reset traffic stats after inbound.update so 3x-ui clears stale
         # "исчерпано" state from clientTraffics for both renewals and expiries.
         for email in emails_to_reset_stats:
-            try:
-                api.client.reset_stats(inbound.id, email)
-                logger.debug(
-                    "Normalized traffic state for client '%s' on host '%s'.",
-                    email,
-                    host_name,
-                )
-            except Exception as rst_err:
-                logger.warning(
-                    "Could not reset traffic stats for '%s' on host '%s': %s",
-                    email,
-                    host_name,
-                    rst_err,
-                )
+            _normalize_client_traffic_state(api, inbound.id, email)
 
         for email in reactivated_emails:
             _refresh_reactivated_client_visual_state(api, inbound.id, email)
