@@ -19,14 +19,45 @@ main_reply_keyboard = ReplyKeyboardMarkup(
 )
 
 
+def _has_paid_vpn_subscription(user_keys: list) -> bool:
+    for key in user_keys or []:
+        if str(key.get("service_type") or "xui").lower() == "mtg":
+            continue
+        try:
+            plan_id = int(key.get("plan_id") or 0)
+        except (TypeError, ValueError):
+            plan_id = 0
+        if plan_id > 0:
+            return True
+    return False
+
+
+def build_happ_redirect_url(subscription_token: str | None) -> str | None:
+    domain = (get_setting("domain") or "").strip()
+    token = (subscription_token or "").strip()
+    if not domain or not token:
+        return None
+    if not domain.startswith(("http://", "https://")):
+        domain = f"https://{domain}"
+    return f"{domain.rstrip('/')}/happ/{token}"
+
+
 def create_main_menu_keyboard(
     user_keys: list, trial_available: bool, is_admin: bool
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.button(
-        text="💳 Купить VPN подписку", callback_data="buy_subscription", style="primary"
+        text="👑 Купить подписку", callback_data="buy_subscription", style="primary"
     )
+
+    has_paid_vpn_subscription = _has_paid_vpn_subscription(user_keys)
+    if has_paid_vpn_subscription:
+        builder.button(
+            text="🥂 Продлить подписку",
+            callback_data="select_host_new_ALL",
+            style="success",
+        )
 
     mtg_hosts_available = bool(get_all_mtg_hosts(only_enabled=True))
     if mtg_hosts_available:
@@ -39,8 +70,11 @@ def create_main_menu_keyboard(
             text="🎁 Попробовать бесплатно", callback_data="get_trial", style="success"
         )
 
-    builder.button(text="👤 Мой профиль", callback_data="show_profile")
-    builder.button(text="📦 Мои подписки", callback_data="manage_keys")
+    promo_codes_enabled = str(get_setting("enable_promo_codes") or "true").lower() == "true"
+    if promo_codes_enabled:
+        builder.button(text="🎟 Промокод", callback_data="enter_promo_code")
+    builder.button(text="🪪 Мой профиль", callback_data="show_profile")
+    builder.button(text="✨ Мои подписки", callback_data="manage_keys")
 
     referral_enabled = str(get_setting("enable_referrals")).lower() == "true"
     if referral_enabled:
@@ -48,22 +82,29 @@ def create_main_menu_keyboard(
             text="🤝 Реферальная программа", callback_data="show_referral_program"
         )
 
-    builder.button(text="📖 Инструкция", callback_data="howto_vless")
-    builder.button(text="🆘 Поддержка", callback_data="show_help")
-    builder.button(text="ℹ️ О проекте", callback_data="show_about")
+    builder.button(text="👩‍🏫 Инструкция", callback_data="howto_vless")
+    builder.button(text="🧚‍♀️ Поддержка", callback_data="show_help")
+    about_enabled = str(get_setting("show_about_menu_item") or "true").lower() != "false"
+    if about_enabled:
+        builder.button(text="ℹ️ О проекте", callback_data="show_about")
     if is_admin:
         builder.button(text="📢 Рассылка", callback_data="start_broadcast")
 
     layout = [1]
+    if has_paid_vpn_subscription:
+        layout.append(1)
     if mtg_hosts_available:
         layout.append(1)
     if trial_available and get_setting("trial_enabled") == "true":
         layout.append(1)
+    if promo_codes_enabled:
+        layout.append(1)  # Promo code
     layout.append(2)  # Profile + Keys
     if referral_enabled:
         layout.append(1)
     layout.append(2)  # Инструкция + Поддержка
-    layout.append(1)  # О проекте
+    if about_enabled:
+        layout.append(1)  # О проекте
     if is_admin:
         layout.append(1)
     builder.adjust(*layout)
@@ -197,24 +238,30 @@ def create_email_required_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def create_saved_email_keyboard(has_fallback_email: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="💳 Оплатить", callback_data="use_saved_receipt_email", style="primary"
+    )
+    builder.button(text="✏️ Изменить email", callback_data="change_receipt_email")
+    if has_fallback_email:
+        builder.button(text="➡️ Продолжить без почты", callback_data="skip_email")
+    builder.button(text="← Назад", callback_data="back_to_payment_methods")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def create_payment_method_keyboard(
     payment_methods: dict, action: str, key_id: int
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     if payment_methods and payment_methods.get("yookassa"):
-        if str(get_setting("sbp_enabled")).lower() == "true":
-            builder.button(
-                text="🏦 СБП / Банковская карта",
-                callback_data="pay_yookassa",
-                style="primary",
-            )
-        else:
-            builder.button(
-                text="🏦 Банковская карта",
-                callback_data="pay_yookassa",
-                style="primary",
-            )
+        builder.button(
+            text="💳 Оплата по СБП / ЮKassa",
+            callback_data="pay_yookassa",
+            style="primary",
+        )
     if payment_methods and payment_methods.get("stars"):
         builder.button(
             text="⭐ Telegram Stars", callback_data="pay_stars", style="primary"
@@ -307,6 +354,13 @@ def create_global_link_keyboard(
     subscription_link: str, subscription_token: str
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    happ_url = build_happ_redirect_url(subscription_token)
+    if happ_url:
+        builder.button(
+            text="🔌 Подключить в Happ",
+            url=happ_url,
+            style="success",
+        )
     builder.row(
         InlineKeyboardButton(
             text="📋 Скопировать ссылку",
@@ -323,13 +377,20 @@ def create_global_link_keyboard(
 
 def create_global_sub_keyboard(subscription_token: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    happ_url = build_happ_redirect_url(subscription_token)
+    if happ_url:
+        builder.button(
+            text="🔌 Подключить в Happ",
+            url=happ_url,
+            style="success",
+        )
     builder.button(
         text="➕ Продлить подписку",
         callback_data="select_host_new_ALL",
         style="success",
     )
     builder.button(
-        text="🔗 Ссылка VPN подписки",
+        text="🔗 Ссылка подписки",
         callback_data=f"global_link_{subscription_token}",
         style="primary",
     )
@@ -345,7 +406,7 @@ def create_unified_keys_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
-        text="🌍 Моя VPN подписка", callback_data="show_global_info", style="primary"
+        text="🌍 Моя подписка", callback_data="show_global_info", style="primary"
     )
 
     if mtg_keys_count > 0:
@@ -357,7 +418,7 @@ def create_unified_keys_keyboard(
 
     if trial_keys_count > 0:
         builder.button(
-            text="🌍 Моя VPN подписка",
+            text="🌍 Моя подписка",
             callback_data="show_global_info",
         )
 
@@ -371,7 +432,7 @@ def create_trial_only_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
-        text="🌍 Моя VPN подписка",
+        text="🌍 Моя подписка",
         callback_data="show_global_info",
         style="primary",
     )
@@ -437,13 +498,20 @@ def create_proxy_keys_keyboard(mtg_keys: list) -> InlineKeyboardMarkup:
 
 def create_global_info_keyboard(subscription_token: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    happ_url = build_happ_redirect_url(subscription_token)
+    if happ_url:
+        builder.button(
+            text="🔌 Подключить в Happ",
+            url=happ_url,
+            style="success",
+        )
     builder.button(
         text="➕ Продлить подписку",
         callback_data="select_host_new_ALL",
         style="success",
     )
     builder.button(
-        text="🔗 Ссылка VPN подписки",
+        text="🔗 Ссылка подписки",
         callback_data=f"global_link_{subscription_token}",
         style="primary",
     )

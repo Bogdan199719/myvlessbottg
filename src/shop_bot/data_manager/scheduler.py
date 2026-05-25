@@ -8,19 +8,23 @@ from shop_bot.utils import time_utils
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError
+from yookassa import Configuration, Payment
 
 from shop_bot.bot_controller import BotController
 from shop_bot.data_manager import database
 from shop_bot.data_manager.database import host_slug as _host_slug
 from shop_bot.modules import xui_api
 from shop_bot.modules import mtg_api
-from shop_bot.bot import keyboards
+from shop_bot.bot import handlers, keyboards
 
 CHECK_INTERVAL_SECONDS = 60
-PAID_NOTIFY_HOURS = {24, 1, 0}
-TRIAL_NOTIFY_HOURS = {1, 0}
+PAID_NOTIFY_HOURS = {24, 1, 0, -24}
+TRIAL_NOTIFY_HOURS = {1, 0, -24}
 
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
+_HOST_FAILURE_BACKOFF_SECONDS = 15 * 60
+_host_failure_backoff: dict[str, float] = {}
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,34 @@ def _provision_timeout_seconds() -> int:
     return max(10, min(timeout, 180))
 
 
+def _is_host_in_failure_backoff(host_name: str) -> bool:
+    retry_at = _host_failure_backoff.get(host_name)
+    if not retry_at:
+        return False
+    if time.monotonic() >= retry_at:
+        _host_failure_backoff.pop(host_name, None)
+        return False
+    return True
+
+
+def _mark_host_failure(host_name: str, reason: str) -> None:
+    was_in_backoff = _is_host_in_failure_backoff(host_name)
+    _host_failure_backoff[host_name] = (
+        time.monotonic() + _HOST_FAILURE_BACKOFF_SECONDS
+    )
+    if not was_in_backoff:
+        logger.warning(
+            "Scheduler: Host '%s' temporarily backed off for %s seconds after failure: %s",
+            host_name,
+            _HOST_FAILURE_BACKOFF_SECONDS,
+            reason,
+        )
+
+
+def _mark_host_success(host_name: str) -> None:
+    _host_failure_backoff.pop(host_name, None)
+
+
 def format_time_left(hours: int) -> str:
     if hours >= 24:
         days = hours // 24
@@ -60,6 +92,13 @@ def format_time_left(hours: int) -> str:
             return f"{hours} часов"
 
 
+def _notification_type_for_expiry_cycle(
+    base_type: str, expiry_date: datetime
+) -> str:
+    expiry_ms = time_utils.get_timestamp_ms(expiry_date)
+    return f"{base_type}:{expiry_ms}"
+
+
 async def send_subscription_notification(
     bot: Bot,
     user_id: int,
@@ -74,26 +113,26 @@ async def send_subscription_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ **Внимание!** ⚠️\n\n"
-                f"Срок действия вашей подписки истекает через **{time_text}**.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
-                f"Продлите подписку, чтобы не остаться без доступа к VPN!"
+                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
+                f"Срок действия вашей подписки истекает через <b>{time_text}</b>.\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
+                f"Продлите подписку, чтобы не остаться без доступа!"
             )
             btn_text = "➕ Продлить ключ"
             # If trial, direct to new purchase flow as requested
             callback_data = "buy_new_key" if is_trial else f"extend_key_{key_id}"
         elif time_left_hours == 0:
             message = (
-                f"❌ **Срок действия вашей подписки истек!**\n\n"
-                f"Ваш доступ к VPN на сервере временно ограничен.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
+                f"❌ <b>Срок действия вашей подписки истек!</b>\n\n"
+                f"Ваш доступ к серверу временно ограничен.\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
                 "Продлите подписку прямо сейчас, чтобы восстановить соединение!"
             )
             btn_text = "➕ Восстановить доступ"
             callback_data = "buy_new_key" if is_trial else f"extend_key_{key_id}"
         else:  # -24 follow-up
             message = (
-                f"👋 **Мы скучаем!**\n\n"
+                f"👋 <b>Мы скучаем!</b>\n\n"
                 f"Заметили, что вы не продлили подписку, которая истекла вчера ({expiry_str}).\n\n"
                 f"Если у вас возникли трудности с оплатой или настройкой — напишите в нашу поддержку, мы обязательно поможем!"
             )
@@ -108,10 +147,15 @@ async def send_subscription_notification(
             chat_id=user_id,
             text=message,
             reply_markup=builder.as_markup(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         logger.info(
             f"Sent subscription notification to user {user_id} for key {key_id} ({time_left_hours} hours left, trial={is_trial})."
+        )
+        return True
+    except TelegramForbiddenError as e:
+        logger.warning(
+            f"Cannot send subscription notification to user {user_id}: {e}. Marking as handled."
         )
         return True
     except Exception as e:
@@ -132,23 +176,23 @@ async def send_global_subscription_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ **Внимание!** ⚠️\n\n"
-                f"Срок действия вашей **глобальной подписки** (на {hosts_count} сервер(ов)) истекает через **{time_text}**.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
-                f"Продлите подписку, чтобы не остаться без доступа к VPN!"
+                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
+                f"Срок действия вашей <b>глобальной подписки</b> (на {hosts_count} сервер(ов)) истекает через <b>{time_text}</b>.\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
+                f"Продлите подписку, чтобы не остаться без доступа!"
             )
             btn_text = "➕ Продлить подписку"
         elif time_left_hours == 0:
             message = (
-                f"❌ **Ваша глобальная подписка истекла!**\n\n"
+                f"❌ <b>Ваша глобальная подписка истекла!</b>\n\n"
                 f"Ваш доступ ко всем серверам ({hosts_count} шт.) ограничен.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
                 "Продлите подписку, чтобы вернуть доступ сразу ко всем серверам!"
             )
             btn_text = "➕ Восстановить доступ"
         else:  # -24 follow-up
             message = (
-                f"👋 **Мы скучаем!**\n\n"
+                f"👋 <b>Мы скучаем!</b>\n\n"
                 f"Заметили, что вы не продлили вашу глобальную подписку, которая истекла вчера ({expiry_str}).\n\n"
                 f"Если у вас возникли трудности — наша поддержка всегда на связи!"
             )
@@ -162,10 +206,15 @@ async def send_global_subscription_notification(
             chat_id=user_id,
             text=message,
             reply_markup=builder.as_markup(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         logger.info(
             f"Sent GLOBAL subscription notification to user {user_id} ({hosts_count} hosts, {time_left_hours} hours left)."
+        )
+        return True
+    except TelegramForbiddenError as e:
+        logger.warning(
+            f"Cannot send GLOBAL subscription notification to user {user_id}: {e}. Marking as handled."
         )
         return True
     except Exception as e:
@@ -184,25 +233,25 @@ async def send_proxy_expiry_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ **Внимание!** ⚠️\n\n"
-                f"Срок действия вашего **Telegram-прокси** истекает через **{time_text}**.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
+                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
+                f"Срок действия вашего <b>Telegram-прокси</b> истекает через <b>{time_text}</b>.\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
                 f"Продлите прокси, чтобы не остаться без доступа к Telegram!"
             )
             btn_text = "➕ Продлить прокси"
             callback_data = f"extend_key_{key_id}"
         elif time_left_hours == 0:
             message = (
-                f"❌ **Срок действия вашего Telegram-прокси истёк!**\n\n"
+                f"❌ <b>Срок действия вашего Telegram-прокси истёк!</b>\n\n"
                 f"Прокси временно отключён.\n"
-                f"Дата окончания: **{expiry_str}**\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>\n\n"
                 "Продлите прокси, чтобы восстановить доступ!"
             )
             btn_text = "➕ Активировать прокси"
             callback_data = f"extend_key_{key_id}"
         else:  # -24 follow-up
             message = (
-                f"👋 **Мы скучаем!**\n\n"
+                f"👋 <b>Мы скучаем!</b>\n\n"
                 f"Заметили, что вы не продлили прокси, который истёк вчера ({expiry_str}).\n\n"
                 f"Если у вас возникли трудности — напишите в нашу поддержку, мы поможем!"
             )
@@ -218,10 +267,15 @@ async def send_proxy_expiry_notification(
             chat_id=user_id,
             text=message,
             reply_markup=builder.as_markup(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         logger.info(
             f"Sent proxy expiry notification to user {user_id} for key {key_id} ({time_left_hours} hours left)."
+        )
+        return True
+    except TelegramForbiddenError as e:
+        logger.warning(
+            f"Cannot send proxy expiry notification to user {user_id}: {e}. Marking as handled."
         )
         return True
     except Exception as e:
@@ -246,7 +300,10 @@ async def _process_notification(
     # Check regular expiry
     for hours_mark in marks:
         if hours_mark - 1 < total_hours_left <= hours_mark:
-            notification_type = "global_expiry" if key_id is None else "expiry"
+            base_notification_type = "global_expiry" if key_id is None else "expiry"
+            notification_type = _notification_type_for_expiry_cycle(
+                base_notification_type, expiry_date
+            )
 
             already_sent = await asyncio.to_thread(
                 database.is_notification_sent,
@@ -256,6 +313,24 @@ async def _process_notification(
                 hours_mark,
             )
             if already_sent:
+                return True
+
+            legacy_sent = await asyncio.to_thread(
+                database.is_legacy_notification_sent_for_expiry_window,
+                user_id,
+                key_id,
+                base_notification_type,
+                hours_mark,
+                expiry_date,
+            )
+            if legacy_sent:
+                await asyncio.to_thread(
+                    database.mark_notification_sent,
+                    user_id,
+                    key_id,
+                    notification_type,
+                    hours_mark,
+                )
                 return True
 
             if key_id is None:  # Global
@@ -295,16 +370,11 @@ async def _process_notification(
 async def check_expiring_subscriptions(bot: Bot):
     logger.info("Scheduler: Checking for expiring subscriptions...")
     all_keys = await asyncio.to_thread(database.get_all_keys)
+    current_time = time_utils.get_msk_now()
 
     # Determine global plan ids (host_name == 'ALL')
-    global_plan_ids: set[int] = set()
     try:
-        global_plans = await asyncio.to_thread(database.get_plans_for_host, "ALL")
-        for p in global_plans:
-            try:
-                global_plan_ids.add(int(p.get("plan_id")))
-            except Exception:
-                continue
+        global_plan_ids = await asyncio.to_thread(database.get_global_plan_ids)
     except Exception:
         global_plan_ids = set()
 
@@ -314,12 +384,7 @@ async def check_expiring_subscriptions(bot: Bot):
 
     for key in all_keys:
         try:
-            plan_id = key.get("plan_id", 0)
-            if (
-                plan_id is not None
-                and int(plan_id) in global_plan_ids
-                and int(plan_id) > 0
-            ):
+            if database.is_global_xui_key(key, global_plan_ids):
                 global_keys_by_user.setdefault(int(key["user_id"]), []).append(key)
             else:
                 remaining_keys.append(key)
@@ -328,6 +393,7 @@ async def check_expiring_subscriptions(bot: Bot):
 
     # 1. Process GLOBAL notifications
     processed_global_users: set[int] = set()
+    active_global_users: set[int] = set()
     for user_id, keys in global_keys_by_user.items():
         try:
             expiry_dates: list[datetime] = []
@@ -337,6 +403,8 @@ async def check_expiring_subscriptions(bot: Bot):
                 dt = time_utils.parse_iso_to_msk(k["expiry_date"])
                 if dt:
                     expiry_dates.append(dt)
+                    if dt > current_time:
+                        active_global_users.add(user_id)
 
             if not expiry_dates:
                 continue
@@ -356,7 +424,10 @@ async def check_expiring_subscriptions(bot: Bot):
         except Exception as e:
             logger.error(f"Error processing GLOBAL expiry for user {user_id}: {e}")
 
-    # 2. Process Regular & Trial keys (SKIP users already notified globally)
+    # 2. Process Regular, Trial and MTG keys.
+    # If the user has an active global VPN subscription, skip other XUI
+    # reminders for old per-host/trial keys. MTG proxy expiry is a separate
+    # product and still needs its own reminder.
     for key in remaining_keys:
         try:
             if not key.get("expiry_date"):
@@ -368,17 +439,23 @@ async def check_expiring_subscriptions(bot: Bot):
 
             user_id = key["user_id"]
 
-            # Skip users who were already notified via global subscription
-            if user_id in processed_global_users:
-                continue
-
             key_id = key["key_id"]
             plan_id = int(key.get("plan_id", 0) or 0)
             is_trial = plan_id == 0
             service_type = key.get("service_type", "xui")
 
+            if (
+                user_id in active_global_users or user_id in processed_global_users
+            ) and service_type != "mtg":
+                continue
+
             await _process_notification(
-                bot, user_id, key_id, expiry_date, is_trial, service_type=service_type
+                bot,
+                user_id,
+                key_id,
+                expiry_date,
+                is_trial,
+                service_type=service_type,
             )
 
         except Exception as e:
@@ -401,6 +478,7 @@ async def enforce_clients_state_from_db() -> None:
     total_already_ok = 0
     total_not_found = 0
     total_errors = 0
+    total_traffic_fixed = 0
     total_expired_preserved = 0
 
     now = time_utils.get_msk_now()
@@ -408,6 +486,12 @@ async def enforce_clients_state_from_db() -> None:
     for host in all_hosts:
         host_name = host.get("host_name")
         if not host_name:
+            continue
+        if _is_host_in_failure_backoff(host_name):
+            logger.debug(
+                "Scheduler: Host '%s' is in failure backoff; enforce skipped.",
+                host_name,
+            )
             continue
 
         keys_in_db = await asyncio.to_thread(database.get_keys_for_host, host_name)
@@ -441,18 +525,26 @@ async def enforce_clients_state_from_db() -> None:
             host_result = await xui_api.sync_clients_state_on_host(
                 host_name, desired_by_email
             )
+            if int(host_result.get("errors", 0)) and not int(
+                host_result.get("checked", 0)
+            ):
+                _mark_host_failure(host_name, "client state sync failed")
+            else:
+                _mark_host_success(host_name)
             total_checked += int(host_result.get("checked", 0))
             total_updated += int(host_result.get("updated", 0))
             total_already_ok += int(host_result.get("already_ok", 0))
             total_not_found += int(host_result.get("not_found", 0))
+            total_traffic_fixed += int(host_result.get("traffic_fixed", 0))
             total_errors += int(host_result.get("errors", 0))
 
     logger.info(
-        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s expired_preserved=%s errors=%s",
+        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s traffic_fixed=%s expired_preserved=%s errors=%s",
         total_checked,
         total_updated,
         total_already_ok,
         total_not_found,
+        total_traffic_fixed,
         total_expired_preserved,
         total_errors,
     )
@@ -470,6 +562,12 @@ async def sync_keys_with_panels():
 
     for host in all_hosts:
         host_name = host["host_name"]
+        if _is_host_in_failure_backoff(host_name):
+            logger.debug(
+                "Scheduler: Host '%s' is in failure backoff; sync skipped.",
+                host_name,
+            )
+            continue
 
         try:
             api, inbound = xui_api.login_to_host(
@@ -477,11 +575,14 @@ async def sync_keys_with_panels():
                 username=host["host_username"],
                 password=host["host_pass"],
                 inbound_id=host["host_inbound_id"],
+                api_token=host.get("api_token"),
             )
 
             if not api or not inbound:
+                _mark_host_failure(host_name, "panel sync login/inbound lookup failed")
                 failed_hosts.append(host_name)
                 continue
+            _mark_host_success(host_name)
 
             full_inbound_details = api.inbound.get_by_id(inbound.id)
             if not full_inbound_details or not getattr(
@@ -517,6 +618,7 @@ async def sync_keys_with_panels():
                 server_client = clients_on_server.pop(key_email, None)
 
                 if server_client:
+                    await asyncio.to_thread(database.purge_missing_key, key_email)
                     # Determine country flag based on server name
                     country_flag = xui_api.get_country_flag_by_host(host_name)
                     # Clean server name
@@ -666,15 +768,8 @@ async def auto_provision_new_hosts_for_global_users():
         logger.debug("Scheduler: No regular enabled hosts found.")
         return
 
-    # Get global plan IDs
-    global_plan_ids = set()
     try:
-        global_plans = await asyncio.to_thread(database.get_plans_for_host, "ALL")
-        for p in global_plans:
-            try:
-                global_plan_ids.add(int(p.get("plan_id")))
-            except (ValueError, TypeError):
-                continue
+        global_plan_ids = await asyncio.to_thread(database.get_global_plan_ids)
     except Exception as e:
         logger.error(f"Scheduler: Failed to get global plans: {e}")
         return
@@ -714,12 +809,7 @@ async def auto_provision_new_hosts_for_global_users():
                 try:
                     expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
                     if expiry and expiry > now:
-                        plan_id = k.get("plan_id")
-                        # Check if key belongs to global subscription
-                        is_global = (
-                            plan_id is not None and int(plan_id) in global_plan_ids
-                        )
-                        if is_global:
+                        if database.is_global_xui_key(k, global_plan_ids):
                             active_paid_keys.append(k)
                 except (ValueError, TypeError):
                     continue
@@ -777,6 +867,12 @@ async def auto_provision_new_hosts_for_global_users():
 
             # Provision keys on missing hosts
             for host_name in missing_hosts:
+                if _is_host_in_failure_backoff(host_name):
+                    logger.debug(
+                        "Scheduler: Host '%s' is in failure backoff; auto-provision skipped.",
+                        host_name,
+                    )
+                    continue
                 try:
                     email = f"user{user_id}-global-{_host_slug(host_name)}"
                     logger.info(
@@ -821,22 +917,26 @@ async def auto_provision_new_hosts_for_global_users():
                                 plan_id=first_global_plan_id,
                             )
                         total_keys_created += 1
+                        _mark_host_success(host_name)
                         logger.info(
                             f"Scheduler: Successfully created key for user {user_id} on host '{host_name}'"
                         )
                     else:
+                        _mark_host_failure(host_name, "auto-provision returned no result")
                         logger.error(
                             f"Scheduler: Failed to create key for user {user_id} on host '{host_name}'"
                         )
                         total_errors += 1
 
                 except asyncio.TimeoutError:
+                    _mark_host_failure(host_name, "auto-provision timed out")
                     logger.error(
                         f"Scheduler: Timeout provisioning key for user {user_id} on host '{host_name}' "
                         f"after {provision_timeout}s"
                     )
                     total_errors += 1
                 except Exception as e:
+                    _mark_host_failure(host_name, str(e))
                     logger.error(
                         f"Scheduler: Error provisioning key for user {user_id} on host '{host_name}': {e}"
                     )
@@ -949,6 +1049,220 @@ async def enforce_mtg_proxies_state() -> None:
     logger.debug("Scheduler: MTG proxy state enforce finished.")
 
 
+async def process_pending_yookassa_payments(bot: Bot) -> None:
+    """Safety net for YooKassa webhooks: verify and fulfill paid pending payments."""
+    shop_id = await asyncio.to_thread(database.get_setting, "yookassa_shop_id")
+    secret_key = await asyncio.to_thread(database.get_setting, "yookassa_secret_key")
+    if not shop_id or not secret_key:
+        return
+
+    pending = await asyncio.to_thread(database.get_pending_yookassa_transactions, 20)
+    if not pending:
+        return
+
+    logger.info(
+        "Scheduler: Checking %s pending YooKassa payment(s) via API.", len(pending)
+    )
+
+    Configuration.account_id = shop_id
+    Configuration.secret_key = secret_key
+
+    for tx in pending:
+        payment_id = str(tx.get("payment_id") or "").strip()
+        if not payment_id:
+            continue
+
+        try:
+            payment = await asyncio.to_thread(Payment.find_one, payment_id)
+        except Exception as e:
+            logger.warning(
+                "Scheduler: YooKassa API check failed for payment %s: %s",
+                payment_id,
+                e,
+            )
+            continue
+
+        if not payment or getattr(payment, "status", None) != "succeeded":
+            logger.debug(
+                "Scheduler: YooKassa payment %s is not succeeded yet (status=%s).",
+                payment_id,
+                getattr(payment, "status", None),
+            )
+            continue
+
+        metadata = {}
+        if hasattr(payment, "metadata") and payment.metadata:
+            metadata = dict(payment.metadata)
+        if not metadata:
+            metadata = dict(tx.get("metadata_dict") or {})
+        if not metadata:
+            logger.error(
+                "Scheduler: YooKassa payment %s succeeded but has no metadata.",
+                payment_id,
+            )
+            continue
+
+        api_amount = getattr(getattr(payment, "amount", None), "value", None)
+        api_currency = getattr(getattr(payment, "amount", None), "currency", None)
+        meta_price = metadata.get("price")
+        if api_amount and meta_price is not None:
+            try:
+                if abs(float(api_amount) - float(meta_price)) > 0.01:
+                    logger.error(
+                        "Scheduler: YooKassa amount mismatch for %s: API=%s metadata=%s",
+                        payment_id,
+                        api_amount,
+                        meta_price,
+                    )
+                    continue
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Scheduler: Could not compare YooKassa amount for %s: API=%s metadata=%s",
+                    payment_id,
+                    api_amount,
+                    meta_price,
+                )
+
+        metadata["provider_payment_id"] = payment_id
+        metadata["payment_method"] = "YooKassa"
+
+        reserved_metadata = await asyncio.to_thread(
+            database.reserve_pending_transaction,
+            payment_id,
+            metadata,
+            payment_method="YooKassa",
+            amount_currency=float(api_amount) if api_amount is not None else None,
+            currency_name=api_currency,
+        )
+        if reserved_metadata is None:
+            logger.info(
+                "Scheduler: YooKassa payment %s is no longer pending; skipping.",
+                payment_id,
+            )
+            continue
+
+        processed_ok = False
+        try:
+            processed_ok = await handlers.process_successful_payment(
+                bot, reserved_metadata
+            )
+        except Exception as e:
+            logger.error(
+                "Scheduler: YooKassa fallback processing failed for %s: %s",
+                payment_id,
+                e,
+                exc_info=True,
+            )
+
+        finalized = await asyncio.to_thread(
+            database.finalize_reserved_transaction,
+            payment_id,
+            success=bool(processed_ok),
+            metadata=reserved_metadata,
+            payment_method="YooKassa",
+            amount_currency=float(api_amount) if api_amount is not None else None,
+            currency_name=api_currency,
+        )
+        if not finalized:
+            logger.error(
+                "Scheduler: Failed to finalize YooKassa fallback transaction %s after processing=%s.",
+                payment_id,
+                processed_ok,
+            )
+            continue
+
+        if processed_ok:
+            await asyncio.to_thread(
+                database.set_webhook_processed, "yookassa", payment_id
+            )
+            logger.info(
+                "Scheduler: YooKassa fallback fulfilled payment %s successfully.",
+                payment_id,
+            )
+        else:
+            logger.warning(
+                "Scheduler: YooKassa payment %s is paid but fulfillment failed; will retry later.",
+                payment_id,
+            )
+
+
+async def process_pending_paid_provider_retries(bot: Bot) -> None:
+    """Retry already-paid Stars/CryptoBot fulfillments that failed after payment confirmation."""
+    pending = await asyncio.to_thread(database.get_pending_paid_retry_transactions, 20)
+    if not pending:
+        return
+
+    logger.info(
+        "Scheduler: Retrying %s paid non-YooKassa fulfillment(s).", len(pending)
+    )
+
+    for tx in pending:
+        payment_id = str(tx.get("payment_id") or "").strip()
+        if not payment_id:
+            continue
+
+        metadata = dict(tx.get("metadata_dict") or {})
+        method = metadata.get("payment_method") or tx.get("payment_method") or "Unknown"
+        currency_name = tx.get("currency_name")
+        amount_currency = tx.get("amount_currency")
+
+        reserved_metadata = await asyncio.to_thread(
+            database.reserve_pending_transaction,
+            payment_id,
+            metadata,
+            payment_method=method,
+            amount_currency=amount_currency,
+            currency_name=currency_name,
+        )
+        if reserved_metadata is None:
+            logger.info(
+                "Scheduler: paid retry transaction %s is no longer pending; skipping.",
+                payment_id,
+            )
+            continue
+
+        processed_ok = False
+        try:
+            processed_ok = await handlers.process_successful_payment(
+                bot, reserved_metadata
+            )
+        except Exception as e:
+            logger.error(
+                "Scheduler: paid retry fulfillment failed for %s: %s",
+                payment_id,
+                e,
+                exc_info=True,
+            )
+
+        finalized = await asyncio.to_thread(
+            database.finalize_reserved_transaction,
+            payment_id,
+            success=bool(processed_ok),
+            metadata=reserved_metadata,
+            payment_method=method,
+            amount_currency=amount_currency,
+            currency_name=currency_name,
+        )
+        if not finalized:
+            logger.error(
+                "Scheduler: Failed to finalize paid retry transaction %s after processing=%s.",
+                payment_id,
+                processed_ok,
+            )
+            continue
+
+        if processed_ok:
+            logger.info(
+                "Scheduler: paid retry fulfilled transaction %s successfully.",
+                payment_id,
+            )
+        else:
+            logger.warning(
+                "Scheduler: paid retry transaction %s still failed; will retry later.",
+                payment_id,
+            )
+
+
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
     await asyncio.sleep(10)
@@ -992,6 +1306,8 @@ async def periodic_subscription_check(bot_controller: BotController):
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
+                    await process_pending_yookassa_payments(bot)
+                    await process_pending_paid_provider_retries(bot)
                     await check_expiring_subscriptions(bot)
                 else:
                     logger.warning(

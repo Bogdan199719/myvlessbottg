@@ -6,12 +6,33 @@
 <section class="settings-section">
 	<h2>Список пользователей</h2>
 
+	<div class="admin-summary-grid">
+		<div class="admin-summary-card">
+			<span>Всего пользователей</span>
+			<strong>{{ user_metrics.total_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Платные</span>
+			<strong>{{ user_metrics.paid_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Пробные</span>
+			<strong>{{ user_metrics.trial_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Без подписки</span>
+			<strong>{{ user_metrics.no_subscription_users }}</strong>
+		</div>
+	</div>
+
 	<div class="table-toolbar">
 		<div class="table-tools">
 			<input id="usersSearch" class="search-input" type="text" placeholder="Поиск по ID или username" />
 			<div class="filter-group">
 				<button type="button" class="filter-chip is-active" data-user-filter="all">Все</button>
-				<button type="button" class="filter-chip" data-user-filter="active">Активные</button>
+				<button type="button" class="filter-chip" data-user-filter="paid">Платные</button>
+				<button type="button" class="filter-chip" data-user-filter="trial">Пробные</button>
+				<button type="button" class="filter-chip" data-user-filter="no_subscription">Без подписки</button>
 				<button type="button" class="filter-chip" data-user-filter="banned">Забаненные</button>
 			</div>
 		</div>
@@ -27,26 +48,41 @@
 				<tr>
 					<th>Telegram ID</th>
 					<th>Username</th>
+					<th>Email для чеков</th>
 					<th>Статус</th>
-					<th>Активные ключи</th>
+					<th>Подписка</th>
 					<th class="actions-cell">Действия</th>
 				</tr>
 			</thead>
 			<tbody>
 				{% for user in users %}
-				<tr id="user-{{ user.telegram_id }}" data-status="{{ 'banned' if user.is_banned else 'active' }}" data-search="{{ user.telegram_id }} {{ user.username or '' }}">
+				{% set subscription = user.subscription_summary %}
+				<tr id="user-{{ user.telegram_id }}" data-status="{{ subscription.status }}" data-search="{{ user.telegram_id }} {{ user.username or '' }} {{ user.receipt_email or '' }} {{ subscription.label }}">
 					<td>{{ user.telegram_id }}</td>
 					<td>@{{ user.username or 'N/A' }}</td>
+					<td>{{ user.receipt_email or '—' }}</td>
 					<td>
-						{% if user.is_banned %}
-						<span class="status-badge status-banned">Забанен</span>
-						{% else %}
-						<span class="status-badge status-active">Активен</span>
-						{% endif %}
+						<span class="status-badge {{ subscription.css_class }}">{{ subscription.label }}</span>
 					</td>
 					<td>
-						{% if user.user_keys %} {{ user.user_keys | length }} шт. {% else %}
-						0 {% endif %}
+						<div class="subscription-cell">
+							{% if subscription.status == 'paid' %}
+							<strong>Активная</strong>
+							<small>платная подписка</small>
+							{% elif subscription.status == 'trial' %}
+							<strong>Активная</strong>
+							<small>пробная подписка</small>
+							{% elif subscription.status == 'trial_expired' %}
+							<strong>Истекла</strong>
+							<small>пробная подписка</small>
+							{% elif subscription.status == 'banned' %}
+							<strong>Недоступна</strong>
+							<small>пользователь забанен</small>
+							{% else %}
+							<strong>Нет</strong>
+							<small>подписка отсутствует</small>
+							{% endif %}
+						</div>
 					</td>
 					<td class="actions-cell">
 						<div class="actions-wrapper">
@@ -107,11 +143,11 @@
 </section>
 
 <!-- Issue Key Modal -->
-<div id="issueKeyModal" class="modal">
-	<div class="modal-content">
-		<span class="close" onclick="closeIssueModal()">&times;</span>
-		<h2>Выдать подписку</h2>
-		<p>Пользователь: <span id="modalUsername"></span> (ID: <span id="modalUserIdDisplay"></span>)</p>
+<div id="issueKeyModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="issueKeyModalTitle" hidden>
+	<div class="modal-content" tabindex="-1">
+		<button type="button" class="modal-close" aria-label="Закрыть" onclick="closeIssueModal()">&times;</button>
+		<h2 id="issueKeyModalTitle">Выдать подписку</h2>
+		<p class="modal-user-line">Пользователь: <span id="modalUsername"></span> <small>ID: <span id="modalUserIdDisplay"></span></small></p>
 
 		<form id="issueKeyForm" method="post" action="">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -151,10 +187,13 @@
 	</div>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce() }}">
+	var lastFocusedElement = null;
+
 	function openIssueModal(userId, username) {
 		var modal = document.getElementById("issueKeyModal");
 		var form = document.getElementById("issueKeyForm");
+		var content = modal ? modal.querySelector(".modal-content") : null;
 
 		document.getElementById("modalUsername").textContent = username ? "@" + username : "Без юзернейма";
 		document.getElementById("modalUserIdDisplay").textContent = userId;
@@ -163,11 +202,20 @@
 		form.action = "/users/issue-key/" + userId;
 
 		modal.style.display = "block";
+		modal.removeAttribute("hidden");
+		lastFocusedElement = document.activeElement;
+		if (content) {
+			content.focus();
+		}
 	}
 
 	function closeIssueModal() {
 		var modal = document.getElementById("issueKeyModal");
 		modal.style.display = "none";
+		modal.setAttribute("hidden", "");
+		if (lastFocusedElement && typeof lastFocusedElement.focus === "function") {
+			lastFocusedElement.focus();
+		}
 	}
 
 	document.querySelectorAll(".js-open-issue-modal").forEach(function (button) {
@@ -180,12 +228,22 @@
 	});
 
 	// Close modal if clicked outside
-	window.onclick = function (event) {
+	window.addEventListener("click", function (event) {
 		var modal = document.getElementById("issueKeyModal");
 		if (event.target == modal) {
 			modal.style.display = "none";
+			modal.setAttribute("hidden", "");
 		}
-	}
+	});
+
+	document.addEventListener("keydown", function (event) {
+		if (event.key === "Escape") {
+			var modal = document.getElementById("issueKeyModal");
+			if (modal && !modal.hasAttribute("hidden")) {
+				closeIssueModal();
+			}
+		}
+	});
 </script>
 
 

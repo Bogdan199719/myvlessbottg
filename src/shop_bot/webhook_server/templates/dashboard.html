@@ -1,156 +1,417 @@
-{% extends "base.html" %} {% block title %}Главная страница{% endblock %} {%
-block content %}
+{% extends "base.html" %}
+{% block title %}Аналитика{% endblock %}
+{% block content %}
 
-<div class="dashboard-page-head">
-	<h1>Главная</h1>
-	<p>Сводка по ботам, пользователям, ключам и платежам.</p>
+{% set summary = analytics.summary %}
+
+<div class="dashboard-page-head analytics-head">
+	<div>
+		<h1>Аналитика</h1>
+		<p>Пользователи, выручка, подписки и платежи {{ analytics.period_label }}.</p>
+	</div>
+	<div class="analytics-head-actions">
+		{% for option in period_options %}
+		<a class="button button-small {{ 'button-primary' if option.is_active else 'button-secondary' }}" href="{{ url_for('dashboard_page', period=option.period) }}">{{ option.label }}</a>
+		{% endfor %}
+		<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Пользователи CSV</a>
+		<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Платежи CSV</a>
+	</div>
 </div>
 
-<section class="stats-section">
-	<div class="stats-grid">
-		<a href="{{ url_for('users_page') }}" class="stat-card">
-			<h3>Пользователей</h3>
-			<p class="stat-number">{{ stats.user_count }}</p>
-		</a>
-		<a href="{{ url_for('keys_page') }}" class="stat-card">
-			<h3>Всего ключей</h3>
-			<p class="stat-number">{{ stats.total_keys }}</p>
-		</a>
-		<div class="stat-card">
-			<h3>Всего потрачено</h3>
-			<p class="stat-number">
-				{{ stats.total_spent | round(2) }} <small>RUB</small>
-			</p>
-		</div>
-		<a href="{{ url_for('settings_page') }}#hosts" class="stat-card">
-			<h3>Активных хостов</h3>
-			<p class="stat-number">{{ stats.host_count }}</p>
-		</a>
-		<a href="{{ url_for('keys_page') }}" class="stat-card">
-			<h3>Проблемных пользователей</h3>
-			<p class="stat-number">{{ stats.problem_users_count }}</p>
-		</a>
+<section class="analytics-kpi-grid">
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">Выручка {{ analytics.period_label }}</span>
+		<strong>{{ "%.0f"|format(summary.period_revenue) }} ₽</strong>
+		<small>сегодня: {{ "%.0f"|format(summary.today_revenue) }} ₽</small>
+	</div>
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">Выручка за всё время</span>
+		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
+		<small>оплаченных подписок: {{ summary.all_time_orders }}</small>
+	</div>
+	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+		<span class="kpi-label">Активные оплаченные подписки</span>
+		<strong>{{ summary.active_paid_subscriptions }}</strong>
+		<small>активных клиентов; оплатили всего: {{ summary.paid_transaction_users }}</small>
+	</a>
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">Оплаченные заказы {{ analytics.period_label }}</span>
+		<strong>{{ summary.period_orders }}</strong>
+		<small>сегодня: {{ summary.today_orders }}, уникальных клиентов: {{ summary.period_paid_transaction_users }}</small>
+	</div>
+	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+		<span class="kpi-label">Пользователи</span>
+		<strong>{{ summary.total_users }}</strong>
+		<small>новых за 30 дней: {{ summary.period_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
+	</a>
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">Оплатившие клиенты</span>
+		<strong>{{ summary.paid_transaction_users }}</strong>
+		<small>по paid-транзакциям за всю историю</small>
+	</div>
+	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+		<span class="kpi-label">Всего пользователей</span>
+		<strong>{{ summary.total_users }}</strong>
+		<small>пробник взяли: {{ summary.trial_used_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
+	</a>
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">Средний чек</span>
+		<strong>{{ "%.0f"|format(summary.avg_order) }} ₽</strong>
+		<small>конверсия в оплату: {{ summary.conversion_percent }}%</small>
 	</div>
 </section>
 
-<div class="dashboard-container">
-	<div class="dashboard-column-left">
-		<section>
-			<h2>Аналитика за последние 30 дней</h2>
-			<div class="chart-container">
-				<h3>Новые пользователи</h3>
-				<canvas id="newUsersChart"></canvas>
-			</div>
-			<div class="chart-container">
-				<h3>Новые ключи</h3>
-				<canvas id="newKeysChart"></canvas>
-			</div>
-		</section>
+<section class="profit-panel">
+	<div class="section-head">
+		<div>
+			<h2>Делёж прибыли</h2>
+			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, серверы пополам, затем Богдан {{ profit.settings.bogdan_share_percent|round(2) }}% и Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
+		</div>
+		<form class="profit-settings-form" action="{{ url_for('update_profit_settings_route') }}" method="post">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+			<label>
+				<span>Налог с выручки, %</span>
+				<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ profit.settings.vlad_tax_percent }}">
+			</label>
+			<label>
+				<span>Серверы, ₽</span>
+				<input type="number" name="server_cost_rub" min="0" step="0.01" value="{{ profit.settings.server_cost_rub }}">
+			</label>
+			<button type="submit" class="button button-small button-secondary">Сохранить</button>
+		</form>
 	</div>
 
-	<div class="dashboard-column-right">
-		<section>
+	<div class="profit-slices">
+		{% for key, title in [
+			('unsettled', 'К распределению'),
+			('selected', 'Выбранный период'),
+			('current_month', 'Текущий месяц'),
+			('previous_month', 'Прошлый месяц'),
+			('all_time', 'Всё время')
+		] %}
+		{% set item = profit.slices[key] %}
+		<div class="profit-card {{ 'profit-card-primary' if key == 'unsettled' else '' }}">
+			<div class="profit-card-head">
+				<span class="kpi-label">{{ title }}</span>
+				<strong>{{ "%.0f"|format(item.revenue_rub) }} ₽</strong>
+			</div>
+			<div class="profit-partners">
+				<div>
+					<span>Богдан</span>
+					<strong>{{ "%.0f"|format(item.bogdan_profit_rub) }} ₽</strong>
+				</div>
+				<div>
+					<span>Влад чистыми</span>
+					<strong>{{ "%.0f"|format(item.vlad_net_rub) }} ₽</strong>
+				</div>
+			</div>
+			<small>Налог с выручки: {{ "%.0f"|format(item.vlad_tax_rub) }} ₽. Серверы: {{ "%.0f"|format(item.server_cost_rub) }} ₽, у каждого по {{ "%.0f"|format(item.server_share_rub) }} ₽.</small>
+		</div>
+		{% endfor %}
+	</div>
+
+	<div class="profit-actions">
+		<form class="profit-close-form" action="{{ url_for('create_profit_distribution_route') }}" method="post" data-confirm="Зафиксировать распределение прибыли за выбранный период?">
+			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+			<input type="hidden" name="selected_period" value="{{ analytics.period }}">
+			<label>
+				<span>Период фиксации</span>
+				<select name="distribution_period" class="form-control" id="profitDistributionPeriod">
+					{% for item in profit.distribution_periods %}
+					<option value="{{ item.value }}"
+						data-revenue="{{ item.revenue_display }}"
+						data-tax="{{ item.tax_display }}"
+						data-server-share="{{ item.server_share_display }}"
+						data-bogdan="{{ item.bogdan_display }}"
+						data-vlad="{{ item.vlad_display }}"
+						data-period="{{ item.note }}">{{ item.label }} — {{ item.note }}</option>
+					{% endfor %}
+				</select>
+			</label>
+			<label>
+				<span>Вручную с</span>
+				<input class="form-control" type="datetime-local" name="custom_period_start" value="{{ profit.current_month_start_input }}">
+			</label>
+			<label>
+				<span>Вручную по</span>
+				<input class="form-control" type="datetime-local" name="custom_period_end" value="{{ profit.now_input }}">
+			</label>
+			<input class="form-control" type="text" name="note" placeholder="Заметка к фиксации">
+			<div class="profit-preview" id="profitDistributionPreview" aria-live="polite">
+				<div><span>Период</span><strong data-profit-preview="period">—</strong></div>
+				<div><span>Выручка</span><strong><b data-profit-preview="revenue">0</b> ₽</strong></div>
+				<div><span>Налог</span><strong><b data-profit-preview="tax">0</b> ₽</strong></div>
+				<div><span>Сервер с каждого</span><strong><b data-profit-preview="serverShare">0</b> ₽</strong></div>
+				<div><span>Богдан</span><strong><b data-profit-preview="bogdan">0</b> ₽</strong></div>
+				<div><span>Влад</span><strong><b data-profit-preview="vlad">0</b> ₽</strong></div>
+			</div>
+			<button type="submit" class="button button-primary">Закрыть период</button>
+		</form>
+		<span class="panel-note">Дата первой оплаты и старта проекта: {{ profit.project_start_label }}. Период к распределению: {{ profit.unsettled_start_label }} → {{ profit.now_label }}</span>
+	</div>
+
+	{% if profit.history %}
+	<div class="profit-history">
+		<div class="section-head">
+			<h3>История фиксаций</h3>
+			<span class="panel-note">последние {{ profit.history|length }}</span>
+		</div>
+		<div class="table-scroll">
+			<table class="transactions-table analytics-table profit-table">
+				<thead>
+					<tr>
+						<th>Период</th>
+						<th>Статус</th>
+						<th>Выручка</th>
+						<th>Богдан</th>
+						<th>Влад чистыми</th>
+						<th>Правка</th>
+						<th></th>
+					</tr>
+				</thead>
+				<tbody>
+					{% for row in profit.history %}
+						<tr class="{{ 'is-void' if row.status == 'void' else '' }}">
+							<td>
+								{{ row.period_start_label }}<br>
+								<small>до {{ row.period_end_label }}</small>
+								{% if row.note %}<small>{{ row.note }}</small>{% endif %}
+							</td>
+							<td><span class="profit-status profit-status-{{ row.status }}">{{ row.status_label }}</span></td>
+							<td><strong>{{ "%.0f"|format(row.revenue_rub) }} ₽</strong></td>
+						<td>{{ "%.0f"|format(row.bogdan_profit_rub) }} ₽</td>
+						<td>{{ "%.0f"|format(row.vlad_net_rub) }} ₽</td>
+						<td>
+							<form class="profit-edit-form" action="{{ url_for('update_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<input type="text" name="period_start" value="{{ row.period_start or '' }}" placeholder="начало">
+								<input type="text" name="period_end" value="{{ row.period_end }}" placeholder="конец">
+								<input type="number" name="revenue_rub" min="0" step="0.01" value="{{ row.revenue_rub }}">
+								<input type="hidden" name="bogdan_share_percent" value="{{ row.bogdan_share_percent }}">
+								<input type="hidden" name="vlad_share_percent" value="{{ row.vlad_share_percent }}">
+								<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ row.vlad_tax_percent }}">
+								<input type="number" name="server_cost_rub" min="0" step="0.01" value="{{ row.server_cost_rub }}">
+								<input type="text" name="note" value="{{ row.note or '' }}" placeholder="заметка">
+								<button type="submit" class="button button-tiny button-secondary">Сохранить</button>
+							</form>
+						</td>
+						<td>
+							{% if row.status == 'active' %}
+							<form action="{{ url_for('mark_profit_distribution_paid_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отметить эту фиксацию как выплаченную?">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-tiny button-success">Выплачено</button>
+							</form>
+							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить эту фиксацию? Платежи не удалятся, период снова попадёт в расчёт к распределению.">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-tiny button-warning">Отменить</button>
+							</form>
+							{% elif row.status == 'paid' %}
+							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить выплаченную фиксацию? Период снова попадёт в расчёт к распределению.">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-tiny button-warning">Отменить</button>
+							</form>
+							{% endif %}
+						</td>
+					</tr>
+					{% endfor %}
+				</tbody>
+			</table>
+		</div>
+	</div>
+	{% endif %}
+</section>
+
+<div class="analytics-layout">
+	<section class="analytics-panel analytics-panel-wide">
+		<div class="section-head">
+			<h2>Динамика по дням</h2>
+			<span class="panel-note">пользователи, оплаты, выручка</span>
+		</div>
+		<div class="analytics-chart analytics-chart-large">
+			<canvas id="analyticsTrendChart"></canvas>
+		</div>
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
+			<h2>Методы оплаты</h2>
+			<span class="panel-note">оплаченные платежи</span>
+		</div>
+		<div class="analytics-chart analytics-chart-donut">
+			<canvas id="paymentMethodsChart"></canvas>
+		</div>
+		{% if analytics.payment_methods %}
+		<div class="analytics-list">
+			{% for item in analytics.payment_methods %}
+			<div class="analytics-list-row">
+				<span>{{ item.method }}</span>
+				<strong>{{ "%.0f"|format(item.revenue) }} ₽</strong>
+				<small>{{ item.orders }} оплат</small>
+			</div>
+			{% endfor %}
+		</div>
+		{% else %}
+		<p class="empty-state">Оплаченных платежей пока нет.</p>
+		{% endif %}
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
+			<h2>Тарифы</h2>
+			<span class="panel-note">по выручке</span>
+		</div>
+		{% if analytics.plan_revenue %}
+		<div class="analytics-bar-list">
+			{% set top_plan_revenue = analytics.plan_revenue[0].revenue if analytics.plan_revenue else 0 %}
+			{% for item in analytics.plan_revenue %}
+			{% set width = (item.revenue / top_plan_revenue * 100) if top_plan_revenue else 0 %}
+			<div class="analytics-bar-row">
+				<div class="bar-row-head">
+					<span>{{ item.plan }}</span>
+					<strong>{{ "%.0f"|format(item.revenue) }} ₽</strong>
+				</div>
+				<div class="bar-track"><span style="width: {{ width }}%"></span></div>
+				<small>{{ item.orders }} оплат</small>
+			</div>
+			{% endfor %}
+		</div>
+		{% else %}
+		<p class="empty-state">Нет данных по тарифам.</p>
+		{% endif %}
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
+			<h2>Подписки и доступ</h2>
+			<a class="button button-small button-secondary" href="{{ url_for('users_page') }}">Пользователи</a>
+		</div>
+		<div class="subscription-state-grid">
+			<div class="subscription-state-item is-active">
+				<span>Активные оплаченные подписки</span>
+				<strong>{{ summary.active_paid_subscriptions }}</strong>
+			</div>
+			<div class="subscription-state-item is-expired">
+				<span>Истекшие платные подписки</span>
+				<strong>{{ summary.expired_paid_subscriptions }}</strong>
+			</div>
+			<div class="subscription-state-item is-trial">
+				<span>Активные пробные подписки</span>
+				<strong>{{ summary.active_trial_subscriptions }}</strong>
+			</div>
+			<div class="subscription-state-item">
+				<span>Пробник взяли всего</span>
+				<strong>{{ summary.trial_used_users }}</strong>
+			</div>
+			<div class="subscription-state-item">
+				<span>Пробники истекли</span>
+				<strong>{{ summary.expired_trial_users }}</strong>
+			</div>
+			<div class="subscription-state-item">
+				<span>Уникальные оплатившие клиенты</span>
+				<strong>{{ summary.paid_transaction_users }}</strong>
+			</div>
+			<div class="subscription-state-item">
+				<span>Оплаченные заказы</span>
+				<strong>{{ summary.all_time_orders }}</strong>
+			</div>
+		</div>
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
+			<h2>Лучшие дни</h2>
+			<span class="panel-note">по выручке</span>
+		</div>
+		{% if analytics.top_days %}
+		<div class="analytics-list">
+			{% for item in analytics.top_days %}
+			<div class="analytics-list-row">
+				<span>{{ item.day }}</span>
+				<strong>{{ "%.0f"|format(item.revenue) }} ₽</strong>
+				<small>{{ item.orders }} оплат</small>
+			</div>
+			{% endfor %}
+		</div>
+		{% else %}
+		<p class="empty-state">Пока нет оплаченных дней.</p>
+		{% endif %}
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
+			<h2>Статусы платежей</h2>
+			<span class="panel-note">вся история</span>
+		</div>
+		{% if analytics.transaction_statuses %}
+		<div class="status-summary-grid">
+			{% for item in analytics.transaction_statuses %}
+			<div class="status-summary-item">
+				<span>{{ item.status }}</span>
+				<strong>{{ item.count }}</strong>
+			</div>
+			{% endfor %}
+		</div>
+		{% else %}
+		<p class="empty-state">Транзакций пока нет.</p>
+		{% endif %}
+	</section>
+
+	<section class="analytics-panel analytics-panel-wide">
+		<div class="section-head">
+			<h2>Последние оплаченные покупки</h2>
+			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
+		</div>
+		{% if analytics.recent_paid %}
+		<div class="table-scroll">
+			<table class="transactions-table analytics-table">
+				<thead>
+					<tr>
+						<th>Пользователь</th>
+						<th>Тариф</th>
+						<th>Метод</th>
+						<th>Сумма</th>
+						<th>Дата</th>
+					</tr>
+				</thead>
+				<tbody>
+					{% for tx in analytics.recent_paid %}
+					<tr>
+						<td>{{ tx.username }}<br><small>{{ tx.user_id }}</small></td>
+						<td>{{ tx.plan }}</td>
+						<td>{{ tx.method }}</td>
+						<td><strong>{{ "%.2f"|format(tx.amount) }} ₽</strong></td>
+						<td>{{ tx.date.split(' ')[0] if tx.date else '—' }}</td>
+					</tr>
+					{% endfor %}
+				</tbody>
+			</table>
+		</div>
+		{% else %}
+		<p class="empty-state">Оплаченных покупок пока нет.</p>
+		{% endif %}
+	</section>
+
+	<section class="analytics-panel">
+		<div class="section-head">
 			<h2>Проблемные пользователи</h2>
-			{% if problem_users %}
-			<div class="table-scroll">
-				<table class="users-table">
-					<thead>
-						<tr>
-							<th>ID</th>
-							<th>User</th>
-							<th>Проблемы</th>
-							<th>Действие</th>
-						</tr>
-					</thead>
-					<tbody>
-						{% for item in problem_users %}
-						<tr>
-							<td>{{ item.user_id }}</td>
-							<td>@{{ item.username or 'N/A' }}</td>
-							<td>
-								{% for reason in item.reasons %}
-								<div class="diag-issue">{{ reason }}</div>
-								{% endfor %}
-							</td>
-							<td>
-								<a class="button button-small button-secondary" href="{{ url_for('user_diagnostics_page', user_id=item.user_id) }}">
-									Открыть
-								</a>
-							</td>
-						</tr>
-						{% endfor %}
-					</tbody>
-				</table>
-			</div>
-			{% else %}
-			<p>Явных проблем не обнаружено.</p>
-			{% endif %}
-		</section>
-
-		<section>
-			<div class="section-head">
-				<h2>Недавние транзакции</h2>
-				<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
-			</div>
-			{% if transactions %}
-			<div class="table-scroll">
-				<table class="transactions-table">
-					<thead>
-						<tr>
-							<th>Пользователь</th>
-							<th>Хост</th>
-							<th>План</th>
-							<th>Активна до</th>
-							<th>Цена</th>
-							<th>Дата</th>
-						</tr>
-					</thead>
-					<tbody>
-						{% for tx in transactions %}
-						<tr>
-							<td>
-								{{ tx.username or 'N/A' }}<br /><small>({{tx.user_id}})</small>
-							</td>
-							<td>{{ tx.host_name }}</td>
-							<td>{{ tx.plan_name }}</td>
-							<td>{% if tx.subscription_expires_at %}{{ tx.subscription_expires_at.split(' ')[0] }}{% else %}—{% endif %}</td>
-							<td>{{ tx.amount_rub | round(2) }} RUB</td>
-							<td>{{ tx.created_date.split(' ')[0] }}</td>
-						</tr>
-						{% endfor %}
-					</tbody>
-				</table>
-			</div>
-
-			{% if total_pages > 1 %}
-			<nav class="pagination">
-				<a
-					href="{{ url_for('dashboard_page', page=current_page - 1) }}"
-					class="{{ 'disabled' if current_page == 1 else '' }}"
-					>«</a
-				>
-
-				{% for p in range(1, total_pages + 1) %}
-				<a
-					href="{{ url_for('dashboard_page', page=p) }}"
-					class="{{ 'active' if p == current_page else '' }}"
-					>{{ p }}</a
-				>
-				{% endfor %}
-
-				<a
-					href="{{ url_for('dashboard_page', page=current_page + 1) }}"
-					class="{{ 'disabled' if current_page == total_pages else '' }}"
-					>»</a
-				>
-			</nav>
-			{% endif %} {% else %}
-			<p>Пока нет транзакций для отображения.</p>
-			{% endif %}
-		</section>
-	</div>
+			<span class="panel-note">{{ stats.problem_users_count }}</span>
+		</div>
+		{% if problem_users %}
+		<div class="analytics-list">
+			{% for item in problem_users %}
+			<a class="analytics-list-row analytics-link-row" href="{{ url_for('user_diagnostics_page', user_id=item.user_id) }}">
+				<span>@{{ item.username or 'N/A' }}<br><small>{{ item.user_id }}</small></span>
+				<strong>{{ item.issues_count }}</strong>
+				<small>проверить</small>
+			</a>
+			{% endfor %}
+		</div>
+		{% else %}
+		<p class="empty-state">Явных проблем не обнаружено.</p>
+		{% endif %}
+	</section>
 </div>
 
-<script id="chart-data" type="application/json">{{ chart_data | tojson }}</script>
+<script nonce="{{ csp_nonce() }}" id="chart-data" type="application/json">{{ analytics | tojson }}</script>
 
 {% endblock %}

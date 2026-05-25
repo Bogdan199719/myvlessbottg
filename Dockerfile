@@ -5,6 +5,9 @@ LABEL maintainer="Bogdan199719"
 
 WORKDIR /app/project
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc git \
@@ -21,6 +24,11 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 # Install in editable mode so volume-mounted changes take effect
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e . \
+    && groupadd --system --gid "${APP_GID}" appuser \
+    && useradd --system --uid "${APP_UID}" --gid "${APP_GID}" --home-dir /app/project appuser \
+    && chown -R appuser:appuser /app/project
+
+USER appuser
 
 CMD ["python3", "-m", "shop_bot"]

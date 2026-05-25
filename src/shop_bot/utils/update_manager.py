@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SAFE_GIT_DIRECTORY = "/app/project"
 _VERSION_PATTERN = re.compile(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']')
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
 
 
 def _run_command(
@@ -114,6 +115,15 @@ def perform_update() -> dict:
     by the latest version from GitHub.
     """
     try:
+        if os.getenv("ENABLE_WEB_UPDATES", "").strip().lower() not in _TRUTHY_VALUES:
+            return {
+                "status": "error",
+                "message": (
+                    "Web-обновления отключены в production. "
+                    "Используйте CI/CD или включите ENABLE_WEB_UPDATES=true вручную."
+                ),
+            }
+
         _run_command(
             [
                 "git",

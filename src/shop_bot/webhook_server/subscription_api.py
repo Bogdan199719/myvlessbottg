@@ -13,7 +13,6 @@ from shop_bot.data_manager.database import (
     get_user_trial_keys,
     get_all_settings,
     get_user_by_token,
-    get_plans_for_host,
     get_all_hosts,
     add_new_key,
     get_missing_keys,
@@ -21,6 +20,8 @@ from shop_bot.data_manager.database import (
     get_key_by_email,
     update_key_by_email,
     host_slug as _host_slug,
+    get_global_plan_ids,
+    is_global_xui_key,
 )
 from shop_bot.modules import xui_api
 
@@ -61,13 +62,6 @@ def _run_on_event_loop(coro, timeout_seconds: int, operation: str):
         return None
 
 
-def _safe_int(value, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _token_prefix(token: str, limit: int = 5) -> str:
     if not token:
         return "empty"
@@ -79,6 +73,37 @@ def _bool_setting(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
+    domain_value = (domain or "").strip()
+    token_value = (token or "").strip()
+    if not domain_value or not token_value:
+        return None
+    if not domain_value.startswith(("http://", "https://")):
+        domain_value = f"https://{domain_value}"
+    return f"{domain_value.rstrip('/')}/sub/{token_value}"
+
+
+@subscription_bp.route("/happ/<token>", methods=["GET"])
+def redirect_to_happ(token):
+    user = get_user_by_token(token)
+    if not user:
+        logger.info(f"Happ deeplink token not found (prefix: {_token_prefix(token)})")
+        abort(404, "Subscription not found")
+
+    subscription_url = _build_subscription_link(get_setting("domain"), token)
+    if not subscription_url:
+        logger.error(
+            f"Failed to build Happ deeplink for user {user['telegram_id']}: domain or token missing"
+        )
+        abort(500, "Subscription domain is not configured")
+
+    deeplink_url = f"happ://add/{subscription_url}"
+    logger.info(
+        f"Redirecting user {user['telegram_id']} to Happ deeplink (token prefix: {_token_prefix(token)})"
+    )
+    return Response(status=302, headers={"Location": deeplink_url})
 
 
 def _provision_timeout_seconds() -> int:
@@ -108,21 +133,15 @@ def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
 
 
 def _get_global_plan_ids() -> set[int]:
-    plan_ids: set[int] = set()
     try:
-        for plan in get_plans_for_host("ALL", service_type="xui"):
-            plan_id = _safe_int(plan.get("plan_id"), default=0)
-            if plan_id > 0:
-                plan_ids.add(plan_id)
+        return get_global_plan_ids()
     except Exception as e:
         logger.error(f"Failed to load global plan ids: {e}")
-    return plan_ids
+        return set()
 
 
 def _is_global_key(key: dict, global_plan_ids: set[int]) -> bool:
-    if not global_plan_ids:
-        return False
-    return _safe_int(key.get("plan_id"), default=0) in global_plan_ids
+    return is_global_xui_key(key, global_plan_ids)
 
 
 def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
@@ -215,10 +234,6 @@ def get_subscription(token):
         allow_fallback_fetch = _bool_setting(
             "subscription_allow_fallback_host_fetch", default=False
         )
-        auto_provision_enabled = _bool_setting(
-            "subscription_auto_provision", default=False
-        )
-
         # Find user by subscription token
         user = get_user_by_token(token)
 
@@ -282,9 +297,22 @@ def get_subscription(token):
             k for k in active_paid_keys if _is_global_key(k, global_plan_ids)
         ]
 
-        if active_global_keys and global_plan_ids and auto_provision_enabled:
+        if active_global_keys:
             # Deterministic plan selection for stable writes across workers/restarts.
-            first_global_plan_id = int(min(global_plan_ids))
+            # If the current global plans were recreated, legacy global keys may
+            # only be detectable by their email; fall back to their stored plan_id.
+            if global_plan_ids:
+                first_global_plan_id = int(min(global_plan_ids))
+            else:
+                legacy_plan_ids = set()
+                for key in active_global_keys:
+                    try:
+                        candidate_plan_id = int(key.get("plan_id") or 0)
+                    except (TypeError, ValueError):
+                        candidate_plan_id = 0
+                    if candidate_plan_id > 0:
+                        legacy_plan_ids.add(candidate_plan_id)
+                first_global_plan_id = int(min(legacy_plan_ids)) if legacy_plan_ids else 0
             # Target expiry based on the soonest-expiring global key
             try:
                 global_expiries = []
@@ -385,14 +413,6 @@ def get_subscription(token):
                     else:
                         logger.error(f"Failed to create key on host '{host_name}'")
         else:
-            if active_global_keys and global_plan_ids and not auto_provision_enabled:
-                logger.debug(
-                    "Global auto-provision disabled (subscription_auto_provision=false)."
-                )
-            if active_global_keys and not global_plan_ids:
-                logger.debug(
-                    "Active global keys found but no global plan IDs configured"
-                )
             if global_plan_ids and not active_global_keys:
                 logger.debug("Global plan IDs found but no active global keys")
 
@@ -553,5 +573,9 @@ def get_subscription(token):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error serving subscription for token {token}: {e}")
+        logger.error(
+            "Error serving subscription for token prefix %s: %s",
+            _token_prefix(token),
+            e,
+        )
         return Response("Internal Server Error", status=500)

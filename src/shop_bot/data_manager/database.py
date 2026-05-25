@@ -4,6 +4,7 @@ from shop_bot.utils import time_utils
 import logging
 from pathlib import Path
 import json
+import math
 import os
 import uuid
 
@@ -30,8 +31,9 @@ _host_slug = host_slug
 
 DEFAULT_BOT_SETTINGS = {
     "panel_login": os.getenv("PANEL_LOGIN", "admin"),
-    "panel_password": os.getenv("PANEL_PASSWORD", "admin"),
+    "panel_password": os.getenv("PANEL_PASSWORD"),
     "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
+    "show_about_menu_item": "true",
     "about_text": None,
     "terms_url": None,
     "privacy_url": None,
@@ -78,6 +80,11 @@ DEFAULT_BOT_SETTINGS = {
     "provision_timeout_seconds": "45",
     "panel_sync_enabled": "false",
     "xtls_sync_enabled": "false",
+    "enable_promo_codes": "true",
+    "profit_bogdan_share_percent": "40",
+    "profit_vlad_share_percent": "60",
+    "profit_vlad_tax_percent": "9",
+    "profit_server_cost_rub": "0",
 }
 
 
@@ -99,7 +106,8 @@ def initialize_db():
                     referred_by INTEGER,
                     referral_balance REAL DEFAULT 0,
                     referral_balance_all REAL DEFAULT 0,
-                    subscription_token TEXT UNIQUE
+                    subscription_token TEXT UNIQUE,
+                    receipt_email TEXT
                 )
             """)
             cursor.execute("""
@@ -135,6 +143,14 @@ def initialize_db():
                     payment_method TEXT,
                     metadata TEXT,
                     created_date TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processed_webhooks (
+                    provider TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (provider, external_id)
                 )
             """)
             cursor.execute("""
@@ -190,6 +206,7 @@ def initialize_db():
                     host_url TEXT NOT NULL,
                     host_username TEXT NOT NULL,
                     host_pass TEXT NOT NULL,
+                    api_token TEXT,
                     host_inbound_id INTEGER NOT NULL
                 )
             """)
@@ -232,6 +249,47 @@ def initialize_db():
                     customer_email TEXT,
                     submitted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    promo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL UNIQUE,
+                    duration_days INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS promo_code_redemptions (
+                    redemption_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    promo_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    redeemed_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    UNIQUE (promo_id, user_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS profit_distributions (
+                    distribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start TEXT,
+                    period_end TEXT NOT NULL,
+                    revenue_rub REAL NOT NULL,
+                    bogdan_share_percent REAL NOT NULL,
+                    vlad_share_percent REAL NOT NULL,
+                    vlad_tax_percent REAL NOT NULL,
+                    server_cost_rub REAL NOT NULL DEFAULT 0,
+                    bogdan_profit_rub REAL NOT NULL,
+                    vlad_gross_rub REAL NOT NULL,
+                    vlad_tax_rub REAL NOT NULL,
+                    vlad_net_rub REAL NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
             """)
             run_migration()
@@ -351,6 +409,14 @@ def run_migration():
             else:
                 logging.info(" -> The column 'is_enabled' already exists in xui_hosts.")
 
+            if "api_token" not in host_columns:
+                cursor.execute("ALTER TABLE xui_hosts ADD COLUMN api_token TEXT")
+                logging.info(
+                    " -> The column 'api_token' is successfully added to xui_hosts."
+                )
+            else:
+                logging.info(" -> The column 'api_token' already exists in xui_hosts.")
+
             cursor.execute("PRAGMA table_info(vpn_keys)")
             vpn_keys_columns = [row[1] for row in cursor.fetchall()]
             if "connection_string" not in vpn_keys_columns:
@@ -447,6 +513,50 @@ def run_migration():
                 logging.info(
                     " -> The column 'pending_payment' already exists in users."
                 )
+            if "receipt_email" not in user_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN receipt_email TEXT")
+                logging.info(" -> The column 'receipt_email' is successfully added.")
+            else:
+                logging.info(" -> The column 'receipt_email' already exists in users.")
+
+            try:
+                cursor.execute(
+                    """
+                    SELECT user_id, metadata
+                    FROM transactions
+                    WHERE metadata IS NOT NULL AND metadata != ''
+                    ORDER BY created_date DESC
+                    """
+                )
+                backfilled_users: set[int] = set()
+                for user_id, metadata_raw in cursor.fetchall():
+                    if user_id in backfilled_users:
+                        continue
+                    try:
+                        metadata = json.loads(metadata_raw)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    email = str(metadata.get("customer_email") or "").strip()
+                    if "@" not in email or "." not in email:
+                        continue
+                    cursor.execute(
+                        """
+                        UPDATE users
+                        SET receipt_email = ?
+                        WHERE telegram_id = ?
+                          AND (receipt_email IS NULL OR receipt_email = '')
+                        """,
+                        (email, user_id),
+                    )
+                    if cursor.rowcount:
+                        backfilled_users.add(int(user_id))
+                if backfilled_users:
+                    logging.info(
+                        " -> Backfilled receipt_email for %s users from transactions.",
+                        len(backfilled_users),
+                    )
+            except sqlite3.Error as e:
+                logging.error(f"Failed to backfill user receipt emails: {e}")
 
             # Create indexes for performance
             logging.info("Creating performance indexes...")
@@ -539,6 +649,15 @@ def run_migration():
                     "The new table 'Transactions' has been successfully created."
                 )
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processed_webhooks (
+                    provider TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (provider, external_id)
+                )
+            """)
+
             logging.info("The migration of the table 'sent_notifications' ...")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sent_notifications (
@@ -550,6 +669,10 @@ def run_migration():
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_notifications_unique "
+                "ON sent_notifications(user_id, COALESCE(key_id, -1), notification_type, COALESCE(hours_mark, -999999))"
+            )
             logging.info(" -> Table 'sent_notifications' is ready.")
 
             logging.info("The migration of support ticket tables ...")
@@ -600,6 +723,67 @@ def run_migration():
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_support_messages_user_created ON support_messages(user_id, created_at ASC)"
             )
+
+            logging.info("The migration of promo code tables ...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    promo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL UNIQUE,
+                    duration_days INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("PRAGMA table_info(promo_codes)")
+            promo_cols = [row[1] for row in cursor.fetchall()]
+            if "expires_at" not in promo_cols:
+                cursor.execute("ALTER TABLE promo_codes ADD COLUMN expires_at TEXT")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS promo_code_redemptions (
+                    redemption_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    promo_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    redeemed_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    UNIQUE (promo_id, user_id)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_promo_redemptions_promo_status ON promo_code_redemptions(promo_id, status)"
+            )
+
+            logging.info("The migration of profit distribution tables ...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS profit_distributions (
+                    distribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start TEXT,
+                    period_end TEXT NOT NULL,
+                    revenue_rub REAL NOT NULL,
+                    bogdan_share_percent REAL NOT NULL,
+                    vlad_share_percent REAL NOT NULL,
+                    vlad_tax_percent REAL NOT NULL,
+                    server_cost_rub REAL NOT NULL DEFAULT 0,
+                    bogdan_profit_rub REAL NOT NULL,
+                    vlad_gross_rub REAL NOT NULL,
+                    vlad_tax_rub REAL NOT NULL,
+                    vlad_net_rub REAL NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_profit_distributions_status_end "
+                "ON profit_distributions(status, period_end DESC)"
+            )
+            for key, value in DEFAULT_BOT_SETTINGS.items():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
 
             backfill_now = _now_iso()
             cursor.execute("SELECT user_id, thread_id FROM support_threads")
@@ -670,14 +854,30 @@ def create_new_transactions_table(cursor: sqlite3.Cursor):
     """)
 
 
-def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
+def create_host(
+    name: str,
+    url: str,
+    user: str,
+    passwd: str,
+    inbound: int,
+    api_token: str | None = None,
+):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             # Check if host with same name and identical parameters already exists
             cursor.execute(
-                "SELECT host_name FROM xui_hosts WHERE host_name=? AND host_url=? AND host_username=? AND host_pass=? AND host_inbound_id=?",
-                (name, url, user, passwd, inbound),
+                """
+                SELECT host_name
+                FROM xui_hosts
+                WHERE host_name=?
+                  AND host_url=?
+                  AND host_username=?
+                  AND host_pass=?
+                  AND host_inbound_id=?
+                  AND COALESCE(api_token, '')=?
+                """,
+                (name, url, user, passwd, inbound, api_token or ""),
             )
             if cursor.fetchone():
                 logging.warning(
@@ -692,8 +892,14 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
                 return False
 
             cursor.execute(
-                "INSERT INTO xui_hosts (host_name, host_url, host_username, host_pass, host_inbound_id, is_enabled) VALUES (?, ?, ?, ?, ?, 1)",
-                (name, url, user, passwd, inbound),
+                """
+                INSERT INTO xui_hosts (
+                    host_name, host_url, host_username, host_pass,
+                    api_token, host_inbound_id, is_enabled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (name, url, user, passwd, api_token or None, inbound),
             )
             conn.commit()
             logging.info(f"Host '{name}' added.")
@@ -704,7 +910,13 @@ def create_host(name: str, url: str, user: str, passwd: str, inbound: int):
 
 
 def update_host(
-    old_name: str, new_name: str, url: str, user: str, passwd: str, inbound: int
+    old_name: str,
+    new_name: str,
+    url: str,
+    user: str,
+    passwd: str,
+    inbound: int,
+    api_token: str | None = None,
 ) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -724,24 +936,26 @@ def update_host(
                     )
                     return False
 
+            api_token_value = (api_token or "").strip() or None
+
             # If password is empty, don't update it
             if passwd:
                 cursor.execute(
                     """
                     UPDATE xui_hosts 
-                    SET host_name=?, host_url=?, host_username=?, host_pass=?, host_inbound_id=?
+                    SET host_name=?, host_url=?, host_username=?, host_pass=?, api_token=?, host_inbound_id=?
                     WHERE host_name=?
                     """,
-                    (new_name, url, user, passwd, inbound, old_name),
+                    (new_name, url, user, passwd, api_token_value, inbound, old_name),
                 )
             else:
                 cursor.execute(
                     """
                     UPDATE xui_hosts 
-                    SET host_name=?, host_url=?, host_username=?, host_inbound_id=?
+                    SET host_name=?, host_url=?, host_username=?, api_token=?, host_inbound_id=?
                     WHERE host_name=?
                     """,
-                    (new_name, url, user, inbound, old_name),
+                    (new_name, url, user, api_token_value, inbound, old_name),
                 )
 
             # Also update related plans and keys if name changed
@@ -802,9 +1016,20 @@ def delete_host(host_name: str) -> bool:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             host_slug = _host_slug(host_name)
+            cursor.execute(
+                "SELECT plan_id FROM plans WHERE host_name = ? AND service_type = 'xui'",
+                (host_name,),
+            )
+            plan_ids = [row[0] for row in cursor.fetchall()]
             cursor.execute("DELETE FROM xui_hosts WHERE host_name = ?", (host_name,))
-            cursor.execute("DELETE FROM plans WHERE host_name = ?", (host_name,))
-            cursor.execute("DELETE FROM vpn_keys WHERE host_name = ?", (host_name,))
+            cursor.execute(
+                "DELETE FROM plans WHERE host_name = ? AND service_type = 'xui'",
+                (host_name,),
+            )
+            cursor.execute(
+                "DELETE FROM vpn_keys WHERE host_name = ? AND service_type = 'xui'",
+                (host_name,),
+            )
             cursor.execute(
                 "DELETE FROM vpn_keys_missing WHERE host_name = ?", (host_name,)
             )
@@ -818,6 +1043,11 @@ def delete_host(host_name: str) -> bool:
                 "DELETE FROM payment_method_rules WHERE context_key = ?",
                 (f"xui:{host_name}",),
             )
+            for plan_id in plan_ids:
+                cursor.execute(
+                    "DELETE FROM payment_method_rules WHERE context_key = ?",
+                    (f"plan:{plan_id}",),
+                )
             cursor.execute(
                 "UPDATE bot_settings SET value = NULL WHERE key = 'trial_host_name' AND value = ?",
                 (host_name,),
@@ -958,6 +1188,11 @@ def delete_mtg_host(host_name: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            cursor.execute(
+                "SELECT plan_id FROM plans WHERE host_name = ? AND service_type = 'mtg'",
+                (host_name,),
+            )
+            plan_ids = [row[0] for row in cursor.fetchall()]
             cursor.execute("DELETE FROM mtg_hosts WHERE host_name = ?", (host_name,))
             cursor.execute(
                 "DELETE FROM plans WHERE host_name = ? AND service_type = 'mtg'",
@@ -972,6 +1207,11 @@ def delete_mtg_host(host_name: str) -> bool:
                 "DELETE FROM payment_method_rules WHERE context_key = ?",
                 (f"mtg:{host_name}",),
             )
+            for plan_id in plan_ids:
+                cursor.execute(
+                    "DELETE FROM payment_method_rules WHERE context_key = ?",
+                    (f"plan:{plan_id}",),
+                )
             conn.commit()
             logging.info(f"MTG host '{host_name}' deleted.")
             return True
@@ -1033,6 +1273,7 @@ def get_all_keys_with_usernames() -> list[dict]:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT k.*, u.username, u.subscription_token,
+                       u.total_spent, u.total_months, u.trial_used,
                        (julianday(k.expiry_date) - julianday('now')) as days_left
                 FROM vpn_keys k
                 LEFT JOIN users u ON k.user_id = u.telegram_id
@@ -1108,6 +1349,268 @@ def set_setting(key: str, value: str):
     update_setting(key, value)
 
 
+def get_paid_revenue_between(
+    start_at: str | None = None, end_at: str | None = None
+) -> float:
+    query = "SELECT SUM(amount_rub) FROM transactions WHERE status = 'paid'"
+    params: list[str] = []
+    if start_at:
+        query += " AND datetime(created_date) >= datetime(?)"
+        params.append(start_at)
+    if end_at:
+        query += " AND datetime(created_date) < datetime(?)"
+        params.append(end_at)
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, tuple(params))
+            return float(cursor.fetchone()[0] or 0.0)
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get paid revenue between dates: {e}")
+        return 0.0
+
+
+def get_first_paid_transaction_date() -> str | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT created_date
+                FROM transactions
+                WHERE status = 'paid'
+                  AND created_date IS NOT NULL
+                ORDER BY datetime(created_date) ASC, transaction_id ASC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get first paid transaction date: {e}")
+        return None
+
+
+def create_profit_distribution(
+    *,
+    period_start: str | None,
+    period_end: str,
+    revenue_rub: float,
+    bogdan_share_percent: float,
+    vlad_share_percent: float,
+    vlad_tax_percent: float,
+    server_cost_rub: float,
+    bogdan_profit_rub: float,
+    vlad_gross_rub: float,
+    vlad_tax_rub: float,
+    vlad_net_rub: float,
+    note: str | None = None,
+) -> int | None:
+    now = _now_iso()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO profit_distributions (
+                    period_start, period_end, revenue_rub,
+                    bogdan_share_percent, vlad_share_percent, vlad_tax_percent,
+                    server_cost_rub, bogdan_profit_rub, vlad_gross_rub,
+                    vlad_tax_rub, vlad_net_rub, note, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    period_start,
+                    period_end,
+                    revenue_rub,
+                    bogdan_share_percent,
+                    vlad_share_percent,
+                    vlad_tax_percent,
+                    server_cost_rub,
+                    bogdan_profit_rub,
+                    vlad_gross_rub,
+                    vlad_tax_rub,
+                    vlad_net_rub,
+                    note,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+    except sqlite3.Error as e:
+        logging.error(f"Failed to create profit distribution: {e}")
+        return None
+
+
+def get_profit_distributions(limit: int = 12, include_void: bool = True) -> list[dict]:
+    rows: list[dict] = []
+    query = "SELECT * FROM profit_distributions"
+    params: list[object] = []
+    if not include_void:
+        query += " WHERE status = 'active'"
+    query += " ORDER BY period_end DESC, distribution_id DESC LIMIT ?"
+    params.append(limit)
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(query, tuple(params))
+            rows = [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get profit distributions: {e}")
+    return rows
+
+
+def get_last_active_profit_distribution() -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM profit_distributions
+                WHERE status IN ('active', 'paid')
+                ORDER BY period_end DESC, distribution_id DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get last active profit distribution: {e}")
+        return None
+
+
+def has_profit_distribution_overlap(
+    period_start: str | None, period_end: str, exclude_distribution_id: int | None = None
+) -> bool:
+    query = """
+        SELECT 1
+        FROM profit_distributions
+        WHERE status IN ('active', 'paid')
+          AND datetime(COALESCE(period_start, '0001-01-01 00:00:00')) < datetime(?)
+          AND datetime(period_end) > datetime(COALESCE(?, '0001-01-01 00:00:00'))
+    """
+    params: list[object] = [period_end, period_start]
+    if exclude_distribution_id is not None:
+        query += " AND distribution_id != ?"
+        params.append(exclude_distribution_id)
+    query += " LIMIT 1"
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, tuple(params))
+            return cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to check profit distribution overlap: {e}")
+        return True
+
+
+def update_profit_distribution(
+    distribution_id: int,
+    *,
+    period_start: str | None,
+    period_end: str,
+    revenue_rub: float,
+    bogdan_share_percent: float,
+    vlad_share_percent: float,
+    vlad_tax_percent: float,
+    server_cost_rub: float,
+    bogdan_profit_rub: float,
+    vlad_gross_rub: float,
+    vlad_tax_rub: float,
+    vlad_net_rub: float,
+    note: str | None = None,
+) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE profit_distributions
+                SET period_start = ?,
+                    period_end = ?,
+                    revenue_rub = ?,
+                    bogdan_share_percent = ?,
+                    vlad_share_percent = ?,
+                    vlad_tax_percent = ?,
+                    server_cost_rub = ?,
+                    bogdan_profit_rub = ?,
+                    vlad_gross_rub = ?,
+                    vlad_tax_rub = ?,
+                    vlad_net_rub = ?,
+                    note = ?,
+                    updated_at = ?
+                WHERE distribution_id = ?
+                """,
+                (
+                    period_start,
+                    period_end,
+                    revenue_rub,
+                    bogdan_share_percent,
+                    vlad_share_percent,
+                    vlad_tax_percent,
+                    server_cost_rub,
+                    bogdan_profit_rub,
+                    vlad_gross_rub,
+                    vlad_tax_rub,
+                    vlad_net_rub,
+                    note,
+                    _now_iso(),
+                    distribution_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update profit distribution {distribution_id}: {e}")
+        return False
+
+
+def void_profit_distribution(distribution_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE profit_distributions
+                SET status = 'void', updated_at = ?
+                WHERE distribution_id = ? AND status IN ('active', 'paid')
+                """,
+                (_now_iso(), distribution_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to void profit distribution {distribution_id}: {e}")
+        return False
+
+
+def mark_profit_distribution_paid(distribution_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE profit_distributions
+                SET status = 'paid', updated_at = ?
+                WHERE distribution_id = ? AND status = 'active'
+                """,
+                (_now_iso(), distribution_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to mark profit distribution {distribution_id} paid: {e}")
+        return False
+
+
 def create_plan(
     host_name: str, plan_name: str, months: int, price: float, service_type: str = "xui"
 ):
@@ -1146,6 +1649,89 @@ def get_plans_for_host(host_name: str, service_type: str | None = None) -> list[
     except sqlite3.Error as e:
         logging.error(f"Failed to get plans for host '{host_name}': {e}")
         return []
+
+
+def get_global_plan_ids(include_legacy_transactions: bool = True) -> set[int]:
+    """Return plan IDs that represent global XUI subscriptions.
+
+    Global plan rows can be deleted/recreated from the admin panel, so older
+    paid keys may keep a plan_id that no longer exists in plans. Paid
+    transaction metadata is the durable source for those legacy IDs.
+    """
+    plan_ids: set[int] = set()
+    for plan in get_plans_for_host("ALL", service_type="xui"):
+        try:
+            plan_id = int(plan.get("plan_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if plan_id > 0:
+            plan_ids.add(plan_id)
+
+    if not include_legacy_transactions:
+        return plan_ids
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT metadata
+                FROM transactions
+                WHERE status = 'paid'
+                  AND metadata IS NOT NULL
+                  AND metadata != ''
+                """
+            )
+            for row in cursor.fetchall():
+                try:
+                    metadata = json.loads(row["metadata"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+
+                if str(metadata.get("host_name") or "").upper() != "ALL":
+                    continue
+                try:
+                    plan_id = int(metadata.get("plan_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if plan_id > 0:
+                    plan_ids.add(plan_id)
+    except sqlite3.Error as e:
+        logging.error(f"Failed to load legacy global plan IDs: {e}")
+
+    return plan_ids
+
+
+def is_global_xui_key(
+    key: dict,
+    global_plan_ids: set[int] | None = None,
+    enabled_host_names: set[str] | None = None,
+) -> bool:
+    """Detect keys that belong to the global XUI subscription product."""
+    if key.get("service_type", "xui") != "xui":
+        return False
+
+    plan_ids = (
+        global_plan_ids if global_plan_ids is not None else get_global_plan_ids()
+    )
+    try:
+        plan_id = int(key.get("plan_id") or 0)
+    except (TypeError, ValueError):
+        plan_id = 0
+    if plan_id > 0 and plan_id in plan_ids:
+        return True
+
+    key_email = str(key.get("key_email") or "").lower()
+    if plan_id > 0 and "-global-" in key_email:
+        return True
+
+    if enabled_host_names is not None:
+        return bool(key.get("subscription_token")) and (
+            key.get("host_name") in enabled_host_names
+        )
+
+    return False
 
 
 def get_plan_by_id(plan_id: int) -> dict | None:
@@ -1345,6 +1931,22 @@ def set_terms_agreed(telegram_id: int):
         logging.error(f"Failed to set terms agreed for user {telegram_id}: {e}")
 
 
+def update_user_receipt_email(telegram_id: int, receipt_email: str | None) -> bool:
+    email = (receipt_email or "").strip() or None
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET receipt_email = ? WHERE telegram_id = ?",
+                (email, telegram_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update receipt email for user {telegram_id}: {e}")
+        return False
+
+
 def update_user_stats(telegram_id: int, amount_spent: float, months_purchased: int):
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -1541,6 +2143,94 @@ def finalize_reserved_transaction(
         return False
 
 
+def get_pending_yookassa_transactions(limit: int = 20) -> list[dict]:
+    transactions: list[dict] = []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE status = 'pending'
+                  AND metadata IS NOT NULL
+                  AND metadata != ''
+                ORDER BY created_date DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            for row in cursor.fetchall():
+                item = dict(row)
+                try:
+                    metadata = json.loads(item.get("metadata") or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if str(metadata.get("payment_method") or "").lower() != "yookassa":
+                    continue
+                item["metadata_dict"] = metadata
+                transactions.append(item)
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get pending YooKassa transactions: {e}")
+    return transactions
+
+
+def get_pending_paid_retry_transactions(limit: int = 20) -> list[dict]:
+    """Return paid provider transactions that are pending only because fulfillment failed."""
+    transactions: list[dict] = []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE status = 'pending'
+                  AND metadata IS NOT NULL
+                  AND metadata != ''
+                ORDER BY created_date DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            for row in cursor.fetchall():
+                item = dict(row)
+                try:
+                    metadata = json.loads(item.get("metadata") or "{}")
+                except json.JSONDecodeError:
+                    continue
+                method = str(metadata.get("payment_method") or "").lower()
+                if method not in {"telegram stars", "cryptobot"}:
+                    continue
+                if not metadata.get("provider_payment_id"):
+                    continue
+                item["metadata_dict"] = metadata
+                transactions.append(item)
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get pending paid retry transactions: {e}")
+    return transactions
+
+
+def set_webhook_processed(provider: str, external_id: str) -> None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO processed_webhooks (provider, external_id)
+                VALUES (?, ?)
+                """,
+                (provider, external_id),
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(
+            f"Failed to set processed webhook marker for {provider}:{external_id}: {e}"
+        )
+
+
 def log_transaction(
     username: str,
     transaction_id: str | None,
@@ -1648,6 +2338,43 @@ def set_trial_used(telegram_id: int):
             logging.info(f"Trial period marked as used for user {telegram_id}.")
     except sqlite3.Error as e:
         logging.error(f"Failed to set trial used for user {telegram_id}: {e}")
+
+
+def claim_trial_if_unused(telegram_id: int) -> bool:
+    """Atomically mark a user's trial as used if it has not been used yet."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE users
+                SET trial_used = 1
+                WHERE telegram_id = ?
+                  AND COALESCE(trial_used, 0) = 0
+                """,
+                (telegram_id,),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to claim trial for user {telegram_id}: {e}")
+        return False
+
+
+def release_trial_claim(telegram_id: int) -> bool:
+    """Undo a trial claim when provisioning failed before any access was issued."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET trial_used = 0 WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to release trial claim for user {telegram_id}: {e}")
+        return False
 
 
 def add_new_key(
@@ -2542,6 +3269,30 @@ def get_latest_transaction(user_id: int) -> dict | None:
         return None
 
 
+def get_latest_paid_transaction(user_id: int) -> dict | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE user_id = ?
+                  AND status = 'paid'
+                  AND amount_rub > 0
+                ORDER BY created_date DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            transaction = cursor.fetchone()
+            return dict(transaction) if transaction else None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get latest paid transaction for user {user_id}: {e}")
+        return None
+
+
 def get_all_users() -> list[dict]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -2664,12 +3415,64 @@ def mark_notification_sent(
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO sent_notifications (user_id, key_id, notification_type, hours_mark) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO sent_notifications (user_id, key_id, notification_type, hours_mark) VALUES (?, ?, ?, ?)",
                 (user_id, key_id, notification_type, hours_mark),
             )
             conn.commit()
     except Exception as e:
         logger.error(f"Error marking notification sent: {e}")
+
+
+def is_legacy_notification_sent_for_expiry_window(
+    user_id: int,
+    key_id: int | None,
+    notification_type: str,
+    hours_mark: int,
+    expiry_date: datetime,
+) -> bool:
+    """
+    Backward-compatible check for pre-cycle notification rows.
+
+    Older rows did not include the expiry timestamp in notification_type. Treat
+    them as sent only when their sent_at falls into the same reminder window for
+    the current expiry date. This prevents duplicate sends after deployment
+    without suppressing reminders after a later renewal.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if key_id is not None:
+                cursor.execute(
+                    """
+                    SELECT sent_at FROM sent_notifications
+                    WHERE user_id = ? AND key_id = ?
+                      AND notification_type = ? AND hours_mark = ?
+                    """,
+                    (user_id, key_id, notification_type, hours_mark),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT sent_at FROM sent_notifications
+                    WHERE user_id = ? AND key_id IS NULL
+                      AND notification_type = ? AND hours_mark = ?
+                    """,
+                    (user_id, notification_type, hours_mark),
+                )
+
+            for row in cursor.fetchall():
+                sent_at = time_utils.parse_iso_to_msk(row["sent_at"])
+                if not sent_at:
+                    continue
+                hours_left_at_send = math.ceil(
+                    (expiry_date - sent_at).total_seconds() / 3600
+                )
+                if hours_mark - 1 < hours_left_at_send <= hours_mark:
+                    return True
+    except Exception as e:
+        logger.error(f"Error checking legacy sent notification: {e}")
+    return False
 
 
 def cleanup_notifications(days_to_keep: int = 30):
@@ -2877,6 +3680,255 @@ def get_all_payment_rules() -> dict[str, dict[str, bool]]:
         return {}
 
 
+# --- Promo codes ---
+
+
+def normalize_promo_code(code: str | None) -> str:
+    return (code or "").strip().upper()
+
+
+def create_promo_code(
+    code: str, duration_days: int, max_uses: int, expires_at: str | None
+) -> tuple[bool, str]:
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return False, "Промокод не может быть пустым."
+    if duration_days <= 0:
+        return False, "Количество дней подписки должно быть больше 0."
+    if max_uses <= 0:
+        return False, "Лимит применений должен быть больше 0."
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                """
+                INSERT INTO promo_codes (code, duration_days, max_uses, is_active, expires_at, created_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    normalized,
+                    int(duration_days),
+                    int(max_uses),
+                    expires_at,
+                    _now_iso(),
+                ),
+            )
+            conn.commit()
+            return True, f"Промокод {normalized} создан."
+    except sqlite3.IntegrityError:
+        return False, f"Промокод {normalized} уже существует."
+    except sqlite3.Error as e:
+        logging.error(f"Failed to create promo code {normalized}: {e}")
+        return False, "Ошибка базы данных при создании промокода."
+
+
+def get_all_promo_codes() -> list[dict]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT p.*,
+                       COALESCE(SUM(CASE WHEN r.status IN ('reserved', 'applied') THEN 1 ELSE 0 END), 0) AS used_count
+                FROM promo_codes p
+                LEFT JOIN promo_code_redemptions r ON r.promo_id = p.promo_id
+                GROUP BY p.promo_id
+                ORDER BY p.created_at DESC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get promo codes: {e}")
+        return []
+
+
+def update_promo_code(
+    promo_id: int,
+    code: str,
+    duration_days: int,
+    max_uses: int,
+    expires_at: str | None,
+    is_active: bool,
+) -> tuple[bool, str]:
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return False, "Промокод не может быть пустым."
+    if duration_days <= 0:
+        return False, "Количество дней подписки должно быть больше 0."
+    if max_uses <= 0:
+        return False, "Лимит применений должен быть больше 0."
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE promo_codes
+                SET code = ?, duration_days = ?, max_uses = ?, expires_at = ?, is_active = ?
+                WHERE promo_id = ?
+                """,
+                (
+                    normalized,
+                    int(duration_days),
+                    int(max_uses),
+                    expires_at,
+                    1 if is_active else 0,
+                    int(promo_id),
+                ),
+            )
+            conn.commit()
+            if cursor.rowcount == 1:
+                return True, f"Промокод {normalized} обновлён."
+            return False, "Промокод не найден."
+    except sqlite3.IntegrityError:
+        return False, f"Промокод {normalized} уже существует."
+    except sqlite3.Error as e:
+        logging.error(f"Failed to update promo code {promo_id}: {e}")
+        return False, "Ошибка базы данных при обновлении промокода."
+
+
+def set_promo_code_active(promo_id: int, is_active: bool) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE promo_codes SET is_active = ? WHERE promo_id = ?",
+                (1 if is_active else 0, int(promo_id)),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to set promo code active={is_active} {promo_id}: {e}")
+        return False
+
+
+def delete_promo_code(promo_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM promo_code_redemptions WHERE promo_id = ?",
+                (int(promo_id),),
+            )
+            cursor.execute("DELETE FROM promo_codes WHERE promo_id = ?", (int(promo_id),))
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to delete promo code {promo_id}: {e}")
+        return False
+
+
+def claim_promo_code(code: str, user_id: int) -> tuple[str, dict | None]:
+    """Reserve a promo for a user.
+
+    Statuses: ok, not_found, inactive, already_used, exhausted, error.
+    Reserved redemptions must be marked applied or released by the caller.
+    """
+    normalized = normalize_promo_code(code)
+    if not normalized:
+        return "not_found", None
+
+    try:
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT * FROM promo_codes WHERE code = ?", (normalized,))
+            promo_row = cursor.fetchone()
+            if not promo_row:
+                conn.rollback()
+                return "not_found", None
+
+            promo = dict(promo_row)
+            if not bool(promo.get("is_active")):
+                conn.rollback()
+                return "inactive", promo
+
+            expires_at = time_utils.parse_iso_to_msk(promo.get("expires_at"))
+            if expires_at and expires_at < time_utils.get_msk_now():
+                conn.rollback()
+                return "expired", promo
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM promo_code_redemptions
+                WHERE promo_id = ? AND user_id = ? AND status IN ('reserved', 'applied')
+                """,
+                (promo["promo_id"], int(user_id)),
+            )
+            if cursor.fetchone():
+                conn.rollback()
+                return "already_used", promo
+
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM promo_code_redemptions
+                WHERE promo_id = ? AND status IN ('reserved', 'applied')
+                """,
+                (promo["promo_id"],),
+            )
+            used_count = int(cursor.fetchone()[0] or 0)
+            if used_count >= int(promo["max_uses"]):
+                conn.rollback()
+                return "exhausted", promo
+
+            cursor.execute(
+                """
+                INSERT INTO promo_code_redemptions (promo_id, user_id, redeemed_at, status)
+                VALUES (?, ?, ?, 'reserved')
+                """,
+                (promo["promo_id"], int(user_id), _now_iso()),
+            )
+            conn.commit()
+            promo["used_count"] = used_count + 1
+            return "ok", promo
+    except sqlite3.IntegrityError:
+        return "already_used", None
+    except sqlite3.Error as e:
+        logging.error(f"Failed to claim promo code {normalized}: {e}")
+        return "error", None
+
+
+def mark_promo_code_applied(promo_id: int, user_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE promo_code_redemptions
+                SET status = 'applied'
+                WHERE promo_id = ? AND user_id = ? AND status = 'reserved'
+                """,
+                (int(promo_id), int(user_id)),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to mark promo applied {promo_id}/{user_id}: {e}")
+        return False
+
+
+def release_promo_code_claim(promo_id: int, user_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM promo_code_redemptions
+                WHERE promo_id = ? AND user_id = ? AND status = 'reserved'
+                """,
+                (int(promo_id), int(user_id)),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(f"Failed to release promo claim {promo_id}/{user_id}: {e}")
+        return False
+
+
 # --- P2P requests (persistent) ---
 
 
@@ -2944,22 +3996,41 @@ def get_active_p2p_request_for_user(user_id: int) -> dict | None:
         return None
 
 
-def mark_p2p_request_submitted(request_id: str) -> None:
+def mark_p2p_request_submitted(request_id: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(
-                "UPDATE p2p_requests SET submitted = 1 WHERE request_id = ?",
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE p2p_requests
+                SET submitted = 1
+                WHERE request_id = ?
+                  AND submitted = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM p2p_requests active
+                      WHERE active.user_id = p2p_requests.user_id
+                        AND active.submitted = 1
+                        AND active.request_id != p2p_requests.request_id
+                  )
+                """,
                 (request_id,),
             )
             conn.commit()
+            return cursor.rowcount == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to mark p2p_request submitted {request_id}: {e}")
+        return False
 
 
-def delete_p2p_request(request_id: str) -> None:
+def delete_p2p_request(request_id: str) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("DELETE FROM p2p_requests WHERE request_id = ?", (request_id,))
+            cursor = conn.execute(
+                "DELETE FROM p2p_requests WHERE request_id = ?", (request_id,)
+            )
             conn.commit()
+            return cursor.rowcount == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to delete p2p_request {request_id}: {e}")
+        return False

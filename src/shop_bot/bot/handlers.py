@@ -39,7 +39,8 @@ from shop_bot.data_manager.database import (
     get_key_by_id,
     update_key_info,
     update_key_plan_id,
-    set_trial_used,
+    claim_trial_if_unused,
+    release_trial_claim,
     set_terms_agreed,
     get_setting,
     get_all_hosts,
@@ -67,6 +68,13 @@ from shop_bot.data_manager.database import (
     get_active_p2p_request_for_user,
     mark_p2p_request_submitted,
     delete_p2p_request,
+    update_user_receipt_email,
+    get_global_plan_ids,
+    is_global_xui_key,
+    claim_promo_code,
+    mark_promo_code_applied,
+    release_promo_code_claim,
+    normalize_promo_code,
 )
 
 from shop_bot.config import (
@@ -124,6 +132,14 @@ def _get_valid_receipt_email() -> str | None:
     return email
 
 
+def _get_valid_user_receipt_email(user_id: int) -> str | None:
+    user_data = get_user(user_id) or {}
+    email = (user_data.get("receipt_email") or "").strip()
+    if not is_valid_email(email) or _is_placeholder_receipt_email(email):
+        return None
+    return email
+
+
 def _is_payment_method_configured(method: str) -> bool:
     if get_setting(f"{method}_enabled") != "true":
         return False
@@ -163,6 +179,18 @@ def _get_vpn_purchase_plans() -> list[dict]:
             )
             plans_for_display.append(plan_copy)
 
+    for host in get_all_hosts(only_enabled=True):
+        host_name = host.get("host_name")
+        if not host_name:
+            continue
+        for plan in get_plans_for_host(host_name, service_type="xui"):
+            plan_copy = dict(plan)
+            plan_copy["host_name"] = host_name
+            plan_copy["display_name"] = (
+                f"📍 {host_name} · {plan_copy['plan_name']} — {plan_copy['price']:.0f} ₽"
+            )
+            plans_for_display.append(plan_copy)
+
     plans_for_display.sort(
         key=lambda item: (
             0 if item.get("host_name") == "ALL" else 1,
@@ -196,7 +224,7 @@ async def _show_vpn_purchase_plans(
         return
 
     await callback.message.edit_text(
-        "Выберите тариф VPN:",
+        "Выберите тариф:",
         reply_markup=keyboards.create_plans_keyboard(
             plans=plans, action=action, host_name="", key_id=key_id
         ),
@@ -247,6 +275,10 @@ class PaymentProcess(StatesGroup):
     waiting_for_payment_method = State()
 
 
+class PromoCodeProcess(StatesGroup):
+    waiting_for_code = State()
+
+
 def get_active_payment_methods(
     context_key: str | None = None, plan_id: int | None = None
 ) -> Dict[str, bool]:
@@ -293,25 +325,14 @@ def get_active_payment_methods(
 def has_active_global_subscription(active_paid_keys: list[dict]) -> bool:
     """Detect active global subscription based on global plan ids and non-expired keys."""
     try:
-        global_plan_ids = {
-            int(p["plan_id"])
-            for p in get_plans_for_host("ALL", service_type="xui")
-            if p.get("plan_id") is not None
-        }
+        global_plan_ids = get_global_plan_ids()
     except Exception as e:
         logger.warning(f"Error getting global plan IDs: {e}")
         global_plan_ids = set()
 
-    if not global_plan_ids:
-        return False
-
     for key in active_paid_keys:
-        try:
-            if int(key.get("plan_id", 0)) in global_plan_ids:
-                return True
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Error checking plan_id: {e}")
-            continue
+        if is_global_xui_key(key, global_plan_ids):
+            return True
     return False
 
 
@@ -384,8 +405,35 @@ def get_active_paid_keys(user_id: int) -> list[dict]:
     return _dedupe_paid_keys_by_host(active_keys)
 
 
+def get_active_global_paid_keys(user_id: int) -> list[dict]:
+    try:
+        global_plan_ids = get_global_plan_ids()
+    except Exception as e:
+        logger.warning(f"Error getting global plan IDs: {e}")
+        global_plan_ids = set()
+
+    return [
+        key
+        for key in get_active_paid_keys(user_id)
+        if is_global_xui_key(key, global_plan_ids)
+    ]
+
+
 def has_ever_purchased_vpn_subscription(user_id: int) -> bool:
     """Trial is only for users who have never bought VPN access."""
+    user_data = get_user(user_id)
+    if user_data:
+        try:
+            if float(user_data.get("total_spent") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        try:
+            if int(user_data.get("total_months") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
     for key in get_user_paid_keys(user_id):
         if key.get("service_type", "xui") == "xui":
             return True
@@ -441,6 +489,39 @@ def _stars_complete_transaction(
             currency_name="XTR",
         )
         if metadata is None:
+            return None
+        expected_stars = metadata.get("expected_stars_amount")
+        try:
+            if expected_stars is not None and int(expected_stars) != int(paid_stars):
+                logger.error(
+                    "Stars: Amount mismatch for %s: paid=%s expected=%s",
+                    payment_id,
+                    paid_stars,
+                    expected_stars,
+                )
+                finalize_reserved_transaction(
+                    payment_id,
+                    success=False,
+                    metadata=metadata,
+                    payment_method="Telegram Stars",
+                    amount_currency=int(paid_stars),
+                    currency_name="XTR",
+                )
+                return None
+        except (TypeError, ValueError):
+            logger.error(
+                "Stars: Invalid expected_stars_amount=%r for payment %s",
+                expected_stars,
+                payment_id,
+            )
+            finalize_reserved_transaction(
+                payment_id,
+                success=False,
+                metadata=metadata,
+                payment_method="Telegram Stars",
+                amount_currency=int(paid_stars),
+                currency_name="XTR",
+            )
             return None
 
         if telegram_payment_charge_id:
@@ -576,7 +657,7 @@ def get_user_router() -> Router:
 
         if user_data and user_data.get("agreed_to_terms"):
             await message.answer(
-                f"👋 Снова здравствуйте, {html.bold(message.from_user.full_name)}!",
+                "Привет, солнышко ☀️",
                 reply_markup=keyboards.main_reply_keyboard,
             )
             await show_main_menu(message)
@@ -655,9 +736,12 @@ def get_user_router() -> Router:
         try:
             if "@" not in channel_url and "t.me/" not in channel_url:
                 logger.error(
-                    f"Неверный формат URL канала: {channel_url}. Пропускаем проверку подписки."
+                    f"Неверный формат URL канала для обязательной подписки: {channel_url}."
                 )
-                await process_successful_onboarding(callback, state)
+                await callback.answer(
+                    "Проверка подписки временно недоступна из-за ошибки настройки канала. Обратитесь в поддержку.",
+                    show_alert=True,
+                )
                 return
 
             channel_id = (
@@ -718,7 +802,7 @@ def get_user_router() -> Router:
             return
 
         if not has_active_global_access(active_paid_keys, active_trial_keys):
-            await callback.answer("У вас нет активной VPN-подписки.", show_alert=True)
+            await callback.answer("У вас нет активной подписки.", show_alert=True)
             return
 
         if not expected_token or token != expected_token:
@@ -759,7 +843,7 @@ def get_user_router() -> Router:
             return
 
         if not has_active_global_access(active_paid_keys, active_trial_keys):
-            await callback.answer("У вас нет активной VPN-подписки.", show_alert=True)
+            await callback.answer("У вас нет активной подписки.", show_alert=True)
             return
 
         if not expected_token or token != expected_token:
@@ -779,7 +863,9 @@ def get_user_router() -> Router:
         await callback.message.answer(
             "🔗 <b>Ссылка-подписка:</b>\n"
             f"<code>{sub_link}</code>\n\n"
-            "<blockquote>📋 Скопируйте ссылку → откройте Happ → нажмите <b>+</b> → вставьте ссылку и при необходимости обновите подписку.</blockquote>",
+            "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
+            "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
+            "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>",
             reply_markup=keyboards.create_global_link_keyboard(sub_link, token),
             disable_web_page_preview=True,
         )
@@ -792,12 +878,11 @@ def get_user_router() -> Router:
             "Это одна ссылка вида <code>https://.../sub/...</code>, в которой уже собраны все ваши серверы.\n"
             "Её удобно добавлять в <a href='https://www.happ.su/main/ru'>Happ</a> как одну подписку.\n\n"
             "<b>Как подключить:</b>\n"
-            "1. Откройте в боте профиль и скопируйте ссылку подписки или покажите QR.\n"
-            "2. Скопируйте ссылку подписки.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Добавьте ссылку из буфера обмена.\n"
-            "5. Нажмите <b>Обновить подписку</b>, если Happ попросит обновление.\n"
-            "6. Выберите любой сервер из списка и подключитесь.\n\n"
+            "1. Нажмите кнопку <b>🔌 Подключить в Happ</b> рядом со ссылкой подписки.\n"
+            "2. Подтвердите добавление в Happ.\n"
+            "3. Нажмите <b>Обновить подписку</b>, если Happ попросит обновление.\n"
+            "4. Выберите любой сервер из списка и подключитесь.\n\n"
+            "<b>Запасной способ:</b> скопируйте ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
             "<b>Важно:</b> обычный ключ <code>vless://</code> добавляет один сервер,\n"
             "а ссылка <code>https://.../sub/...</code> добавляет сразу всю подписку целиком.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
@@ -840,6 +925,7 @@ def get_user_router() -> Router:
             if dt and dt > now:
                 active_paid_keys.append(key)
         active_paid_keys = _dedupe_paid_keys_by_host(active_paid_keys)
+        active_global_paid_keys = get_active_global_paid_keys(user_id)
 
         active_trial_keys = get_active_trial_keys(user_id)
 
@@ -868,22 +954,22 @@ def get_user_router() -> Router:
         if is_global_active:
             profile_vpn_link = _build_subscription_link(domain, subscription_token)
             if profile_vpn_link:
-                profile_link_label = "Ссылка VPN подписки"
+                profile_link_label = "Ссылка подписки"
 
         # ── Build profile card with blockquote sections ───────────────────────
         parts = [f"👤 <b>{username}</b>\n"]
 
         # VPN card
-        if has_active_global_subscription(active_paid_keys):
+        if active_global_paid_keys:
             min_exp = min(
                 time_utils.parse_iso_to_msk(k["expiry_date"])
-                for k in active_paid_keys
+                for k in active_global_paid_keys
                 if k.get("expiry_date")
             )
             time_left = min_exp - now
             exp_str = time_utils.format_msk(min_exp, "%d.%m.%Y")
             parts.append(
-                f"<blockquote>🔒 <b>VPN подписка</b>  ✅ активна\n"
+                f"<blockquote>🔒 <b>Подписка</b>  ✅ активна\n"
                 f"до {exp_str}  ·  осталось {time_left.days} дн.</blockquote>"
             )
         elif active_trial_keys:
@@ -895,14 +981,14 @@ def get_user_router() -> Router:
             exp_str = time_utils.format_msk(exp_dt, "%d.%m.%Y")
             time_left = exp_dt - now
             parts.append(
-                f"<blockquote>🔒 <b>VPN подписка</b>  🎁 пробный\n"
+                f"<blockquote>🔒 <b>Подписка</b>  🎁 пробный\n"
                 f"до {exp_str}  ·  осталось {time_left.days} дн.</blockquote>"
             )
         elif xui_paid_keys or trial_keys:
-            parts.append("<blockquote>🔒 <b>VPN подписка</b>  ❌ истёкла</blockquote>")
+            parts.append("<blockquote>🔒 <b>Подписка</b>  ❌ истёкла</blockquote>")
         else:
             parts.append(
-                "<blockquote>🔒 <b>VPN подписка</b>  — не приобретена</blockquote>"
+                "<blockquote>🔒 <b>Подписка</b>  — не приобретена</blockquote>"
             )
 
         # Proxy card
@@ -935,12 +1021,18 @@ def get_user_router() -> Router:
         profile_kb = InlineKeyboardBuilder()
 
         if is_global_active and subscription_token:
+            happ_url = keyboards.build_happ_redirect_url(subscription_token)
+            if happ_url:
+                profile_kb.button(
+                    text="🔌 Подключить в Happ",
+                    url=happ_url,
+                )
             profile_kb.button(
-                text="🔗 Ссылка VPN подписки",
+                text="🔗 Ссылка подписки",
                 callback_data=f"global_link_{subscription_token}",
             )
         if active_paid_keys or active_trial_keys or xui_paid_keys or trial_keys:
-            profile_kb.button(text="📦 Мои VPN подписки", callback_data="manage_keys")
+            profile_kb.button(text="📦 Мои подписки", callback_data="manage_keys")
         if mtg_keys:
             label = "📡 Мой Proxy" if active_mtg_keys else "📡 Продлить Proxy"
             profile_kb.button(text=label, callback_data="show_proxy_keys")
@@ -1348,6 +1440,7 @@ def get_user_router() -> Router:
             if dt and dt > now:
                 active_paid_keys.append(k)
         active_paid_keys = _dedupe_paid_keys_by_host(active_paid_keys)
+        active_global_paid_keys = get_active_global_paid_keys(user_id)
         active_trial_keys = get_active_trial_keys(user_id)
         has_global = has_active_global_access(active_paid_keys, active_trial_keys)
 
@@ -1363,7 +1456,7 @@ def get_user_router() -> Router:
                 await callback.message.edit_text(
                     "📂 <b>Управление подписками</b>\n\n" + description,
                     reply_markup=keyboards.create_unified_keys_keyboard(
-                        len(active_paid_keys) or len(active_trial_keys),
+                        len(active_global_paid_keys) or len(active_trial_keys),
                         0,
                         len(mtg_keys),
                     ),
@@ -1468,9 +1561,10 @@ def get_user_router() -> Router:
         await callback.answer()
         user_id = callback.from_user.id
         paid_keys = get_active_paid_keys(user_id)
+        global_paid_keys = get_active_global_paid_keys(user_id)
         trial_keys = get_active_trial_keys(user_id)
-        is_paid_global = has_active_global_subscription(paid_keys)
-        user_keys = paid_keys if is_paid_global else trial_keys
+        is_paid_global = bool(global_paid_keys)
+        user_keys = global_paid_keys if is_paid_global else trial_keys
 
         user_token = get_or_create_subscription_token(user_id)
 
@@ -1537,6 +1631,12 @@ def get_user_router() -> Router:
 
         chosen_host = hosts[0]
 
+        if not claim_trial_if_unused(user_id):
+            await callback.answer(
+                "Вы уже использовали бесплатный пробный период.", show_alert=True
+            )
+            return
+
         await callback.answer()
         await process_trial_key_creation(callback.message, chosen_host["host_name"])
 
@@ -1552,14 +1652,14 @@ def get_user_router() -> Router:
             trial_days = 1
 
         await message.edit_text(
-            f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей VPN-подписки..."
+            f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей подписки..."
         )
 
+        results: list[dict] = []
         try:
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
             hosts_to_process = get_all_hosts(only_enabled=True)
-            results: list[dict] = []
 
             for host in hosts_to_process:
                 current_host_name = host["host_name"]
@@ -1608,12 +1708,11 @@ def get_user_router() -> Router:
                     )
 
             if not results:
+                release_trial_claim(user_id)
                 await message.edit_text(
                     "❌ Не удалось создать пробный доступ. Ошибка на сервере."
                 )
                 return
-
-            set_trial_used(user_id)
 
             await message.delete()
             new_expiry_date = min(
@@ -1630,7 +1729,10 @@ def get_user_router() -> Router:
             if sub_link:
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Добавьте ссылку в Happ как обычную подписку. После окончания пробного периода можно будет продлить эту же глобальную подписку.</blockquote>"
+                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
+                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
+                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.\n"
+                    "После окончания пробного периода можно будет продлить эту же глобальную подписку.</blockquote>"
                 )
             else:
                 final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена в админке."
@@ -1658,11 +1760,244 @@ def get_user_router() -> Router:
             await notify_admin_of_trial(message.bot, user_id, "ALL", trial_days)
 
         except Exception as e:
+            if not results:
+                release_trial_claim(user_id)
             logger.error(
                 f"Error creating trial key for user {user_id} on host {host_name}: {e}",
                 exc_info=True,
             )
             await message.edit_text("❌ Произошла ошибка при создании пробного ключа.")
+
+    @user_router.callback_query(F.data == "enter_promo_code")
+    @registration_required
+    async def enter_promo_code_handler(callback: types.CallbackQuery, state: FSMContext):
+        if str(get_setting("enable_promo_codes") or "true").lower() != "true":
+            await callback.answer("Промокоды сейчас недоступны.", show_alert=True)
+            await show_main_menu(callback.message, edit_message=True)
+            return
+        await callback.answer()
+        await state.set_state(PromoCodeProcess.waiting_for_code)
+        await callback.message.edit_text(
+            "🎟 <b>Введите промокод</b>\n\n"
+            "Отправьте код одним сообщением, например: <code>STOPURBAN11</code>",
+            reply_markup=keyboards.create_back_to_menu_keyboard(),
+        )
+
+    @user_router.message(PromoCodeProcess.waiting_for_code)
+    @registration_required
+    async def process_promo_code_handler(message: types.Message, state: FSMContext):
+        code = normalize_promo_code(message.text)
+        user_id = message.from_user.id
+
+        if str(get_setting("enable_promo_codes") or "true").lower() != "true":
+            await state.clear()
+            await message.answer(
+                "❌ Промокоды сейчас недоступны.",
+                reply_markup=keyboards.create_back_to_menu_keyboard(),
+            )
+            return
+
+        if not code:
+            await message.answer("❌ Введите промокод текстом.")
+            return
+
+        await state.clear()
+
+        if not set_pending_payment(user_id, True):
+            await message.answer(
+                "⏳ Сейчас уже обрабатывается ваша подписка. Попробуйте чуть позже.",
+                reply_markup=keyboards.create_back_to_menu_keyboard(),
+            )
+            return
+
+        promo = None
+        processing_message = None
+        try:
+            status, promo = claim_promo_code(code, user_id)
+            if status == "not_found":
+                await message.answer(
+                    "❌ Промокод не найден или уже истёк.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+            if status == "inactive":
+                await message.answer(
+                    "❌ Промокод больше не активен.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+            if status == "expired":
+                await message.answer(
+                    "❌ Срок действия промокода истёк.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+            if status == "already_used":
+                await message.answer(
+                    "❌ Вы уже применяли этот промокод.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+            if status == "exhausted":
+                await message.answer(
+                    "❌ Промокод уже истёк: лимит применений закончился.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+            if status != "ok" or not promo:
+                await message.answer(
+                    "❌ Не удалось применить промокод. Попробуйте позже.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+
+            global_plans = get_plans_for_host("ALL", service_type="xui")
+            if not global_plans:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await message.answer(
+                    "❌ Администратор ещё не настроил глобальные VPN-тарифы.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+
+            plan = sorted(global_plans, key=lambda item: int(item.get("months") or 0))[0]
+            plan_id = int(plan["plan_id"])
+            duration_days = int(promo["duration_days"])
+
+            hosts = get_all_hosts(only_enabled=True)
+            if not hosts:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await message.answer(
+                    "❌ Сейчас нет доступных VPN-серверов.",
+                    reply_markup=keyboards.create_back_to_menu_keyboard(),
+                )
+                return
+
+            processing_message = await message.answer(
+                f"🎟 Промокод принят. Активирую подписку на {duration_days} дн..."
+            )
+
+            action, key_number, hosts_to_process, prep_error = _build_hosts_for_payment(
+                user_id=user_id, action="new", host_name="ALL", key_id=0
+            )
+            if prep_error:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await processing_message.edit_text(prep_error)
+                return
+
+            results, _primary_key_id = await _execute_payment_for_hosts(
+                user_id=user_id,
+                purchase_host_name="ALL",
+                action=action,
+                plan_id=plan_id,
+                days_to_add=duration_days,
+                hosts_to_process=hosts_to_process,
+                key_id=0,
+            )
+
+            if not results:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await processing_message.edit_text(
+                    "❌ Не удалось активировать подписку по промокоду."
+                )
+                return
+
+            mark_promo_code_applied(int(promo["promo_id"]), user_id)
+            update_user_stats(user_id, 0, 0)
+
+            user_info = get_user(user_id)
+            log_transaction(
+                username=user_info.get("username", "N/A") if user_info else "N/A",
+                transaction_id=None,
+                payment_id=f"promo-{promo['promo_id']}-{user_id}-{uuid.uuid4()}",
+                user_id=user_id,
+                status="paid",
+                amount_rub=0,
+                amount_currency=None,
+                currency_name=None,
+                payment_method="Promo",
+                metadata=json.dumps(
+                    {
+                        "promo_code": promo["code"],
+                        "duration_days": duration_days,
+                        "plan_id": plan_id,
+                        "plan_name": plan.get("plan_name", "Promo"),
+                        "host_name": "ALL",
+                    }
+                ),
+            )
+
+            await processing_message.delete()
+
+            domain = get_setting("domain")
+            user_token = get_or_create_subscription_token(user_id)
+            new_expiry_date = min(
+                time_utils.from_timestamp_ms(res["expiry_timestamp_ms"])
+                for res in results
+            )
+            final_text = (
+                f"🎉 <b>Промокод применён!</b>\n"
+                f"<blockquote>🎟 {html.quote(promo['code'])}\n"
+                f"📅 Подписка активна до {new_expiry_date.strftime('%d.%m.%Y')}\n"
+                f"🔗 Доступно серверов: {len(results)}</blockquote>\n"
+            )
+
+            sub_link = _build_subscription_link(domain, user_token)
+            if sub_link:
+                final_text += (
+                    f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
+                    "<blockquote>Нажмите <b>🔌 Подключить в Happ</b> или скопируйте ссылку и добавьте её вручную.</blockquote>"
+                )
+            else:
+                final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена."
+
+            failed_hosts = [
+                h[0]
+                for h in hosts_to_process
+                if h[0] not in [res["host_name"] for res in results]
+            ]
+            if failed_hosts:
+                final_text += (
+                    "\n\n⚠️ Не удалось выдать доступ на серверы:\n- "
+                    + "\n- ".join(failed_hosts)
+                )
+
+            await message.answer(
+                final_text,
+                reply_markup=(
+                    keyboards.create_global_sub_keyboard(user_token)
+                    if user_token
+                    else keyboards.create_back_to_menu_keyboard()
+                ),
+            )
+
+            await notify_admin_of_purchase(
+                message.bot,
+                {
+                    "user_id": user_id,
+                    "months": 0,
+                    "price": 0,
+                    "host_name": "ALL",
+                    "plan_id": plan_id,
+                    "payment_method": f"Promo {promo['code']}",
+                },
+            )
+
+        except Exception as e:
+            if promo:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+            logger.error(
+                f"Error applying promo code {code} for user {user_id}: {e}",
+                exc_info=True,
+            )
+            if processing_message:
+                await processing_message.edit_text(
+                    "❌ Произошла ошибка при применении промокода."
+                )
+            else:
+                await message.answer("❌ Произошла ошибка при применении промокода.")
+        finally:
+            set_pending_payment(user_id, False)
 
     @user_router.callback_query(F.data.startswith("show_key_"))
     @registration_required
@@ -1787,7 +2122,7 @@ def get_user_router() -> Router:
             bio = BytesIO()
             qr_img.save(bio, "PNG")
             bio.seek(0)
-            qr_code_file = BufferedInputFile(bio.read(), filename="vpn_qr.png")
+            qr_code_file = BufferedInputFile(bio.read(), filename="qr.png")
             await callback.message.answer_photo(
                 photo=qr_code_file, caption="📱 <b>QR-код для ключа</b>"
             )
@@ -1815,15 +2150,15 @@ def get_user_router() -> Router:
             "<b>📖 Инструкция по подключению</b>\n\n"
             "<b>Рекомендуемое приложение:</b> <a href='https://www.happ.su/main/ru'>Happ</a>\n\n"
             "<b>Что вы получаете в боте:</b>\n"
-            "1. <code>vless://...</code> — один VPN-ключ.\n"
+            "1. <code>vless://...</code> — один ключ доступа.\n"
             "2. <code>https://.../sub/...</code> — ссылка подписки со всеми серверами.\n\n"
             "<b>Самый простой сценарий:</b>\n"
             "1. Установите Happ на ваше устройство.\n"
-            "2. Скопируйте в боте ключ или ссылку подписки.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Вставьте ссылку из буфера обмена.\n"
-            "5. Если добавили <code>/sub/</code> — нажмите <b>Обновить подписку</b>.\n"
-            "6. Выберите сервер и включите VPN.\n\n"
+            "2. Если у вас есть ссылка подписки <code>https://.../sub/...</code>, нажмите <b>🔌 Подключить в Happ</b>.\n"
+            "3. Подтвердите добавление в Happ.\n"
+            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
+            "5. Выберите сервер и включите подключение.\n\n"
+            "<b>Запасной способ:</b> скопируйте ключ или ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
             "Выберите платформу ниже:",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
@@ -1836,10 +2171,10 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>Подключение на Android</b>\n\n"
             "1. Установите <a href='https://play.google.com/store/apps/details?id=com.happproxy'>Happ из Google Play</a>.\n"
-            "2. В боте скопируйте VPN-ключ <code>vless://...</code> или ссылку подписки <code>https://.../sub/...</code>.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Выберите добавление из буфера обмена и вставьте ссылку.\n"
-            "5. Если добавили <code>/sub/</code> — нажмите <b>Обновить подписку</b>.\n"
+            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
+            "3. Подтвердите добавление в Happ.\n"
+            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
+            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n\n"
             "Для подписки <code>/sub/</code> в Happ появится список серверов.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
@@ -1852,12 +2187,12 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
-            "1. Установите <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>Happ из App Store</a>.\n"
-            "2. В боте скопируйте VPN-ключ <code>vless://...</code> или ссылку подписки <code>https://.../sub/...</code>.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Выберите добавление из буфера обмена и вставьте ссылку.\n"
-            "5. Если добавили <code>/sub/</code> — нажмите <b>Обновить подписку</b>.\n"
-            "6. Выберите сервер и включите VPN.\n\n"
+            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973'>Happ из App Store</a>.\n"
+            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
+            "3. Подтвердите добавление в Happ.\n"
+            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
+            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
+            "6. Выберите сервер и включите подключение.\n\n"
             "Для подписки <code>/sub/</code> в Happ появится готовый список серверов.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
@@ -1870,10 +2205,10 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>Подключение на macOS</b>\n\n"
             "1. Установите Happ: <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>скачать dmg</a>.\n"
-            "2. В боте скопируйте VPN-ключ <code>vless://...</code> или ссылку подписки <code>https://.../sub/...</code>.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Добавьте ссылку из буфера обмена.\n"
-            "5. Если добавили <code>/sub/</code> — нажмите <b>Обновить подписку</b>.\n"
+            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
+            "3. Подтвердите добавление в Happ.\n"
+            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
+            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n"
             "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
@@ -1887,10 +2222,10 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>Подключение на Windows</b>\n\n"
             "1. Установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ для Windows</a>.\n"
-            "2. В боте скопируйте VPN-ключ <code>vless://...</code> или ссылку подписки <code>https://.../sub/...</code>.\n"
-            "3. Откройте Happ и нажмите <b>+</b>.\n"
-            "4. Добавьте ссылку из буфера обмена.\n"
-            "5. Если добавили <code>/sub/</code> — нажмите <b>Обновить подписку</b>.\n"
+            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
+            "3. Подтвердите добавление в Happ.\n"
+            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
+            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n"
             "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
@@ -2032,6 +2367,21 @@ def get_user_router() -> Router:
     @registration_required
     async def select_host_for_purchase_handler(callback: types.CallbackQuery):
         await callback.answer()
+        host_name = callback.data[len("select_host_new_") :]
+        if host_name and host_name != "ALL":
+            plans = get_plans_for_host(host_name, service_type="xui")
+            if not plans:
+                await callback.message.edit_text(
+                    f'❌ Для сервера "{host_name}" сейчас не настроены тарифы.'
+                )
+                return
+            await callback.message.edit_text(
+                f'Выберите тариф для сервера "{host_name}":',
+                reply_markup=keyboards.create_plans_keyboard(
+                    plans=plans, action="new", host_name=host_name, key_id=0
+                ),
+            )
+            return
         await _show_global_purchase_plans(
             callback,
             keep_source_message=_is_subscription_reminder_message(callback.message),
@@ -2067,9 +2417,30 @@ def get_user_router() -> Router:
 
         service_type = key_data.get("service_type", "xui")
         if service_type == "xui":
-            await _show_global_purchase_plans(
-                callback,
-                keep_source_message=_is_subscription_reminder_message(callback.message),
+            try:
+                is_global_key = is_global_xui_key(key_data, get_global_plan_ids())
+            except Exception:
+                is_global_key = False
+            if is_global_key:
+                await _show_global_purchase_plans(
+                    callback,
+                    keep_source_message=_is_subscription_reminder_message(
+                        callback.message
+                    ),
+                )
+                return
+
+            plans = get_plans_for_host(host_name, service_type="xui")
+            if not plans:
+                await callback.message.edit_text(
+                    f'❌ Для сервера "{host_name}" сейчас не настроены тарифы для продления.'
+                )
+                return
+            await callback.message.edit_text(
+                f'Выберите тариф для продления подписки на сервере "{host_name}":',
+                reply_markup=keyboards.create_plans_keyboard(
+                    plans=plans, action="extend", host_name=host_name, key_id=key_id
+                ),
             )
             return
 
@@ -2209,9 +2580,11 @@ def get_user_router() -> Router:
 
     @user_router.message(PaymentProcess.waiting_for_email)
     async def process_email_handler(message: types.Message, state: FSMContext):
-        if is_valid_email(message.text):
-            await state.update_data(customer_email=message.text)
-            await message.answer(f"✅ Email принят: {message.text}")
+        email = (message.text or "").strip()
+        if is_valid_email(email):
+            update_user_receipt_email(message.chat.id, email)
+            await state.update_data(customer_email=email)
+            await message.answer(f"✅ Email принят: {email}")
             await _create_yookassa_payment(message, state)
         else:
             await message.answer("❌ Неверный формат email. Попробуйте еще раз.")
@@ -2340,6 +2713,8 @@ def get_user_router() -> Router:
                 price_rub = base_price - discount_amount
 
         customer_email = data.get("customer_email")
+        if not customer_email:
+            customer_email = _get_valid_user_receipt_email(user_id)
         if not customer_email:
             customer_email = _get_valid_receipt_email()
         elif not is_valid_email(customer_email):
@@ -2481,6 +2856,39 @@ def get_user_router() -> Router:
                 await state.set_state(PaymentProcess.waiting_for_payment_method)
 
     @user_router.callback_query(
+        PaymentProcess.waiting_for_email, F.data == "use_saved_receipt_email"
+    )
+    async def use_saved_receipt_email_handler(
+        callback: types.CallbackQuery, state: FSMContext
+    ):
+        await callback.answer()
+        saved_email = _get_valid_user_receipt_email(callback.from_user.id)
+        if not saved_email:
+            await callback.message.edit_text(
+                "📧 Сохранённый email не найден. Введите email для отправки чека.",
+                reply_markup=keyboards.create_email_required_keyboard(),
+            )
+            await state.set_state(PaymentProcess.waiting_for_email)
+            return
+
+        await state.update_data(customer_email=saved_email)
+        await _create_yookassa_payment(callback, state)
+
+    @user_router.callback_query(
+        PaymentProcess.waiting_for_email, F.data == "change_receipt_email"
+    )
+    async def change_receipt_email_handler(
+        callback: types.CallbackQuery, state: FSMContext
+    ):
+        await callback.answer()
+        await state.update_data(customer_email=None)
+        await callback.message.edit_text(
+            "📧 Введите новый email для отправки чека.",
+            reply_markup=keyboards.create_email_required_keyboard(),
+        )
+        await state.set_state(PaymentProcess.waiting_for_email)
+
+    @user_router.callback_query(
         PaymentProcess.waiting_for_payment_method, F.data == "pay_yookassa"
     )
     async def create_yookassa_payment_handler(
@@ -2490,6 +2898,19 @@ def get_user_router() -> Router:
         await state.update_data(selected_payment_method="yookassa")
         if str(get_setting("email_prompt_enabled")).lower() == "true":
             fallback_email = _get_valid_receipt_email()
+            saved_email = _get_valid_user_receipt_email(callback.from_user.id)
+            if saved_email:
+                await callback.message.edit_text(
+                    "📧 Email для чека:\n"
+                    f"<code>{html.quote(saved_email)}</code>\n\n"
+                    "Можно сразу перейти к оплате или изменить email.",
+                    reply_markup=keyboards.create_saved_email_keyboard(
+                        has_fallback_email=bool(fallback_email)
+                    ),
+                )
+                await state.set_state(PaymentProcess.waiting_for_email)
+                return
+
             await callback.message.edit_text(
                 "📧 Введите email для отправки чека.\n\n"
                 + (
@@ -2564,6 +2985,7 @@ def get_user_router() -> Router:
             "user_id": user_id,
             "months": plan["months"],
             "price": float(price_rub),
+            "expected_stars_amount": stars_amount,
             "action": data.get("action"),
             "key_id": data.get("key_id"),
             "host_name": data.get("host_name"),
@@ -2626,6 +3048,13 @@ def get_user_router() -> Router:
     async def stars_successful_payment_handler(message: types.Message, bot: Bot):
         sp = message.successful_payment
         payment_id = sp.invoice_payload
+        if sp.currency != "XTR":
+            logger.error(
+                "Stars: Unexpected currency=%s for payload=%s",
+                sp.currency,
+                payment_id,
+            )
+            return
         paid_stars = int(sp.total_amount)
         telegram_payment_charge_id = sp.telegram_payment_charge_id
 
@@ -2774,7 +3203,13 @@ def get_user_router() -> Router:
                 "customer_email": customer_email,
                 "payment_method": "CryptoBot",
             }
-            create_pending_transaction(payment_id, user_id, float(price_rub), metadata)
+            pending_id = create_pending_transaction(
+                payment_id, user_id, float(price_rub), metadata
+            )
+            if not pending_id:
+                raise RuntimeError(
+                    f"Could not persist pending CryptoBot transaction {payment_id}"
+                )
 
             invoice = await crypto.create_invoice(
                 currency_type="fiat",
@@ -2872,6 +3307,9 @@ def get_user_router() -> Router:
             await callback.answer("Заявка устарела или не найдена.", show_alert=True)
             await show_main_menu(callback.message, edit_message=True)
             return
+        if int(pending.get("user_id") or 0) != int(callback.from_user.id):
+            await callback.answer("Это не ваша заявка.", show_alert=True)
+            return
 
         if pending.get("submitted"):
             await callback.answer("Заявка уже отправлена на проверку.", show_alert=True)
@@ -2885,7 +3323,12 @@ def get_user_router() -> Router:
             )
             return
 
-        mark_p2p_request_submitted(request_id)
+        if not mark_p2p_request_submitted(request_id):
+            await callback.answer(
+                "Заявка уже отправлена или у вас есть другая активная заявка.",
+                show_alert=True,
+            )
+            return
         await callback.answer("Ваша заявка отправлена на проверку админу.")
 
         plan_id = pending.get("plan_id")
@@ -2936,12 +3379,17 @@ def get_user_router() -> Router:
             await message.answer("Заявка не найдена или уже подтверждена/отклонена.")
             return
 
+        if not delete_p2p_request(request_id):
+            await message.answer("Заявка уже обрабатывается другим подтверждением.")
+            return
+
         await message.answer("Платеж подтвержден. Выполняю выдачу ключа.")
         pending["payment_method"] = "P2P"
         success = await process_successful_payment(bot, pending)
         if success:
-            delete_p2p_request(request_id)
+            await message.answer("Ключ успешно выдан.")
         else:
+            create_p2p_request(request_id, pending)
             await message.answer(
                 "Выдача не завершилась. Заявка сохранена, можно повторить подтверждение позже."
             )
@@ -3290,35 +3738,58 @@ async def _create_mtg_proxy_after_payment(
                 except Exception:
                     pass
         update_user_stats(user_id, price, months)
-        user_info = get_user(user_id)
-        log_transaction(
-            username=user_info.get("username", "N/A") if user_info else "N/A",
-            transaction_id=None,
-            payment_id=str(uuid.uuid4()),
-            user_id=user_id,
-            status="paid",
-            amount_rub=price,
-            amount_currency=None,
-            currency_name=None,
-            payment_method=metadata.get("payment_method", "Unknown"),
-            metadata=json.dumps(
-                {
-                    "plan_id": plan_id,
-                    "plan_name": (
-                        plan.get("plan_name", "Unknown") if plan else "Unknown"
-                    ),
-                    "host_name": host_name,
-                    "service_type": "mtg",
-                    "customer_email": metadata.get("customer_email"),
-                }
-            ),
+        provider_payment_id = metadata.get("provider_payment_id")
+        payment_id_for_log = (
+            str(provider_payment_id).strip()
+            if provider_payment_id
+            else str(uuid.uuid4())
         )
+        existing_status = (
+            _get_transaction_status(payment_id_for_log) if provider_payment_id else None
+        )
+        if provider_payment_id and existing_status in {"pending", "processing", "paid"}:
+            logger.info(
+                "Skipping duplicate MTG transaction insert for provider payment_id=%s status=%s user_id=%s",
+                payment_id_for_log,
+                existing_status,
+                user_id,
+            )
+        else:
+            user_info = get_user(user_id)
+            log_transaction(
+                username=user_info.get("username", "N/A") if user_info else "N/A",
+                transaction_id=None,
+                payment_id=payment_id_for_log,
+                user_id=user_id,
+                status="paid",
+                amount_rub=price,
+                amount_currency=None,
+                currency_name=None,
+                payment_method=metadata.get("payment_method", "Unknown"),
+                metadata=json.dumps(
+                    {
+                        "plan_id": plan_id,
+                        "plan_name": (
+                            plan.get("plan_name", "Unknown") if plan else "Unknown"
+                        ),
+                        "host_name": host_name,
+                        "service_type": "mtg",
+                        "customer_email": metadata.get("customer_email"),
+                    }
+                ),
+            )
     except Exception as e:
         logger.error(
             f"MTG post-payment stats/log error for user {user_id}: {e}", exc_info=True
         )
 
-    await processing_message.delete()
+    try:
+        try:
+            await processing_message.delete()
+        except Exception as e:
+            logger.warning("Could not delete payment processing message: %s", e)
+    except Exception as e:
+        logger.warning("Could not delete MTG processing message: %s", e)
 
     # Determine display key number (count only MTG proxy keys)
     all_mtg_keys = [k for k in get_user_keys(user_id) if k.get("service_type") == "mtg"]
@@ -3334,15 +3805,26 @@ async def _create_mtg_proxy_after_payment(
         expiry_date=new_expiry_dt,
         proxy_link=proxy_link,
     )
-    await bot.send_message(
-        chat_id=user_id,
-        text=final_text,
-        reply_markup=keyboards.create_proxy_info_keyboard(
-            int(used_key_id or 0), proxy_link
-        ),
-        parse_mode="HTML",
-    )
-    await notify_admin_of_purchase(bot, metadata)
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=final_text,
+            reply_markup=keyboards.create_proxy_info_keyboard(
+                int(used_key_id or 0), proxy_link
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(
+            "MTG access was issued but success message failed for user %s: %s",
+            user_id,
+            e,
+            exc_info=True,
+        )
+    try:
+        await notify_admin_of_purchase(bot, metadata)
+    except Exception as e:
+        logger.warning("MTG admin purchase notification failed: %s", e)
     return True
 
 
@@ -3743,7 +4225,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Вставьте ссылку в Happ и при необходимости нажмите <b>Обновить подписку</b>.</blockquote>"
+                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
+                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
+                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>"
                 )
 
             # Report failures if any
@@ -3758,27 +4242,46 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                     + "\n- ".join(failed_hosts)
                 )
 
-            await bot.send_message(
-                chat_id=user_id,
-                text=final_text,
-                reply_markup=(
-                    keyboards.create_global_sub_keyboard(user_token)
-                    if user_token
-                    else keyboards.create_back_to_menu_keyboard()
-                ),
-            )
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=final_text,
+                    reply_markup=(
+                        keyboards.create_global_sub_keyboard(user_token)
+                        if user_token
+                        else keyboards.create_back_to_menu_keyboard()
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "VPN access was issued but global success message failed for user %s: %s",
+                    user_id,
+                    e,
+                    exc_info=True,
+                )
         else:
             final_text += "\n\n<blockquote>📋 Скопируйте ключ → откройте Happ → нажмите <b>+</b> → вставьте ссылку из буфера обмена.</blockquote>"
-            await bot.send_message(
-                chat_id=user_id,
-                text=final_text,
-                reply_markup=keyboards.create_key_info_keyboard(
-                    primary_key_id if primary_key_id is not None else key_id,
-                    connection_string,
-                ),
-            )
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=final_text,
+                    reply_markup=keyboards.create_key_info_keyboard(
+                        primary_key_id if primary_key_id is not None else key_id,
+                        connection_string,
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "VPN access was issued but success message failed for user %s: %s",
+                    user_id,
+                    e,
+                    exc_info=True,
+                )
 
-        await notify_admin_of_purchase(bot, metadata)
+        try:
+            await notify_admin_of_purchase(bot, metadata)
+        except Exception as e:
+            logger.warning("Admin purchase notification failed: %s", e)
         return True
 
     except Exception as e:

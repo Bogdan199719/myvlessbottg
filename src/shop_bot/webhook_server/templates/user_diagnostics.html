@@ -14,6 +14,7 @@
     <div class="diagnostic-summary">
         <div class="count-pill">Пользователь: <strong>{{ diagnostic_user.telegram_id }}</strong></div>
         <div class="count-pill">Username: <strong>@{{ diagnostic_user.username or 'N/A' }}</strong></div>
+        <div class="count-pill">Email для чеков: <strong>{{ diagnostic_user.receipt_email or '—' }}</strong></div>
         <div class="count-pill">Проверено ключей: <strong>{{ checked_total }}</strong></div>
         <div class="count-pill">Проблемных: <strong>{{ issues_total }}</strong></div>
     </div>

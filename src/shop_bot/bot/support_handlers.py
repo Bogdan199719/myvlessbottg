@@ -81,24 +81,75 @@ def _format_history_message(entry: dict) -> str:
     return f"[{timestamp}] {direction}: {text}"
 
 
+def _get_enabled_xui_host_names() -> set[str]:
+    return {
+        host.get("host_name")
+        for host in database.get_all_hosts(only_enabled=True)
+        if host.get("host_name")
+    }
+
+
+def _format_host_list(host_names: list[str], limit: int = 6) -> str:
+    if not host_names:
+        return "нет активных хостов"
+    visible = host_names[:limit]
+    suffix = "" if len(host_names) <= limit else f" и ещё {len(host_names) - limit}"
+    return ", ".join(html.escape(name) for name in visible) + suffix
+
+
 async def get_user_summary(user_id: int, username: str) -> str:
     keys = database.get_user_keys(user_id)
     latest_transaction = database.get_latest_transaction(user_id)
+    latest_paid_transaction = database.get_latest_paid_transaction(user_id)
     now = time_utils.get_msk_now()
+    try:
+        global_plan_ids = database.get_global_plan_ids()
+    except Exception as error:
+        logger.warning("Failed to load global plan ids for support summary: %s", error)
+        global_plan_ids = set()
+    enabled_xui_hosts = _get_enabled_xui_host_names()
 
-    active_keys = []
+    active_global_keys = []
+    active_regular_keys = []
     for key in keys:
         expiry_dt = time_utils.parse_iso_to_msk(key.get("expiry_date"))
         if expiry_dt and expiry_dt > now:
-            active_keys.append((key, expiry_dt))
+            item = (key, expiry_dt)
+            if database.is_global_xui_key(key, global_plan_ids, enabled_xui_hosts):
+                active_global_keys.append(item)
+            else:
+                active_regular_keys.append(item)
 
     summary_parts = [
         f"<b>Новый тикет от пользователя:</b> @{html.escape(username)} (ID: <code>{user_id}</code>)\n"
     ]
 
-    if active_keys:
+    if active_global_keys or active_regular_keys:
         summary_parts.append("<b>🔑 Активные ключи:</b>")
-        for key, expiry_dt in active_keys:
+        if active_global_keys:
+            expiry_dates = [expiry_dt for _, expiry_dt in active_global_keys]
+            expiry = time_utils.format_msk(min(expiry_dates), "%d.%m.%Y")
+            host_names = sorted(
+                {
+                    key.get("host_name")
+                    for key, _ in active_global_keys
+                    if key.get("host_name")
+                }
+            )
+            missing_host_names = sorted(enabled_xui_hosts - set(host_names))
+            total_hosts = len(enabled_xui_hosts) or len(host_names)
+            hosts_count_text = str(len(host_names))
+            if total_hosts and total_hosts != len(host_names):
+                hosts_count_text = f"{len(host_names)}/{total_hosts}"
+            summary_parts.append(
+                f"- 🌍 <b>Глобальная подписка</b> (до {expiry}; "
+                f"серверов: {hosts_count_text} — {_format_host_list(host_names)})"
+            )
+            if missing_host_names:
+                summary_parts.append(
+                    f"  ⚠️ Не выданы/недоступны: {_format_host_list(missing_host_names)}"
+                )
+        for key, expiry_dt in active_regular_keys:
             expiry = time_utils.format_msk(expiry_dt, "%d.%m.%Y")
             summary_parts.append(
                 f"- <code>{html.escape(key['key_email'])}</code> (до {expiry} на хосте {html.escape(key['host_name'])})"
@@ -106,17 +157,39 @@ async def get_user_summary(user_id: int, username: str) -> str:
     else:
         summary_parts.append("<b>🔑 Активные ключи:</b> Нет")
 
-    if latest_transaction:
-        summary_parts.append("\n<b>💸 Последняя транзакция:</b>")
+    def _format_transaction(transaction: dict) -> str:
         try:
-            metadata = json.loads(latest_transaction.get("metadata", "{}") or "{}")
+            metadata = json.loads(transaction.get("metadata", "{}") or "{}")
         except JSONDecodeError:
             metadata = {}
         plan_name = metadata.get("plan_name", "N/A")
-        price = latest_transaction.get("amount_rub", "N/A")
-        tx_date = time_utils.parse_iso_to_msk(latest_transaction.get("created_date"))
+        if plan_name == "N/A" and metadata.get("plan_id"):
+            try:
+                plan = database.get_plan_by_id(int(metadata["plan_id"]))
+                if plan and plan.get("plan_name"):
+                    plan_name = plan["plan_name"]
+            except (TypeError, ValueError):
+                pass
+        price = transaction.get("amount_rub", "N/A")
+        method = transaction.get("payment_method") or metadata.get("payment_method")
+        method_text = f", {html.escape(str(method))}" if method else ""
+        tx_date = time_utils.parse_iso_to_msk(transaction.get("created_date"))
         date = time_utils.format_msk(tx_date, "%d.%m.%Y") if tx_date else "N/A"
-        summary_parts.append(f"- {html.escape(str(plan_name))} за {price} RUB ({date})")
+        return f"- {html.escape(str(plan_name))} за {price} RUB ({date}{method_text})"
+
+    if latest_paid_transaction:
+        summary_parts.append("\n<b>💸 Последняя оплата:</b>")
+        summary_parts.append(_format_transaction(latest_paid_transaction))
+        if (
+            latest_transaction
+            and latest_transaction.get("payment_id")
+            != latest_paid_transaction.get("payment_id")
+        ):
+            summary_parts.append("<b>🎟 Последняя служебная/промо операция:</b>")
+            summary_parts.append(_format_transaction(latest_transaction))
+    elif latest_transaction:
+        summary_parts.append("\n<b>💸 Последняя транзакция:</b>")
+        summary_parts.append(_format_transaction(latest_transaction))
     else:
         summary_parts.append("\n<b>💸 Последняя транзакция:</b> Нет")
 

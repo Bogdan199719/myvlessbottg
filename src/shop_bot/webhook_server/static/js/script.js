@@ -127,180 +127,319 @@ document.addEventListener('DOMContentLoaded', function () {
 	}
 
 	function initializeDashboardCharts() {
-		const usersChartCanvas = document.getElementById('newUsersChart')
 		const chartDataEl = document.getElementById('chart-data')
-		if (!usersChartCanvas || !chartDataEl) {
+		const trendChartCanvas = document.getElementById('analyticsTrendChart')
+		const paymentChartCanvas = document.getElementById('paymentMethodsChart')
+		if (!chartDataEl || (!trendChartCanvas && !paymentChartCanvas)) {
 			return
 		}
 
-		let CHART_DATA
+		if (typeof Chart === 'undefined') {
+			return
+		}
+
+		let chartData
 		try {
-			CHART_DATA = JSON.parse(chartDataEl.textContent || '{}')
+			chartData = JSON.parse(chartDataEl.textContent || '{}')
 		} catch (e) {
 			return
 		}
 
-		if (!CHART_DATA || !CHART_DATA.users || !CHART_DATA.keys) {
+		if (!chartData || !chartData.series) {
 			return
 		}
 
-		function prepareChartData(data, label, color) {
-			const labels = []
-			const values = []
-			const today = new Date()
+		const labels = Array.isArray(chartData.labels) ? chartData.labels : []
+		const dates = Array.isArray(chartData.dates) ? chartData.dates : []
+		const charts = []
 
-			for (let i = 29; i >= 0; i--) {
-				const date = new Date(today)
-				date.setDate(today.getDate() - i)
-				const dateString = date.toISOString().split('T')[0]
-				const formattedDate = `${date.getDate().toString().padStart(2, '0')}.${(
-					date.getMonth() + 1
-				)
-					.toString()
-					.padStart(2, '0')}`
-				labels.push(formattedDate)
-				values.push(data[dateString] || 0)
-			}
-
-			return {
-				labels: labels,
-				datasets: [
-					{
-						label: label,
-						data: values,
-						borderColor: color,
-						backgroundColor: color + '33',
-						borderWidth: 2,
-						fill: true,
-						tension: 0.3,
-					},
-				],
-			}
+		function valuesFor(seriesName) {
+			const series = chartData.series[seriesName] || {}
+			return dates.map(date => Number(series[date] || 0))
 		}
 
-		function updateChartFontsAndLabels(chart) {
+		function compactMoney(value) {
+			const amount = Number(value || 0)
+			return `${amount.toLocaleString('ru-RU', {
+				maximumFractionDigits: 0,
+			})} ₽`
+		}
+
+		function compactNumber(value) {
+			return Number(value || 0).toLocaleString('ru-RU')
+		}
+
+		function formatFullDate(isoDate) {
+			const parts = String(isoDate || '').split('-')
+			if (parts.length !== 3) return isoDate || ''
+			return `${parts[2]}.${parts[1]}.${parts[0]}`
+		}
+
+		function baseScaleOptions() {
 			const isMobile = window.innerWidth <= 768
 			const isVerySmall = window.innerWidth <= 470
-			chart.options.scales.x.ticks.font.size = isMobile ? 10 : 12
-			chart.options.scales.y.ticks.font.size = isMobile ? 10 : 12
-			chart.options.plugins.legend.labels.font.size = isMobile ? 12 : 14
-			chart.options.scales.x.ticks.maxTicksLimit = isMobile ? 8 : 15
-			chart.options.scales.x.ticks.display = !isVerySmall
-			chart.options.scales.y.ticks.display = !isVerySmall
-			chart.options.plugins.legend.display = !isVerySmall
-			chart.update()
+
+			return {
+				x: {
+					grid: {
+						color: 'rgba(255, 255, 255, 0.05)',
+					},
+					ticks: {
+						color: 'rgba(176, 186, 201, 0.9)',
+						font: {
+							size: isMobile ? 10 : 12,
+						},
+						maxTicksLimit: isMobile ? 8 : 15,
+						maxRotation: 0,
+						minRotation: 0,
+						display: !isVerySmall,
+					},
+				},
+				y: {
+					beginAtZero: true,
+					grid: {
+						color: 'rgba(255, 255, 255, 0.06)',
+					},
+					ticks: {
+						color: 'rgba(176, 186, 201, 0.9)',
+						font: {
+							size: isMobile ? 10 : 12,
+						},
+						display: !isVerySmall,
+					},
+				},
+			}
 		}
 
-		const usersCtx = usersChartCanvas.getContext('2d')
-		const usersChartData = prepareChartData(
-			CHART_DATA.users,
-			'Новых пользователей в день',
-			'#007bff'
-		)
-		const usersChart = new Chart(usersCtx, {
-			type: 'line',
-			data: usersChartData,
-			options: {
-				scales: {
-					y: {
-						beginAtZero: true,
-						ticks: {
-							precision: 0,
-							font: {
-								size: window.innerWidth <= 768 ? 10 : 12,
-							},
-							display: window.innerWidth > 470,
-						},
-					},
-					x: {
-						ticks: {
-							font: {
-								size: window.innerWidth <= 768 ? 10 : 12,
-							},
-							maxTicksLimit: window.innerWidth <= 768 ? 8 : 15,
-							maxRotation: 45,
-							minRotation: 45,
-							display: window.innerWidth > 470,
-						},
-					},
-				},
-				responsive: true,
-				maintainAspectRatio: false,
-				layout: {
-					autoPadding: true,
-					padding: 0,
-				},
-				plugins: {
-					legend: {
-						labels: {
-							font: {
-								size: window.innerWidth <= 768 ? 12 : 14,
-							},
-							display: window.innerWidth > 470,
-						},
-					},
-				},
-			},
-		})
+		function updateResponsiveOptions() {
+			const isMobile = window.innerWidth <= 768
+			const isVerySmall = window.innerWidth <= 470
 
-		const keysChartCanvas = document.getElementById('newKeysChart')
-		if (!keysChartCanvas) return
+			charts.forEach(chart => {
+				if (chart.options.scales) {
+					Object.assign(chart.options.scales, baseScaleOptions())
+				}
+				if (chart.options.plugins && chart.options.plugins.legend) {
+					chart.options.plugins.legend.display = !isVerySmall
+					chart.options.plugins.legend.labels.font.size = isMobile ? 11 : 12
+				}
+				chart.update()
+			})
+		}
 
-		const keysCtx = keysChartCanvas.getContext('2d')
-		const keysChartData = prepareChartData(
-			CHART_DATA.keys,
-			'Новых ключей в день',
-			'#28a745'
-		)
-		const keysChart = new Chart(keysCtx, {
-			type: 'line',
-			data: keysChartData,
-			options: {
-				scales: {
-					y: {
-						beginAtZero: true,
-						ticks: {
-							precision: 0,
-							font: {
-								size: window.innerWidth <= 768 ? 10 : 12,
+		if (trendChartCanvas && labels.length && dates.length) {
+			const trendChart = new Chart(trendChartCanvas.getContext('2d'), {
+				type: 'bar',
+				data: {
+					labels: labels,
+					datasets: [
+						{
+							label: 'Выручка, ₽',
+							data: valuesFor('revenue'),
+							borderColor: '#4da3ff',
+							backgroundColor: 'rgba(77, 163, 255, 0.46)',
+							borderWidth: 1,
+							borderRadius: 5,
+							maxBarThickness: 28,
+							yAxisID: 'revenue',
+							order: 2,
+						},
+						{
+							label: 'Оплаты, шт.',
+							data: valuesFor('orders'),
+							type: 'line',
+							borderColor: '#4cc38a',
+							backgroundColor: '#4cc38a',
+							borderWidth: 2,
+							fill: false,
+							tension: 0.28,
+							yAxisID: 'count',
+							pointRadius: 3,
+							pointHoverRadius: 5,
+							order: 1,
+						},
+						{
+							label: 'Новые пользователи, шт.',
+							data: valuesFor('users'),
+							type: 'line',
+							borderColor: '#f5a54a',
+							backgroundColor: '#f5a54a',
+							borderWidth: 2,
+							fill: false,
+							tension: 0.28,
+							yAxisID: 'count',
+							pointRadius: 3,
+							pointHoverRadius: 5,
+							borderDash: [5, 4],
+							order: 0,
+						},
+					],
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false,
+					interaction: {
+						mode: 'index',
+						intersect: false,
+					},
+					scales: {
+						x: baseScaleOptions().x,
+						revenue: {
+							type: 'linear',
+							position: 'left',
+							beginAtZero: true,
+							grid: {
+								color: 'rgba(255, 255, 255, 0.06)',
+							},
+							ticks: {
+								color: 'rgba(176, 186, 201, 0.9)',
+								callback: value => compactMoney(value),
+								display: window.innerWidth > 470,
+							},
+							title: {
+								display: window.innerWidth > 470,
+								text: 'Выручка',
+								color: 'rgba(176, 186, 201, 0.9)',
+							},
+						},
+						count: {
+							type: 'linear',
+							position: 'right',
+							beginAtZero: true,
+							grid: {
+								drawOnChartArea: false,
+							},
+							ticks: {
+								color: 'rgba(176, 186, 201, 0.9)',
+								precision: 0,
+								callback: value => compactNumber(value),
+								display: window.innerWidth > 470,
+							},
+							title: {
+								display: window.innerWidth > 470,
+								text: 'Оплаты и пользователи',
+								color: 'rgba(176, 186, 201, 0.9)',
+							},
+						},
+					},
+					plugins: {
+						legend: {
+							labels: {
+								color: 'rgba(232, 237, 245, 0.92)',
+								boxWidth: 10,
+								boxHeight: 10,
+								usePointStyle: true,
+								font: {
+									size: window.innerWidth <= 768 ? 11 : 12,
+								},
 							},
 							display: window.innerWidth > 470,
 						},
-					},
-					x: {
-						ticks: {
-							font: {
-								size: window.innerWidth <= 768 ? 10 : 12,
+						tooltip: {
+							backgroundColor: 'rgba(12, 16, 22, 0.96)',
+							borderColor: 'rgba(255, 255, 255, 0.12)',
+							borderWidth: 1,
+							callbacks: {
+								title: items => {
+									const index = items && items.length ? items[0].dataIndex : 0
+									return formatFullDate(dates[index])
+								},
+								label: context => {
+									const label = context.dataset.label || ''
+									if (context.dataset.yAxisID === 'revenue') {
+										return `${label}: ${compactMoney(context.parsed.y)}`
+									}
+									return `${label}: ${compactNumber(context.parsed.y)}`
+								},
+								afterBody: items => {
+									const index = items && items.length ? items[0].dataIndex : 0
+									const date = dates[index]
+									const revenue = Number((chartData.series.revenue || {})[date] || 0)
+									const orders = Number((chartData.series.orders || {})[date] || 0)
+									const users = Number((chartData.series.users || {})[date] || 0)
+									if (!revenue && !orders && !users) {
+										return ['Данных за день нет']
+									}
+									return [
+										`Итого: ${compactMoney(revenue)}`,
+										`Оплат: ${compactNumber(orders)}`,
+										`Новых пользователей: ${compactNumber(users)}`,
+									]
+								},
 							},
-							maxTicksLimit: window.innerWidth <= 768 ? 8 : 15,
-							maxRotation: 45,
-							minRotation: 45,
-							display: window.innerWidth > 470,
 						},
 					},
 				},
-				responsive: true,
-				maintainAspectRatio: false,
-				layout: {
-					autoPadding: true,
-					padding: 0,
-				},
-				plugins: {
-					legend: {
-						labels: {
-							font: {
-								size: window.innerWidth <= 768 ? 12 : 14,
+			})
+			charts.push(trendChart)
+		}
+
+		if (paymentChartCanvas) {
+			const methods = Array.isArray(chartData.payment_methods)
+				? chartData.payment_methods
+				: []
+			const paymentLabels = methods.map(item => item.method || 'Неизвестно')
+			const paymentValues = methods.map(item => Number(item.revenue || 0))
+
+			if (paymentLabels.length) {
+				const paymentChart = new Chart(paymentChartCanvas.getContext('2d'), {
+					type: 'doughnut',
+					data: {
+						labels: paymentLabels,
+						datasets: [
+							{
+								data: paymentValues,
+								backgroundColor: [
+									'#4da3ff',
+									'#4cc38a',
+									'#f5a54a',
+									'#ff6b6b',
+									'#a78bfa',
+									'#22d3ee',
+								],
+								borderColor: 'rgba(12, 16, 22, 0.96)',
+								borderWidth: 3,
 							},
-							display: window.innerWidth > 470,
+						],
+					},
+					options: {
+						responsive: true,
+						maintainAspectRatio: false,
+						cutout: '68%',
+						plugins: {
+							legend: {
+								position: 'bottom',
+								labels: {
+									color: 'rgba(232, 237, 245, 0.92)',
+									boxWidth: 10,
+									boxHeight: 10,
+									usePointStyle: true,
+									font: {
+										size: window.innerWidth <= 768 ? 11 : 12,
+									},
+								},
+								display: window.innerWidth > 470,
+							},
+							tooltip: {
+								backgroundColor: 'rgba(12, 16, 22, 0.96)',
+								borderColor: 'rgba(255, 255, 255, 0.12)',
+								borderWidth: 1,
+								callbacks: {
+									label: context => {
+										const value = context.parsed || 0
+										return `${context.label}: ${compactMoney(value)}`
+									},
+								},
+							},
 						},
 					},
-				},
-			},
-		})
+				})
+				charts.push(paymentChart)
+			}
+		}
 
 		window.addEventListener('resize', () => {
-			updateChartFontsAndLabels(usersChart)
-			updateChartFontsAndLabels(keysChart)
+			updateResponsiveOptions()
 		})
 	}
 
@@ -327,7 +466,10 @@ document.addEventListener('DOMContentLoaded', function () {
 			rows.forEach(row => {
 				const status = normalize(row.dataset.status)
 				const haystack = normalize(row.dataset.search || row.textContent)
-				const matchesFilter = activeFilter === 'all' || status === activeFilter
+				const matchesFilter =
+					activeFilter === 'all' ||
+					status === activeFilter ||
+					(activeFilter === 'no_subscription' && status === 'trial_expired')
 				const matchesQuery = !query || haystack.includes(query)
 				const show = matchesFilter && matchesQuery
 				row.style.display = show ? '' : 'none'
@@ -375,6 +517,7 @@ document.addEventListener('DOMContentLoaded', function () {
 		function matchesStatus(rowStatus) {
 			if (activeFilter === 'all') return true
 			if (activeFilter === 'global') return rowStatus.type === 'global'
+			if (activeFilter === 'trial') return rowStatus.trial === '1'
 			if (activeFilter === 'expired') return rowStatus.status === 'expired'
 			if (activeFilter === 'expiring') return rowStatus.status === 'expiring'
 			if (activeFilter === 'active') return rowStatus.status === 'active'
@@ -390,6 +533,7 @@ document.addEventListener('DOMContentLoaded', function () {
 				const rowStatus = {
 					type: normalize(row.dataset.keyType),
 					status: normalize(row.dataset.keyStatus),
+					trial: normalize(row.dataset.keyTrial),
 				}
 				const haystack = normalize(row.dataset.keySearch || row.textContent)
 				const matchFilter = matchesStatus(rowStatus)
@@ -448,6 +592,37 @@ document.addEventListener('DOMContentLoaded', function () {
 		})
 	}
 
+	function setupProfitDistributionPreview() {
+		const select = document.getElementById('profitDistributionPeriod')
+		const preview = document.getElementById('profitDistributionPreview')
+		if (!select || !preview) return
+
+		const fields = {
+			period: preview.querySelector('[data-profit-preview="period"]'),
+			revenue: preview.querySelector('[data-profit-preview="revenue"]'),
+			tax: preview.querySelector('[data-profit-preview="tax"]'),
+			serverShare: preview.querySelector('[data-profit-preview="serverShare"]'),
+			bogdan: preview.querySelector('[data-profit-preview="bogdan"]'),
+			vlad: preview.querySelector('[data-profit-preview="vlad"]'),
+		}
+
+		function applyPreview() {
+			const option = select.options[select.selectedIndex]
+			if (!option) return
+			if (fields.period) fields.period.textContent = option.dataset.period || '—'
+			if (fields.revenue) fields.revenue.textContent = option.dataset.revenue || '0'
+			if (fields.tax) fields.tax.textContent = option.dataset.tax || '0'
+			if (fields.serverShare) {
+				fields.serverShare.textContent = option.dataset.serverShare || '0'
+			}
+			if (fields.bogdan) fields.bogdan.textContent = option.dataset.bogdan || '0'
+			if (fields.vlad) fields.vlad.textContent = option.dataset.vlad || '0'
+		}
+
+		select.addEventListener('change', applyPreview)
+		applyPreview()
+	}
+
 	initializePasswordToggles()
 	setupBotControlForms()
 	setupConfirmationForms()
@@ -457,4 +632,5 @@ document.addEventListener('DOMContentLoaded', function () {
 	setupUserTableFilters()
 	setupKeyTableFilters()
 	setupMobileNavigation()
+	setupProfitDistributionPreview()
 })

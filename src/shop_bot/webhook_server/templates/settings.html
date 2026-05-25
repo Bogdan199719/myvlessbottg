@@ -11,15 +11,16 @@
   ('cryptobot',  '🤖 CryptoBot'),
 ] -%}
 <div class="payment-rules-section">
-  <h4>💳 Методы оплаты
-    <small style="font-weight:normal;color:#aaa;font-style:italic">курсив = глобальная настройка</small>
-    <form action="/payment-rules/reset" method="post" style="margin:0">
+  <div class="payment-rules-head">
+    <h4>Методы оплаты</h4>
+    <small class="payment-rules-note">Курсив = глобальная настройка</small>
+    <form action="/payment-rules/reset" method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="context_key" value="{{ context_key }}">
       <button type="submit" class="button button-warning button-tiny" title="Сбросить все правила для этого контекста"
         onclick="return confirm('Сбросить правила оплаты?')">↺ сброс</button>
     </form>
-  </h4>
+  </div>
   <div class="pay-methods-grid">
     {%- set ctx_rules = pay_rules.get(context_key, {}) -%}
     {%- for method, label in ml %}
@@ -38,14 +39,14 @@
     {%- endfor %}
   </div>
   {%- if host_plans %}
-  <div style="margin-top:8px;">
+  <div class="plan-rules-list">
     {%- for plan in host_plans %}
     {%- set plan_key = 'plan:' ~ plan.plan_id %}
     {%- set plan_rules = pay_rules.get(plan_key, {}) %}
-    <div style="margin-bottom:5px;">
-      <div style="font-size:12px;color:#666;margin-bottom:3px;display:flex;align-items:center;gap:6px;">
-        ↳ <b>{{ plan.plan_name }}</b> <span style="color:#aaa">({{ plan.months }} мес., {{ plan.price|int }} ₽)</span>
-        <form action="/payment-rules/reset" method="post" style="margin:0">
+    <div class="plan-rules-item">
+      <div class="plan-rules-title">
+        <b>{{ plan.plan_name }}</b> <span>{{ plan.months }} мес., {{ plan.price|int }} ₽</span>
+        <form action="/payment-rules/reset" method="post">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="context_key" value="{{ plan_key }}">
           <button type="submit" class="button button-warning button-tiny"
@@ -78,14 +79,12 @@
 
 <div class="settings-container">
 	<div class="settings-column-left">
-		<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
-			<hr style="flex:1;border:none;border-top:2px solid #6c8ebf;margin:0;">
-			<span style="font-size:13px;font-weight:600;color:#6c8ebf;white-space:nowrap;letter-spacing:.5px;">🔒 VPN / VLESS</span>
-			<hr style="flex:1;border:none;border-top:2px solid #6c8ebf;margin:0;">
+		<div class="service-divider">
+			<span>VPN / VLESS</span>
 		</div>
-		<section class="settings-section" id="hosts" style="border-left:4px solid #6c8ebf;">
+		<section class="settings-section service-section" id="hosts">
 			<h2>Управление Хостами (Серверами)</h2>
-			<p style="margin-top:-8px;margin-bottom:16px;color:var(--text-secondary,#888);font-size:13px;">Серверы 3x-ui для продажи VPN/VLESS подписок.</p>
+			<p class="section-description">Серверы 3x-ui для продажи VPN/VLESS подписок.</p>
 
 			<div class="host-card host-card-global">
 				<div class="host-header">
@@ -137,6 +136,67 @@
 				</div>
 			</div>
 
+			<div class="host-card" id="promo-codes">
+				<h3>🎟 Промокоды на глобальную подписку</h3>
+				<p>Промокод выдаёт пользователю VPN-подписку на все активные серверы. Дни подписки добавляются к текущей платной подписке или trial. Один пользователь может применить один и тот же промокод только один раз.</p>
+
+				<form action="{{ url_for('toggle_promo_codes_feature_route') }}" method="post" class="form-inline">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					<input type="hidden" name="enable_promo_codes" value="{{ 'false' if settings.enable_promo_codes == 'true' else 'true' }}">
+					<span class="status-badge host-status-badge {% if settings.enable_promo_codes == 'true' %}status-active{% else %}status-stopped{% endif %}">
+						{% if settings.enable_promo_codes == 'true' %}Функция включена{% else %}Функция отключена{% endif %}
+					</span>
+					<button type="submit" class="button {% if settings.enable_promo_codes == 'true' %}button-warning{% else %}button-success{% endif %} button-small">
+						{% if settings.enable_promo_codes == 'true' %}Отключить промокоды{% else %}Включить промокоды{% endif %}
+					</button>
+				</form>
+
+				<form action="{{ url_for('add_promo_code_route') }}" method="post" class="form-inline">
+					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+					<input type="text" name="code" placeholder="STOPURBAN11" maxlength="64" required />
+					<input type="number" name="duration_days" placeholder="Дней подписки пользователю" min="1" required />
+					<input type="date" name="expires_on" title="Срок жизни промокода: до какой даты его можно вводить" required />
+					<input type="number" name="max_uses" placeholder="Лимит применений" min="1" required />
+					<button type="submit" class="button button-primary button-small">+</button>
+				</form>
+
+				{% if promo_codes %}
+				<ul class="plan-list">
+					{% for promo in promo_codes %}
+					<li>
+						<form action="{{ url_for('update_promo_code_route', promo_id=promo.promo_id) }}" method="post" class="form-inline">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<input type="text" name="code" value="{{ promo.code }}" maxlength="64" required />
+							<input type="number" name="duration_days" value="{{ promo.duration_days }}" min="1" title="Дней подписки пользователю" required />
+							<input type="date" name="expires_on" value="{{ promo.expires_at[:10] if promo.expires_at else '' }}" title="Срок жизни промокода" required />
+							<input type="number" name="max_uses" value="{{ promo.max_uses }}" min="1" title="Лимит применений" required />
+							<label class="toggle-row">
+								<input type="checkbox" name="is_active" value="true" {% if promo.is_active %}checked{% endif %} />
+								<span>Активен</span>
+							</label>
+							<span class="count-pill">{{ promo.used_count }}/{{ promo.max_uses }}</span>
+							<button type="submit" class="button button-primary button-tiny">Сохранить</button>
+						</form>
+						<form action="{{ url_for('toggle_promo_code_route', promo_id=promo.promo_id) }}" method="post">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<input type="hidden" name="is_active" value="{{ 'false' if promo.is_active else 'true' }}">
+							<button type="submit" class="button {% if promo.is_active %}button-warning{% else %}button-success{% endif %} button-tiny">
+								{% if promo.is_active %}⏸️{% else %}▶️{% endif %}
+							</button>
+						</form>
+						<form action="{{ url_for('delete_promo_code_route', promo_id=promo.promo_id) }}" method="post"
+							data-confirm="Удалить промокод '{{ promo.code }}' и историю его применений?">
+							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+							<button type="submit" class="button button-danger button-tiny">×</button>
+						</form>
+					</li>
+					{% endfor %}
+				</ul>
+				{% else %}
+				<p>Промокоды не добавлены.</p>
+				{% endif %}
+			</div>
+
 			<div class="host-card">
 				<h4>{% if edit_host %}Редактировать хост{% else %}Добавить новый хост{% endif %}</h4>
 				<form action="{{ url_for('update_host_route') if edit_host else url_for('add_host_route') }}"
@@ -166,6 +226,16 @@
 							<input type="password" id="host_pass" name="host_pass" {% if not edit_host %}required{% endif %} />
 							<button type="button" class="toggle-password">👁️</button>
 						</div>
+					</div>
+					<div class="form-group">
+						<label for="api_token">API Token XUI (опционально):</label>
+						<div class="password-wrapper">
+							<input type="password" id="api_token" name="api_token"
+								placeholder="Bearer token из Settings → Security → API Token"
+								value="" />
+							<button type="button" class="toggle-password">👁️</button>
+						</div>
+						<small class="field-hint">Для 3x-ui v3: если задан, бот использует Authorization: Bearer и не зависит от cookie/CSRF.{% if edit_host and edit_host.api_token_configured %} Токен сохранён; оставьте пустым, чтобы не менять.{% endif %}</small>
 					</div>
 					<div class="form-group">
 						<label for="host_inbound_id">ID входящего подключения:</label>
@@ -262,14 +332,12 @@
 		</section>
 
 		{# ── MTG Proxy Hosts ────────────────────────────────────────────── #}
-		<div style="display:flex;align-items:center;gap:12px;margin:32px 0 16px;">
-			<hr style="flex:1;border:none;border-top:2px solid #4a9de0;margin:0;">
-			<span style="font-size:13px;font-weight:600;color:#4a9de0;white-space:nowrap;letter-spacing:.5px;">📡 TELEGRAM PROXY</span>
-			<hr style="flex:1;border:none;border-top:2px solid #4a9de0;margin:0;">
+		<div class="service-divider service-divider-alt">
+			<span>Telegram Proxy</span>
 		</div>
-		<section class="settings-section" id="mtg-hosts" style="border-left:4px solid #4a9de0;">
-			<h2>📡 MTG Proxy хосты</h2>
-			<p style="margin-top:-8px;margin-bottom:16px;color:var(--text-secondary,#888);font-size:13px;">Управление серверами Telegram MTProto Proxy. Отдельная сущность — не связана с VPN подписками.</p>
+		<section class="settings-section service-section service-section-alt" id="mtg-hosts">
+			<h2>MTG Proxy хосты</h2>
+			<p class="section-description">Управление серверами Telegram MTProto Proxy. Отдельная сущность, не связанная с VPN подписками.</p>
 
 			<div class="host-card">
 				<h4>{% if edit_mtg_host is defined and edit_mtg_host %}Редактировать MTG-хост{% else %}Добавить MTG Proxy хост{% endif %}</h4>
@@ -436,6 +504,7 @@
 				<a href="#content-settings">Контент</a>
 				<a href="#backup">Бэкап</a>
 				<a href="#hosts">Хосты</a>
+				<a href="#promo-codes">Промокоды</a>
 			</nav>
 			<section class="settings-section" id="panel-settings">
 				<h2>Настройки Панели</h2>
@@ -459,7 +528,7 @@
 				<div class="form-group">
 					<label for="telegram_bot_token">Токен бота:</label>
 					<div class="password-wrapper">
-						<input type="password" id="telegram_bot_token" name="telegram_bot_token" placeholder="123456:ABCDEF" value="{{ settings.telegram_bot_token or '' }}" required />
+						<input type="password" id="telegram_bot_token" name="telegram_bot_token" placeholder="{% if settings.telegram_bot_token_configured %}Токен сохранён, оставьте пустым чтобы не менять{% else %}123456:ABCDEF{% endif %}" value="" />
 						<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
@@ -500,7 +569,7 @@
 					<label for="support_bot_token">Токен Support-бота (если используется):</label>
 					<div class="password-wrapper">
 						<input type="password" id="support_bot_token" name="support_bot_token"
-							value="{{ settings.support_bot_token or '' }}" />
+							value="" placeholder="{% if settings.support_bot_token_configured %}Токен сохранён, оставьте пустым чтобы не менять{% endif %}" />
 						<button type="button" class="copy-button" data-copy-target="support_bot_token">📋</button>
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
@@ -589,7 +658,7 @@
 						<label for="yookassa_secret_key">YooKassa Secret Key:</label>
 						<div class="password-wrapper">
 							<input type="password" id="yookassa_secret_key" name="yookassa_secret_key"
-								value="{{ settings.yookassa_secret_key or '' }}" />
+								value="" placeholder="{% if settings.yookassa_secret_key_configured %}Секрет сохранён, оставьте пустым чтобы не менять{% endif %}" />
 							<button type="button" class="copy-button" data-copy-target="yookassa_secret_key">📋</button>
 							<button type="button" class="toggle-password">👁️</button>
 						</div>
@@ -645,7 +714,7 @@
 						<label for="cryptobot_token">CryptoBot Token:</label>
 						<div class="password-wrapper">
 							<input type="password" id="cryptobot_token" name="cryptobot_token"
-								value="{{ settings.cryptobot_token or '' }}" />
+								value="" placeholder="{% if settings.cryptobot_token_configured %}Токен сохранён, оставьте пустым чтобы не менять{% endif %}" />
 							<button type="button" class="copy-button" data-copy-target="cryptobot_token">📋</button>
 							<button type="button" class="toggle-password">👁️</button>
 						</div>
@@ -654,8 +723,8 @@
 						<label for="cryptobot_webhook_secret">CryptoBot Webhook Secret (legacy fallback):</label>
 						<div class="password-wrapper">
 							<input type="password" id="cryptobot_webhook_secret" name="cryptobot_webhook_secret"
-								autocomplete="off" value="{{ settings.cryptobot_webhook_secret or '' }}"
-								placeholder="Например: my-super-secret-token" />
+								autocomplete="off" value=""
+								placeholder="{% if settings.cryptobot_webhook_secret_configured %}Секрет сохранён, оставьте пустым чтобы не менять{% else %}Например: my-super-secret-token{% endif %}" />
 							<button type="button" class="copy-button"
 								data-copy-target="cryptobot_webhook_secret">📋</button>
 							<button type="button" class="toggle-password">👁️</button>
@@ -679,6 +748,12 @@
 
 			<section class="settings-section" id="content-settings">
 				<h2>Настройки Контента</h2>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="show_about_menu_item" value="false" />
+					<input type="checkbox" id="show_about_menu_item" name="show_about_menu_item" value="true" {% if
+						settings.show_about_menu_item!='false' %}checked{% endif %}>
+					<label for="show_about_menu_item">Показывать пункт "О проекте" в главном меню Telegram-бота</label>
+				</div>
 				<div class="form-group">
 					<label for="about_text">Текст "О проекте":</label>
 					<textarea id="about_text" name="about_text" rows="3">

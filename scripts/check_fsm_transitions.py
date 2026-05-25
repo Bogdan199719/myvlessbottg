@@ -22,7 +22,12 @@ REQUIRED_STATE_CALLBACKS: dict[str, set[str]] = {
         "broadcast_skip_button",
     },
     "Broadcast.waiting_for_confirmation": {"confirm_broadcast"},
-    "PaymentProcess.waiting_for_email": {"back_to_plans", "skip_email"},
+    "PaymentProcess.waiting_for_email": {
+        "back_to_plans",
+        "skip_email",
+        "use_saved_receipt_email",
+        "change_receipt_email",
+    },
     "PaymentProcess.waiting_for_payment_method": {
         "pay_yookassa",
         "pay_stars",

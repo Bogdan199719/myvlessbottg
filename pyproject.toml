@@ -10,10 +10,10 @@ dependencies = [
     "pyotp==2.9.0",
     "python-dotenv==1.2.2",
     "qrcode[pil]==8.2",
-    "requests==2.32.3",
+    "requests==2.33.1",
     "yookassa==3.5.0",
     "aiosend==2.1.2",
-    "aiohttp==3.9.5",
+    "aiohttp==3.13.5",
     "aiohttp-sse-client==0.2.1",
     "pytz==2026.1",
     "waitress==3.0.2"

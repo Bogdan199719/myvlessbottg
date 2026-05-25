@@ -1,11 +1,13 @@
 import uuid
 import time
+import json
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
+import requests
 from py3xui import Api, Client, Inbound
 
 from shop_bot.data_manager.database import (
@@ -44,7 +46,7 @@ COUNTRY_FLAGS = {
     "🇨🇦": ["canada"],
     "🇲🇽": ["mexico"],
     "🇩🇪": ["germany", "deutschland"],
-    "🇳🇱": ["netherlands", "nederland"],
+    "🇳🇱": ["netherlands", "nederland", "niderland", "niderlands", "holland"],
     "🇫🇷": ["france", "french"],
     "🇬🇧": ["uk", "united kingdom", "britain", "england"],
     "🇮🇹": ["italy", "italia"],
@@ -105,6 +107,35 @@ def get_country_flag_by_host(host_name: str) -> str:
     return "🇺🇸"  # Default to USA
 
 
+def _build_server_remark(host_name: str) -> str:
+    country_flag = get_country_flag_by_host(host_name)
+    clean_server_name = (
+        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
+    )
+    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
+    clean_server_name = clean_server_name.lstrip("_")
+    return f"{country_flag}{clean_server_name}"
+
+
+def _replace_link_remark(connection_string: str, remark: str) -> str:
+    if not connection_string or not remark:
+        return connection_string
+
+    parts = urlsplit(connection_string)
+    if not parts.scheme:
+        return connection_string
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            parts.query,
+            quote(remark, safe=""),
+        )
+    )
+
+
 def _log_host_error(host_url: str, error: Exception) -> None:
     """Log host connection errors with rate limiting to reduce log spam."""
     error_type = type(error).__name__
@@ -141,15 +172,127 @@ def _is_transient_network_error(error: Exception) -> bool:
     return any(marker in error_msg for marker in _TRANSIENT_NETWORK_ERROR_MARKERS)
 
 
+def _attach_bearer_auth(api: Api, api_token: str) -> None:
+    """
+    Teach py3xui's current request layer to use 3x-ui v3 Bearer tokens.
+
+    py3xui 0.4.x only knows session-cookie requests. The 3x-ui panel now
+    accepts Authorization: Bearer <apiToken> under /panel/api/* and bypasses
+    CSRF for those callers. Keeping this adapter local lets existing cookie
+    login keep working for older panels.
+    """
+    token = api_token.strip()
+    if not token:
+        return
+
+    for api_part in (api.client, api.inbound, api.database, api.server):
+        original_request = api_part._request_with_retry
+
+        def _request_with_bearer(
+            method, url, headers, _original=original_request, **kwargs
+        ):
+            auth_headers = dict(headers or {})
+            auth_headers["Authorization"] = f"Bearer {token}"
+            return _original(method, url, auth_headers, **kwargs)
+
+        api_part.session = "__bearer_token__"
+        api_part.cookie_name = None
+        api_part._request_with_retry = _request_with_bearer
+
+    api.session = "__bearer_token__"
+    api.cookie_name = None
+
+
+def _set_cookie_auth(
+    api: Api, cookie_name: str, cookie_value: str, csrf_token: str | None = None
+) -> None:
+    for api_part in (api.client, api.inbound, api.database, api.server):
+        api_part.session = cookie_value
+        api_part.cookie_name = cookie_name
+        if csrf_token:
+            original_request = api_part._request_with_retry
+
+            def _request_with_csrf(
+                method, url, headers, _original=original_request, **kwargs
+            ):
+                auth_headers = dict(headers or {})
+                auth_headers["X-CSRF-Token"] = csrf_token
+                return _original(method, url, auth_headers, **kwargs)
+
+            api_part._request_with_retry = _request_with_csrf
+
+    api.session = cookie_value
+    api.cookie_name = cookie_name
+
+
+def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> bool:
+    """
+    Login against 3x-ui builds that require a CSRF token on /login.
+
+    Newer 3x-ui SPA pages expose /csrf-token before login. py3xui 0.4.x does
+    not fetch or replay that token, so panels can return 403 on the legacy path.
+    """
+    session = requests.Session()
+    csrf_url = f"{host_url.rstrip('/')}/csrf-token"
+    login_url = f"{host_url.rstrip('/')}/login"
+    try:
+        csrf_response = session.get(
+            csrf_url, headers={"Accept": "application/json"}, timeout=10
+        )
+        csrf_response.raise_for_status()
+        csrf_payload = csrf_response.json()
+        csrf_token = str(csrf_payload.get("obj") or "").strip()
+        if not csrf_token:
+            return False
+
+        login_response = session.post(
+            login_url,
+            headers={
+                "Accept": "application/json",
+                "X-CSRF-Token": csrf_token,
+            },
+            json={"username": username, "password": password},
+            timeout=10,
+        )
+        login_response.raise_for_status()
+        payload = login_response.json()
+        if not payload.get("success"):
+            logger.warning(
+                "CSRF-aware XUI login failed for '%s': %s",
+                host_url,
+                payload.get("msg"),
+            )
+            return False
+
+        for cookie in session.cookies:
+            if cookie.value:
+                _set_cookie_auth(api, cookie.name, cookie.value, csrf_token=csrf_token)
+                return True
+    except Exception as e:
+        logger.debug("CSRF-aware XUI login failed for '%s': %s", host_url, e)
+
+    return False
+
+
 def login_to_host(
-    host_url: str, username: str, password: str, inbound_id: int
+    host_url: str,
+    username: str,
+    password: str,
+    inbound_id: int,
+    api_token: str | None = None,
 ) -> tuple[Api | None, Inbound | None]:
     host_url = host_url.rstrip("/")
+    token = (api_token or "").strip()
 
     for attempt in range(1, _XUI_LOGIN_ATTEMPTS + 1):
         try:
             api = Api(host=host_url, username=username, password=password)
-            api.login()
+            if token:
+                _attach_bearer_auth(api, token)
+            elif _login_with_csrf(api, host_url, username, password):
+                pass
+            else:
+                api.login()
             inbounds: List[Inbound] = api.inbound.get_list()
             target_inbound = next(
                 (inbound for inbound in inbounds if inbound.id == inbound_id), None
@@ -217,10 +360,378 @@ def _set_unlimited_traffic_fields(client: Client) -> bool:
     return changed
 
 
+def _find_client_by_email(inbound: Inbound, email: str) -> Client | None:
+    clients = getattr(getattr(inbound, "settings", None), "clients", None) or []
+    for client in clients:
+        if getattr(client, "email", None) == email:
+            return client
+    return None
+
+
+def _get_client_identifier_for_protocol(protocol: str, client: Client) -> str | None:
+    protocol = (protocol or "").lower()
+    if protocol == "trojan":
+        return getattr(client, "password", None)
+    if protocol == "shadowsocks":
+        return getattr(client, "email", None)
+    if protocol in {"hysteria", "hysteria2"}:
+        return getattr(client, "auth", None) or getattr(client, "id", None)
+    return getattr(client, "id", None)
+
+
+def _raw_client_id_field_for_protocol(protocol: str) -> str:
+    protocol = (protocol or "").lower()
+    if protocol == "trojan":
+        return "password"
+    if protocol == "shadowsocks":
+        return "email"
+    if protocol in {"hysteria", "hysteria2"}:
+        return "auth"
+    return "id"
+
+
+def _protocol_uses_raw_client_api(protocol: str | None) -> bool:
+    """
+    Protocols whose client credential fields are not represented by py3xui's
+    Client model. Use 3x-ui's JSON API directly so auth/password fields match
+    the panel's own schema.
+    """
+    return (protocol or "").lower() in {"hysteria", "hysteria2"}
+
+
+def _build_client_for_inbound(
+    inbound: Inbound,
+    email: str,
+    enable: bool,
+    expiry_time: int,
+    flow: str = "",
+    telegram_id: str | None = None,
+    client_identifier: str | None = None,
+) -> tuple[Client, str]:
+    """
+    Build a 3x-ui client using the credential field required by the inbound protocol.
+
+    3x-ui validates VLESS/VMess by id, Trojan by password, and Shadowsocks by
+    email. Sending only id to a Trojan inbound makes the panel reject addClient
+    with "empty client ID" even though the UUID is present in JSON.
+    """
+    protocol = (getattr(inbound, "protocol", "") or "").lower()
+    identifier = client_identifier or str(uuid.uuid4())
+
+    client_kwargs = {
+        "email": email,
+        "enable": enable,
+        "flow": flow,
+        "expiry_time": expiry_time,
+        "sub_id": uuid.uuid4().hex[:16],
+        "total_gb": 0,
+        "reset": 0,
+        "tg_id": telegram_id,
+    }
+
+    if protocol == "trojan":
+        client_kwargs["password"] = identifier
+    elif protocol == "shadowsocks":
+        # Shadowsocks uses email as the panel-side client key. Keep a generated
+        # password for panels/configs that require a non-empty credential.
+        identifier = email
+        client_kwargs["password"] = client_identifier or str(uuid.uuid4())
+    elif protocol in {"hysteria", "hysteria2"}:
+        # py3xui 0.4.0 does not model Hysteria's auth field, so Hysteria clients
+        # are created via raw API helpers instead of this pydantic model.
+        client_kwargs["id"] = identifier
+    else:
+        client_kwargs["id"] = identifier
+
+    client = Client(**client_kwargs)
+    _set_unlimited_traffic_fields(client)
+    return client, identifier
+
+
+def _ensure_client_identifier_for_protocol(
+    protocol: str, client: Client, fallback_email: str
+) -> str:
+    protocol = (protocol or "").lower()
+
+    if protocol == "trojan":
+        identifier = getattr(client, "password", None)
+        if not identifier:
+            identifier = str(uuid.uuid4())
+            client.password = identifier
+        return str(identifier)
+
+    if protocol == "shadowsocks":
+        identifier = getattr(client, "email", None) or fallback_email
+        client.email = identifier
+        if not getattr(client, "password", None):
+            client.password = str(uuid.uuid4())
+        return str(identifier)
+
+    identifier = getattr(client, "id", None)
+    if not identifier:
+        identifier = str(uuid.uuid4())
+        client.id = identifier
+    return str(identifier)
+
+
+def _link_matches_inbound(link: str, inbound: Inbound) -> bool:
+    try:
+        parsed = urlsplit(link)
+    except Exception:
+        return False
+
+    expected_scheme = (getattr(inbound, "protocol", "") or "").lower()
+    if expected_scheme == "hysteria":
+        expected_schemes = {"hysteria", "hysteria2"}
+    else:
+        expected_schemes = {expected_scheme}
+
+    if expected_scheme and parsed.scheme.lower() not in expected_schemes:
+        return False
+
+    try:
+        link_port = parsed.port
+    except ValueError:
+        link_port = None
+
+    return link_port == getattr(inbound, "port", None)
+
+
+def _filter_links_for_inbound(links: list[str], inbound: Inbound) -> list[str]:
+    matched = [link for link in links if _link_matches_inbound(link, inbound)]
+    if matched or len(links) <= 1:
+        return matched or links
+    logger.debug(
+        "Panel returned %s links for inbound %s but none matched port/protocol.",
+        len(links),
+        getattr(inbound, "id", ""),
+    )
+    return []
+
+
+def _get_client_links_from_panel(api: Api, inbound: Inbound, email: str) -> list[str]:
+    """Ask 3x-ui to build protocol URLs using its official clients API."""
+    try:
+        endpoint = f"panel/api/clients/links/{quote(email, safe='')}"
+        url = api.inbound._url(endpoint)
+        response = api.inbound._request_with_retry(
+            requests.get,
+            url,
+            {"Accept": "application/json"},
+        )
+        payload = response.json()
+        links = [str(link) for link in (payload.get("obj") or []) if link]
+        if links:
+            return _filter_links_for_inbound(links, inbound)
+    except Exception as e:
+        logger.debug(
+            "Could not get v3 panel-generated client links for '%s' on inbound %s: %s",
+            email,
+            getattr(inbound, "id", ""),
+            e,
+        )
+
+    try:
+        endpoint = (
+            f"panel/api/inbounds/getClientLinks/{inbound.id}/"
+            f"{quote(email, safe='')}"
+        )
+        url = api.inbound._url(endpoint)
+        response = api.inbound._request_with_retry(
+            requests.get,
+            url,
+            {"Accept": "application/json"},
+        )
+        payload = response.json()
+        links = [str(link) for link in (payload.get("obj") or []) if link]
+        return _filter_links_for_inbound(links, inbound)
+    except Exception as e:
+        logger.debug(
+            "Could not get legacy panel-generated client links for '%s' on inbound %s: %s",
+            email,
+            getattr(inbound, "id", ""),
+            e,
+        )
+        return []
+
+
+def _protocol_prefers_panel_links(protocol: str | None) -> bool:
+    """
+    Protocols whose share-link format is panel-specific or not implemented
+    locally. Ask 3x-ui's own link provider first for these protocols.
+    """
+    return (protocol or "").lower() in {
+        "http",
+        "mixed",
+        "shadowsocks",
+        "tunnel",
+        "wireguard",
+    }
+
+
+def _connection_string_for_client(
+    api: Api,
+    inbound: Inbound,
+    host_url: str,
+    email: str,
+    client_identifier: str | None,
+    remark: str,
+) -> str | None:
+    protocol = getattr(inbound, "protocol", "") or ""
+    protocol_lower = protocol.lower()
+    connection_string = None
+
+    if protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
+        connection_string = get_connection_string(
+            inbound, client_identifier, host_url, remark=remark
+        )
+    elif _protocol_prefers_panel_links(protocol):
+        panel_links = _get_client_links_from_panel(api, inbound, email)
+        connection_string = panel_links[0] if panel_links else None
+        if not connection_string and client_identifier:
+            connection_string = get_connection_string(
+                inbound, client_identifier, host_url, remark=remark
+            )
+    elif client_identifier:
+        connection_string = get_connection_string(
+            inbound, client_identifier, host_url, remark=remark
+        )
+        if not connection_string:
+            panel_links = _get_client_links_from_panel(api, inbound, email)
+            connection_string = panel_links[0] if panel_links else None
+
+    return _replace_link_remark(connection_string, remark)
+
+
+def _raw_api_request(
+    api: Api, method, endpoint: str, payload: dict | None = None
+) -> dict:
+    url = api.inbound._url(endpoint)
+    kwargs = {}
+    if payload is not None:
+        kwargs["json"] = payload
+    response = api.inbound._request_with_retry(
+        method,
+        url,
+        {"Accept": "application/json"},
+        **kwargs,
+    )
+    result = response.json()
+    if isinstance(result, dict) and result.get("success") is False:
+        raise RuntimeError(result.get("msg") or f"3x-ui API request failed: {endpoint}")
+    return result
+
+
+def _get_raw_inbound_obj(api: Api, inbound_id: int) -> dict:
+    payload = _raw_api_request(
+        api,
+        requests.get,
+        f"panel/api/inbounds/get/{inbound_id}",
+    )
+    return payload.get("obj") or {}
+
+
+def _get_raw_clients(api: Api, inbound_id: int) -> list[dict]:
+    inbound_obj = _get_raw_inbound_obj(api, inbound_id)
+    settings_raw = inbound_obj.get("settings") or "{}"
+    settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+    return settings.get("clients") or []
+
+
+def _build_raw_client_for_protocol(
+    protocol: str,
+    email: str,
+    enable: bool,
+    expiry_time: int,
+    flow: str = "",
+    telegram_id: str | None = None,
+    client_identifier: str | None = None,
+) -> tuple[dict, str]:
+    protocol = (protocol or "").lower()
+    id_field = _raw_client_id_field_for_protocol(protocol)
+    identifier = client_identifier or str(uuid.uuid4())
+
+    client = {
+        "email": email,
+        "limitIp": 0,
+        "totalGB": 0,
+        "expiryTime": expiry_time,
+        "enable": enable,
+        "tgId": telegram_id or 0,
+        "subId": uuid.uuid4().hex[:16],
+        "comment": "",
+        "reset": 0,
+    }
+
+    if id_field == "email":
+        identifier = email
+    elif id_field == "auth":
+        client["security"] = ""
+        client["auth"] = identifier
+    elif id_field == "password":
+        client["password"] = identifier
+    else:
+        client["id"] = identifier
+        client["flow"] = flow
+
+    return client, identifier
+
+
+def _add_raw_client(api: Api, inbound_id: int, client: dict) -> None:
+    _raw_api_request(
+        api,
+        requests.post,
+        "panel/api/inbounds/addClient",
+        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+    )
+
+
+def _update_raw_client(
+    api: Api, inbound_id: int, client_identifier: str, client: dict
+) -> None:
+    _raw_api_request(
+        api,
+        requests.post,
+        f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
+        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+    )
+
+
+def _delete_raw_client(api: Api, inbound_id: int, client_identifier: str) -> None:
+    _raw_api_request(
+        api,
+        requests.post,
+        (
+            f"panel/api/inbounds/{inbound_id}/delClient/"
+            f"{quote(client_identifier, safe='')}"
+        ),
+    )
+
+
+def _update_client_direct(api: Api, inbound_id: int, client: Client) -> bool:
+    """Update one client through the same API path the 3x-ui UI uses."""
+    client_uuid = getattr(client, "id", None)
+    if not client_uuid:
+        return False
+
+    try:
+        client.inbound_id = inbound_id
+        api.client.update(str(client_uuid), client)
+        return True
+    except Exception as e:
+        logger.warning(
+            "Could not update client '%s' via client.update on inbound %s: %s",
+            getattr(client, "email", ""),
+            inbound_id,
+            e,
+        )
+        return False
+
+
 def _set_client_enabled_state(
     api: Api, inbound_id: int, email: str, enabled: bool
 ) -> bool:
-    """Best-effort single-client enable toggle via inbound.update."""
+    """Best-effort single-client enable toggle, preferring client.update."""
     try:
         inbound_fresh = api.inbound.get_by_id(inbound_id)
         if not inbound_fresh:
@@ -228,14 +739,19 @@ def _set_client_enabled_state(
         if inbound_fresh.settings.clients is None:
             inbound_fresh.settings.clients = []
 
-        for client in inbound_fresh.settings.clients:
-            if getattr(client, "email", None) != email:
-                continue
-            if bool(getattr(client, "enable", True)) == enabled:
-                return True
-            client.enable = enabled
-            api.inbound.update(inbound_id, inbound_fresh)
+        client = _find_client_by_email(inbound_fresh, email)
+        if not client:
+            return False
+
+        if bool(getattr(client, "enable", True)) == enabled:
             return True
+
+        client.enable = enabled
+        if _update_client_direct(api, inbound_id, client):
+            return True
+
+        api.inbound.update(inbound_id, inbound_fresh)
+        return True
     except Exception as e:
         logger.warning(
             "Could not set enable=%s for client '%s' on inbound %s: %s",
@@ -252,14 +768,15 @@ def _refresh_reactivated_client_visual_state(
 ) -> None:
     """
     Some 3x-ui builds keep a stale red "depleted/exhausted" badge in clientTraffics
-    after an expired client is renewed. Mimic the manual disable/enable fix.
+    after an expired client is renewed. Mimic the manual client toggle from the UI.
     """
     try:
+        _normalize_client_traffic_state(api, inbound_id, email)
         _set_client_enabled_state(api, inbound_id, email, False)
         time.sleep(0.15)
         _set_client_enabled_state(api, inbound_id, email, True)
         time.sleep(0.15)
-        api.client.reset_stats(inbound_id, email)
+        _normalize_client_traffic_state(api, inbound_id, email)
         logger.debug(
             "Refreshed visual exhausted-state for reactivated client '%s' on inbound %s",
             email,
@@ -290,6 +807,88 @@ def _normalize_client_traffic_state(api: Api, inbound_id: int, email: str) -> bo
             rst_err,
         )
         return False
+
+
+def _client_traffic_is_disabled(api: Api, email: str) -> bool:
+    """Return True when clientTraffics says the client is disabled/exhausted."""
+    try:
+        traffic_client = api.client.get_by_email(email)
+        if not traffic_client:
+            return False
+        return not bool(getattr(traffic_client, "enable", True))
+    except Exception as e:
+        logger.debug("Could not inspect clientTraffics for '%s': %s", email, e)
+        return False
+
+
+def validate_host_write_access(
+    host_url: str,
+    username: str,
+    password: str,
+    inbound_id: int,
+    api_token: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Verify that a 3x-ui host can both read the inbound and write clients.
+
+    Login-only checks are not enough for recent 3x-ui builds: a panel can allow
+    /inbounds/list but reject /addClient when CSRF/API permissions are wrong.
+    """
+    api, inbound = login_to_host(
+        host_url=host_url,
+        username=username,
+        password=password,
+        inbound_id=inbound_id,
+        api_token=api_token,
+    )
+    if not api or not inbound:
+        return False, "не удалось войти в 3x-ui или найти указанный inbound"
+
+    probe_email = f"shopbot-preflight-{uuid.uuid4().hex[:12]}"
+    protocol = (getattr(inbound, "protocol", "") or "").lower()
+    probe_expiry = time_utils.get_timestamp_ms(time_utils.get_msk_now())
+    if _protocol_uses_raw_client_api(protocol):
+        probe_client, probe_identifier = _build_raw_client_for_protocol(
+            protocol=protocol,
+            email=probe_email,
+            enable=False,
+            expiry_time=probe_expiry,
+        )
+    else:
+        probe_client, probe_identifier = _build_client_for_inbound(
+            inbound=inbound,
+            email=probe_email,
+            enable=False,
+            expiry_time=probe_expiry,
+        )
+
+    try:
+        if _protocol_uses_raw_client_api(protocol):
+            _add_raw_client(api, inbound.id, probe_client)
+        else:
+            api.client.add(inbound.id, [probe_client])
+    except Exception as e:
+        return False, f"панель не разрешила создать тестового клиента: {e}"
+
+    try:
+        if _protocol_uses_raw_client_api(protocol):
+            _delete_raw_client(api, inbound.id, probe_identifier)
+        else:
+            api.client.delete(inbound.id, probe_identifier)
+    except Exception as e:
+        logger.warning(
+            "Host write preflight created test client '%s' but could not delete it from inbound %s: %s",
+            probe_email,
+            inbound.id,
+            e,
+        )
+        return (
+            False,
+            "тестовый клиент был создан, но не удалился; проверьте права API и удалите "
+            f"'{probe_email}' вручную",
+        )
+
+    return True, "ok"
 
 
 def get_connection_string(
@@ -332,9 +931,46 @@ def get_connection_string(
         return _get_trojan_connection_string(
             inbound, user_uuid, parsed_url.hostname, port, safe_remark
         )
+    elif protocol_lower in {"hysteria", "hysteria2"}:
+        return _get_hysteria_connection_string(
+            inbound, user_uuid, parsed_url.hostname, port, safe_remark
+        )
+    elif _protocol_prefers_panel_links(protocol_lower):
+        logger.debug(
+            "Protocol '%s' uses panel-generated links; manual link builder skipped.",
+            protocol,
+        )
+        return None
     else:
         logger.error(f"Unsupported protocol: {protocol}")
         return None
+
+
+def _get_hysteria_connection_string(
+    inbound: Inbound, auth: str, hostname: str, port: int, remark: str
+) -> str | None:
+    stream_settings = getattr(inbound, "stream_settings", None)
+    tls_settings = {}
+    if stream_settings:
+        tls_settings = getattr(stream_settings, "tls_settings", None) or {}
+
+    sni = tls_settings.get("serverName") or hostname
+    settings = tls_settings.get("settings") or {}
+    fingerprint = settings.get("fingerprint") or "chrome"
+    alpn_values = tls_settings.get("alpn") or ["h3"]
+    alpn = alpn_values[0] if isinstance(alpn_values, list) and alpn_values else "h3"
+
+    if not auth or not hostname or not port:
+        logger.error("Cannot build Hysteria link: auth, hostname, or port is missing.")
+        return None
+
+    query = (
+        f"alpn={quote(str(alpn), safe='')}"
+        f"&fp={quote(str(fingerprint), safe='')}"
+        "&security=tls"
+        f"&sni={quote(str(sni), safe='')}"
+    )
+    return f"hysteria2://{auth}@{hostname}:{port}?{query}#{quote(remark, safe='')}"
 
 
 def _get_vless_connection_string(
@@ -497,6 +1133,7 @@ def update_or_create_client_on_panel(
         is_tcp_reality_vision = False
 
         network, security = _get_stream_network_security(inbound_to_modify)
+        protocol = (getattr(inbound_to_modify, "protocol", "") or "").lower()
         if network == "tcp" and security == "reality":
             target_flow = "xtls-rprx-vision"
             is_tcp_reality_vision = True
@@ -561,6 +1198,47 @@ def update_or_create_client_on_panel(
         current_ts_ms = time_utils.get_timestamp_ms(time_utils.get_msk_now())
         should_enable_client = new_expiry_ms > current_ts_ms
 
+        if _protocol_uses_raw_client_api(protocol):
+            raw_clients = _get_raw_clients(api, inbound_id)
+            raw_client = next(
+                (client for client in raw_clients if client.get("email") == email),
+                None,
+            )
+            if raw_client:
+                raw_client["expiryTime"] = new_expiry_ms
+                raw_client["enable"] = should_enable_client
+                raw_client["totalGB"] = 0
+                raw_client["reset"] = 0
+                if telegram_id and not raw_client.get("tgId"):
+                    raw_client["tgId"] = telegram_id
+                client_uuid = str(raw_client.get("auth") or uuid.uuid4())
+                raw_client["auth"] = client_uuid
+                _update_raw_client(api, inbound_id, client_uuid, raw_client)
+                logger.info(
+                    "Updated existing Hysteria client '%s' (auth: %s) on inbound %s",
+                    email,
+                    client_uuid,
+                    inbound_id,
+                )
+            else:
+                raw_client, client_uuid = _build_raw_client_for_protocol(
+                    protocol=protocol,
+                    email=email,
+                    enable=should_enable_client,
+                    expiry_time=new_expiry_ms,
+                    telegram_id=telegram_id,
+                )
+                _add_raw_client(api, inbound_id, raw_client)
+                logger.info(
+                    "Added new Hysteria client '%s' (auth: %s) on inbound %s",
+                    email,
+                    client_uuid,
+                    inbound_id,
+                )
+
+            _normalize_client_traffic_state(api, inbound_id, email)
+            return client_uuid, new_expiry_ms
+
         if client_index != -1:
             # Update existing client
             client_to_update = inbound_to_modify.settings.clients[client_index]
@@ -587,7 +1265,9 @@ def update_or_create_client_on_panel(
             ):
                 client_to_update.tg_id = telegram_id
 
-            client_uuid = client_to_update.id
+            client_uuid = _ensure_client_identifier_for_protocol(
+                protocol, client_to_update, email
+            )
             try:
                 # Update the already-loaded inbound as the primary path.
                 # This is more stable on panels that intermittently reject direct client.update
@@ -619,23 +1299,17 @@ def update_or_create_client_on_panel(
                         f"Client '{email}' client.update fallback also failed with 'record not found' "
                         f"on inbound {inbound_id}. Trying recreate fallback."
                     )
-                    client_uuid = str(uuid.uuid4())
-                    subscription_id = uuid.uuid4().hex[:16]
-                    recreated_client = Client(
-                        id=client_uuid,
+                    recreated_client, client_uuid = _build_client_for_inbound(
+                        inbound=inbound_to_modify,
                         email=email,
                         enable=should_enable_client,
                         flow=target_flow,
                         expiry_time=new_expiry_ms,
-                        sub_id=subscription_id,
-                        total_gb=0,
-                        reset=0,
-                        tg_id=telegram_id,
+                        telegram_id=telegram_id,
                     )
-                    _set_unlimited_traffic_fields(recreated_client)
                     api.client.add(inbound_id, [recreated_client])
                     logger.info(
-                        f"Recreated client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}"
+                        f"Recreated client '{email}' (identifier: {client_uuid}) on inbound {inbound_id}"
                     )
 
             reactivated_from_expired = should_enable_client and (
@@ -648,24 +1322,17 @@ def update_or_create_client_on_panel(
                 _refresh_reactivated_client_visual_state(api, inbound_id, email)
 
         else:
-            client_uuid = str(uuid.uuid4())
-            subscription_id = uuid.uuid4().hex[:16]
-
-            new_client = Client(
-                id=client_uuid,
+            new_client, client_uuid = _build_client_for_inbound(
+                inbound=inbound_to_modify,
                 email=email,
                 enable=should_enable_client,
                 flow=target_flow,
                 expiry_time=new_expiry_ms,
-                sub_id=subscription_id,
-                total_gb=0,
-                reset=0,
-                tg_id=telegram_id,
+                telegram_id=telegram_id,
             )
-            _set_unlimited_traffic_fields(new_client)
 
             api.client.add(inbound_id, [new_client])
-            logger.info(f"Added new client '{email}' (UUID: {client_uuid})")
+            logger.info(f"Added new client '{email}' (identifier: {client_uuid})")
 
         return client_uuid, new_expiry_ms
 
@@ -749,6 +1416,7 @@ def _create_or_update_key_on_host_sync(
         username=host_data["host_username"],
         password=host_data["host_pass"],
         inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
     )
     if not api or not inbound:
         logger.error(
@@ -772,24 +1440,14 @@ def _create_or_update_key_on_host_sync(
         )
         return None
 
-    # Clean remark for URL safety
-    safe_remark = host_name.replace(" ", "_").encode("ascii", "ignore").decode("ascii")
-    # Determine country flag based on server name
-    country_flag = get_country_flag_by_host(host_name)
-    # Default is handled in the function (returns 🇺🇸)
-
-    # Use server name (cleaned) with country flag for better UX
-    # Clean server name: remove non-ASCII, replace spaces, keep only alphanumeric and underscores
-    clean_server_name = (
-        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
-    )
-    # Remove any remaining special chars, keep only letters, numbers, underscores
-    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
-    # Remove leading underscores
-    clean_server_name = clean_server_name.lstrip("_")
-    server_remark = f"{country_flag}{clean_server_name}"
-    connection_string = get_connection_string(
-        inbound, client_uuid, host_data["host_url"], remark=server_remark
+    server_remark = _build_server_remark(host_name)
+    connection_string = _connection_string_for_client(
+        api=api,
+        inbound=inbound,
+        host_url=host_data["host_url"],
+        email=email,
+        client_identifier=client_uuid,
+        remark=server_remark,
     )
 
     logger.info(f"Successfully processed key for '{email}' on host '{host_name}'.")
@@ -827,28 +1485,18 @@ def _get_key_details_from_host_sync(key_data: dict) -> dict | None:
         username=host_db_data["host_username"],
         password=host_db_data["host_pass"],
         inbound_id=host_db_data["host_inbound_id"],
+        api_token=host_db_data.get("api_token"),
     )
     if not api or not inbound:
         return None
 
-    # Determine country flag based on server name
-    country_flag = get_country_flag_by_host(host_name)
-    # Default is handled in the function (returns 🇺🇸)
-
-    # Use server name (cleaned) with country flag for better UX
-    # Clean server name: remove non-ASCII, replace spaces, keep only alphanumeric and underscores
-    clean_server_name = (
-        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
-    )
-    # Remove any remaining special chars, keep only letters, numbers, underscores
-    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
-    # Remove leading underscores
-    clean_server_name = clean_server_name.lstrip("_")
-    server_remark = f"{country_flag}{clean_server_name}"
-    connection_string = get_connection_string(
-        inbound,
-        key_data["xui_client_uuid"],
-        host_db_data["host_url"],
+    server_remark = _build_server_remark(host_name)
+    connection_string = _connection_string_for_client(
+        api=api,
+        inbound=inbound,
+        host_url=host_db_data["host_url"],
+        email=key_data["key_email"],
+        client_identifier=key_data["xui_client_uuid"],
         remark=server_remark,
     )
     return {"connection_string": connection_string}
@@ -872,13 +1520,15 @@ def _get_client_traffic_sync(key_data: dict) -> dict | None:
         username=host_db_data["host_username"],
         password=host_db_data["host_pass"],
         inbound_id=host_db_data["host_inbound_id"],
+        api_token=host_db_data.get("api_token"),
     )
     if not api or not inbound or not inbound.settings.clients:
         return None
 
     target_uuid = key_data.get("xui_client_uuid")
+    protocol = getattr(inbound, "protocol", "") or ""
     for client in inbound.settings.clients:
-        if client.id == target_uuid:
+        if _get_client_identifier_for_protocol(protocol, client) == target_uuid:
             return {
                 "up": client.up,
                 "down": client.down,
@@ -905,6 +1555,7 @@ def _get_connection_strings_for_host_sync(host_name: str) -> dict[str, str]:
         username=host_db_data["host_username"],
         password=host_db_data["host_pass"],
         inbound_id=host_db_data["host_inbound_id"],
+        api_token=host_db_data.get("api_token"),
     )
     if not api or not inbound:
         return {}
@@ -913,23 +1564,44 @@ def _get_connection_strings_for_host_sync(host_name: str) -> dict[str, str]:
     if not inbound_fresh or not inbound_fresh.settings.clients:
         return {}
 
-    country_flag = get_country_flag_by_host(host_name)
-    clean_server_name = (
-        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
-    )
-    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
-    clean_server_name = clean_server_name.lstrip("_")
-    server_remark = f"{country_flag}{clean_server_name}"
+    server_remark = _build_server_remark(host_name)
 
     result: dict[str, str] = {}
+    protocol = getattr(inbound_fresh, "protocol", "") or ""
+    if _protocol_uses_raw_client_api(protocol):
+        for raw_client in _get_raw_clients(api, inbound.id):
+            email = raw_client.get("email")
+            client_identifier = raw_client.get("auth")
+            if not email or not client_identifier:
+                continue
+            conn = _connection_string_for_client(
+                api=api,
+                inbound=inbound_fresh,
+                host_url=host_db_data["host_url"],
+                email=email,
+                client_identifier=client_identifier,
+                remark=server_remark,
+            )
+            if conn:
+                result[email] = conn
+        return result
+
     for client in inbound_fresh.settings.clients:
         email = getattr(client, "email", None)
-        client_uuid = getattr(client, "id", None)
-        if not email or not client_uuid:
+        if not email:
             continue
-        conn = get_connection_string(
-            inbound_fresh, client_uuid, host_db_data["host_url"], remark=server_remark
-        )
+
+        client_identifier = _get_client_identifier_for_protocol(protocol, client)
+        conn = None
+        if client_identifier:
+            conn = _connection_string_for_client(
+                api=api,
+                inbound=inbound_fresh,
+                host_url=host_db_data["host_url"],
+                email=email,
+                client_identifier=client_identifier,
+                remark=server_remark,
+            )
         if conn:
             result[email] = conn
 
@@ -955,6 +1627,7 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         username=host_data["host_username"],
         password=host_data["host_pass"],
         inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
     )
 
     if not api or not inbound:
@@ -980,6 +1653,16 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         if client_index == -1:
             logger.warning(f"Client '{client_email}' not found on host '{host_name}'.")
             return False
+
+        protocol = (getattr(inbound_to_modify, "protocol", "") or "").lower()
+        if protocol != "vless":
+            logger.info(
+                "Skipping parameter fix for client '%s' on host '%s': protocol '%s' does not use VLESS flow fields.",
+                client_email,
+                host_name,
+                protocol,
+            )
+            return True
 
         # Determine correct flow
         target_flow = ""
@@ -1025,6 +1708,7 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
         username=host_data["host_username"],
         password=host_data["host_pass"],
         inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
     )
 
     if not api or not inbound:
@@ -1079,20 +1763,13 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
                     telegram_id=None,
                 )
                 if client_uuid and new_expiry_ms:
-                    country_flag = get_country_flag_by_host(host_name)
-                    clean_server_name = (
-                        host_name.replace(" ", "")
-                        .encode("ascii", "ignore")
-                        .decode("ascii")
-                    )
-                    clean_server_name = "".join(
-                        c for c in clean_server_name if c.isalnum() or c == "_"
-                    ).lstrip("_")
-                    server_remark = f"{country_flag}{clean_server_name}"
-                    conn = get_connection_string(
-                        inbound,
-                        client_uuid,
-                        host_data["host_url"],
+                    server_remark = _build_server_remark(host_name)
+                    conn = _connection_string_for_client(
+                        api=api,
+                        inbound=inbound,
+                        host_url=host_data["host_url"],
+                        email=email,
+                        client_identifier=client_uuid,
                         remark=server_remark,
                     )
                     update_key_by_email(
@@ -1119,19 +1796,57 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
         if inbound_to_modify.settings.clients is None:
             inbound_to_modify.settings.clients = []
 
+        protocol = (getattr(inbound_to_modify, "protocol", "") or "").lower()
+        server_remark = _build_server_remark(host_name)
+
+        if protocol != "vless":
+            refreshed = 0
+            if protocol in {"hysteria", "hysteria2"}:
+                raw_clients = _get_raw_clients(api, inbound.id)
+                client_rows = (
+                    (client.get("email"), client.get("auth"))
+                    for client in raw_clients
+                )
+            else:
+                client_rows = (
+                    (
+                        getattr(client, "email", None),
+                        _get_client_identifier_for_protocol(protocol, client),
+                    )
+                    for client in inbound_to_modify.settings.clients
+                )
+
+            for email, client_identifier in client_rows:
+                if not email or not client_identifier:
+                    continue
+                key = get_key_by_email(email)
+                if not key:
+                    continue
+                conn = _connection_string_for_client(
+                    api=api,
+                    inbound=inbound_to_modify,
+                    host_url=host_data["host_url"],
+                    email=email,
+                    client_identifier=str(client_identifier),
+                    remark=server_remark,
+                )
+                if conn:
+                    update_key_connection_string(key["key_id"], conn)
+                    purge_missing_key(email)
+                    refreshed += 1
+
+            logger.info(
+                "Refreshed %s connection string(s) for protocol '%s' on host '%s' without inbound.update.",
+                refreshed,
+                protocol,
+                host_name,
+            )
+            return refreshed
+
         network, security = _get_stream_network_security(inbound_to_modify)
         target_flow = ""
         if network == "tcp" and security == "reality":
             target_flow = "xtls-rprx-vision"
-
-        country_flag = get_country_flag_by_host(host_name)
-        clean_server_name = (
-            host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
-        )
-        clean_server_name = "".join(
-            c for c in clean_server_name if c.isalnum() or c == "_"
-        ).lstrip("_")
-        server_remark = f"{country_flag}{clean_server_name}"
 
         updated = 0
         for client in inbound_to_modify.settings.clients:
@@ -1150,10 +1865,16 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
                 key = get_key_by_email(email)
                 if not key:
                     continue
-                conn = get_connection_string(
-                    inbound_to_modify,
-                    client.id,
-                    host_data["host_url"],
+                client_identifier = _get_client_identifier_for_protocol(
+                    getattr(inbound_to_modify, "protocol", "") or "",
+                    client,
+                )
+                conn = _connection_string_for_client(
+                    api=api,
+                    inbound=inbound_to_modify,
+                    host_url=host_data["host_url"],
+                    email=email,
+                    client_identifier=client_identifier,
                     remark=server_remark,
                 )
                 if conn:
@@ -1196,6 +1917,7 @@ def _sync_clients_state_on_host_sync(
         "updated": 0,
         "already_ok": 0,
         "not_found": 0,
+        "traffic_fixed": 0,
         "errors": 0,
     }
 
@@ -1213,6 +1935,7 @@ def _sync_clients_state_on_host_sync(
         username=host_data["host_username"],
         password=host_data["host_pass"],
         inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
     )
 
     if not api or not inbound:
@@ -1229,6 +1952,62 @@ def _sync_clients_state_on_host_sync(
 
         if inbound_to_modify.settings.clients is None:
             inbound_to_modify.settings.clients = []
+
+        protocol = (getattr(inbound_to_modify, "protocol", "") or "").lower()
+        if _protocol_uses_raw_client_api(protocol):
+            raw_clients = _get_raw_clients(api, inbound.id)
+            raw_clients_by_email = {
+                str(client.get("email")): client
+                for client in raw_clients
+                if client.get("email")
+            }
+
+            for email, state in desired_by_email.items():
+                result["checked"] += 1
+                raw_client = raw_clients_by_email.get(email)
+                if not raw_client:
+                    result["not_found"] += 1
+                    continue
+
+                changed = False
+                target_enabled = bool(state.get("enabled", True))
+                if bool(raw_client.get("enable", True)) != target_enabled:
+                    raw_client["enable"] = target_enabled
+                    changed = True
+
+                target_expiry_ms = state.get("expiry_timestamp_ms")
+                if target_expiry_ms is not None:
+                    try:
+                        target_expiry_ms = int(target_expiry_ms)
+                        current_expiry_ms = int(raw_client.get("expiryTime") or 0)
+                        if abs(current_expiry_ms - target_expiry_ms) > 1000:
+                            raw_client["expiryTime"] = target_expiry_ms
+                            changed = True
+                    except Exception:
+                        result["errors"] += 1
+
+                if state.get("force_unlimited", False):
+                    if raw_client.get("totalGB", 0) != 0:
+                        raw_client["totalGB"] = 0
+                        changed = True
+                    if raw_client.get("reset", 0) != 0:
+                        raw_client["reset"] = 0
+                        changed = True
+
+                client_identifier = raw_client.get("auth")
+                if not client_identifier:
+                    client_identifier = str(uuid.uuid4())
+                    raw_client["auth"] = client_identifier
+                    changed = True
+
+                if changed:
+                    _update_raw_client(api, inbound.id, str(client_identifier), raw_client)
+                    result["updated"] += 1
+                    _normalize_client_traffic_state(api, inbound.id, email)
+                else:
+                    result["already_ok"] += 1
+
+            return result
 
         clients_by_email = {
             c.email: c
@@ -1264,6 +2043,7 @@ def _sync_clients_state_on_host_sync(
 
             target_enabled = bool(state.get("enabled", True))
             was_enabled = bool(getattr(client, "enable", True))
+            current_expiry_ms = int(getattr(client, "expiry_time", 0) or 0)
             enable_state_changed = was_enabled != target_enabled
             if enable_state_changed:
                 client.enable = target_enabled
@@ -1273,7 +2053,6 @@ def _sync_clients_state_on_host_sync(
             if target_expiry_ms is not None:
                 try:
                     target_expiry_ms = int(target_expiry_ms)
-                    current_expiry_ms = int(getattr(client, "expiry_time", 0) or 0)
                     if abs(current_expiry_ms - target_expiry_ms) > 1000:
                         client.expiry_time = target_expiry_ms
                         changed = True
@@ -1292,6 +2071,15 @@ def _sync_clients_state_on_host_sync(
                     emails_to_reset_stats.add(email)
                     if current_expiry_ms <= now_ms or not was_enabled:
                         reactivated_emails.add(email)
+                elif _client_traffic_is_disabled(api, email):
+                    logger.info(
+                        "Client '%s' on host '%s' is active in DB but disabled/exhausted in clientTraffics; refreshing.",
+                        email,
+                        host_name,
+                    )
+                    emails_to_reset_stats.add(email)
+                    reactivated_emails.add(email)
+                    result["traffic_fixed"] += 1
             elif enable_state_changed:
                 # When DB marks a key expired we want the host to show it as disabled,
                 # not as traffic-exhausted due to a stale clientTraffics flag.
@@ -1339,6 +2127,7 @@ def _delete_client_on_host_sync(host_name: str, client_email: str) -> bool:
         username=host_data["host_username"],
         password=host_data["host_pass"],
         inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
     )
 
     if not api or not inbound:
@@ -1414,6 +2203,7 @@ def _sync_xtls_for_host(host_info: dict) -> dict:
             username=host_info["host_username"],
             password=host_info["host_pass"],
             inbound_id=host_info["host_inbound_id"],
+            api_token=host_info.get("api_token"),
         )
 
         if not api or not inbound:

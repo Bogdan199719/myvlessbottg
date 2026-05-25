@@ -21,6 +21,7 @@ REQUIRED_DEFAULT_SETTINGS = {
     "admin_telegram_id",
     "support_bot_token",
     "support_group_id",
+    "show_about_menu_item",
     "enable_global_plans",
     "enable_admin_payment_notifications",
     "enable_admin_trial_notifications",

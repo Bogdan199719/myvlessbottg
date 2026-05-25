@@ -29,6 +29,25 @@ content %}
     <span><b>Комплексное обслуживание</b> выполняет обе операции подряд.</span>
 </div>
 
+<div class="admin-summary-grid">
+    <div class="admin-summary-card">
+        <span>Всего пользователей</span>
+        <strong>{{ key_stats.total_users }}</strong>
+    </div>
+    <div class="admin-summary-card">
+        <span>Пользователей с ключами</span>
+        <strong>{{ key_stats.users_with_keys }}</strong>
+    </div>
+    <div class="admin-summary-card">
+        <span>Активные подписки</span>
+        <strong>{{ key_stats.active_subscriptions }}</strong>
+    </div>
+    <div class="admin-summary-card">
+        <span>Пользователей на пробном</span>
+        <strong>{{ key_stats.active_trial_users }}</strong>
+    </div>
+</div>
+
 <div class="task-status-grid" id="taskStatusGrid">
     <div class="task-status-card" data-task-name="maintenance">
         <h3>Комплексное обслуживание</h3>
@@ -55,6 +74,7 @@ content %}
             <button type="button" class="filter-chip" data-key-filter="active">Активные</button>
             <button type="button" class="filter-chip" data-key-filter="expiring">Скоро истекают</button>
             <button type="button" class="filter-chip" data-key-filter="expired">Просроченные</button>
+            <button type="button" class="filter-chip" data-key-filter="trial">Пробные</button>
             <button type="button" class="filter-chip" data-key-filter="global">Глобальные</button>
         </div>
     </div>
@@ -74,7 +94,7 @@ content %}
                     <th>Email</th>
                     <th>Показать ключ</th>
                     <th>Истекает</th>
-                    <th>Статус (дней)</th>
+                    <th>Статус</th>
                     <th class="keys-actions-head">Действия</th>
                 </tr>
             </thead>
@@ -100,8 +120,10 @@ content %}
                 {% endfor %}
 
                 {% if global_keys %}
+                {% set first_key = global_keys[0] %}
                 <tr class="key-row-global" data-key-row="1" data-group="{{ user.user_id }}" data-key-type="global"
-                    data-key-status="{% if global_keys[0].days_left is defined and global_keys[0].days_left < 0 %}expired{% elif global_keys[0].days_left is defined and global_keys[0].days_left < 3 %}expiring{% else %}active{% endif %}"
+                    data-key-trial="{{ '1' if user.is_trial else '0' }}"
+                    data-key-status="{{ first_key.expiry_status.filter }}"
                     data-key-search="{{ user.user_id }} {{ user.username }} global {% for g in global_keys %}{{ g.host_name }} {{ g.key_email }} {% endfor %}">
                     <td>—</td>
                     <td>
@@ -133,25 +155,10 @@ content %}
                         {% endif %}
                     </td>
                     <td>
-                        {% set first_key = global_keys[0] %}
-                        {{ first_key.expiry_date.replace('T', ' ').split(' ')[0] if first_key.expiry_date else '∞' }}
+                        {{ first_key.expiry_status.expires_at }}
                     </td>
                     <td>
-                        {% if first_key.days_left is defined %}
-                            {% if user.is_trial and first_key.days_left < 0 %}
-                                <span class="status-badge status-banned">Триал истек</span>
-                            {% elif user.is_trial and first_key.days_left < 1 %}
-                                <span class="status-badge status-warning">Триал до конца дня</span>
-                            {% elif user.is_trial and first_key.days_left < 3 %}
-                                <span class="status-badge status-warning">Триал {{ first_key.days_left }} дн.</span>
-                            {% elif first_key.days_left < 0 %}
-                                <span class="status-badge status-banned">Просрочена</span>
-                            {% elif first_key.days_left < 3 %}
-                                <span class="status-badge status-warning">{{ first_key.days_left }} дн.</span>
-                            {% else %}
-                                <span class="status-badge status-active">{{ first_key.days_left }} дн.</span>
-                            {% endif %}
-                        {% endif %}
+                        <span class="status-badge {{ first_key.expiry_status.css_class }}">{{ first_key.expiry_status.label }}</span>
                     </td>
                     <td class="actions-cell">
                         <form action="{{ url_for('adjust_key_duration', key_id=first_key.key_id) }}" method="POST"
@@ -178,10 +185,14 @@ content %}
                 {% if not global_keys and regular_keys %}
                 {% set key = regular_keys[0] %}
                 <tr data-key-row="1" data-group="{{ user.user_id }}" data-key-type="regular"
-                    data-key-status="{% if key.days_left is defined and key.days_left < 0 %}expired{% elif key.days_left is defined and key.days_left < 3 %}expiring{% else %}active{% endif %}"
+                    data-key-trial="{{ '1' if key.is_trial else '0' }}"
+                    data-key-status="{{ key.expiry_status.filter }}"
                     data-key-search="{{ user.user_id }} {{ user.username }} {{ key.host_name }} {{ key.key_email }} {{ key.key_id }}">
                     <td>{{ key.key_id }}</td>
-                    <td><strong>Ключ подписки</strong><br><small>Подписка пользователя</small></td>
+                    <td>
+                        <strong>{{ "Пробный ключ" if key.is_trial else "Ключ подписки" }}</strong><br>
+                        <small>{{ "Триальный период" if key.is_trial else "Подписка пользователя" }}</small>
+                    </td>
                     <td><small>Multi-link</small></td>
                     <td class="key-link-cell">
                         {% if user.subscription_link %}
@@ -204,22 +215,10 @@ content %}
                         {% endif %}
                     </td>
                     <td>
-                        {% if key.expiry_date %}
-                        {{ key.expiry_date.replace('T', ' ').split(' ')[0] }}
-                        {% else %}
-                        ∞
-                        {% endif %}
+                        {{ key.expiry_status.expires_at }}
                     </td>
                     <td>
-                        {% if key.days_left is defined %}
-                            {% if key.days_left < 0 %}
-                                <span class="status-badge status-banned">Просрочен</span>
-                            {% elif key.days_left < 3 %}
-                                <span class="status-badge status-warning">{{ key.days_left }} дн.</span>
-                            {% else %}
-                                <span class="status-badge status-active">{{ key.days_left }} дн.</span>
-                            {% endif %}
-                        {% endif %}
+                        <span class="status-badge {{ key.expiry_status.css_class }}">{{ key.expiry_status.label }}</span>
                     </td>
                     <td class="actions-cell">
                         <form action="{{ url_for('adjust_key_duration', key_id=key.key_id) }}" method="POST"
@@ -248,7 +247,7 @@ content %}
     </div>
 </section>
 
-<script>
+<script nonce="{{ csp_nonce() }}">
     function checkChanges(form) {
         const days = parseInt(form.days.value) || 0;
         const hours = parseInt(form.hours.value) || 0;

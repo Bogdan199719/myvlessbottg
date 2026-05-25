@@ -31,7 +31,30 @@
     </div>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce() }}">
+function setUpdateAlert(statusArea, type, lines, withUpdateButton = false) {
+    statusArea.replaceChildren();
+    const alert = document.createElement('div');
+    alert.className = `alert alert-${type}`;
+
+    for (const line of lines) {
+        const element = document.createElement(line.tag || 'p');
+        element.textContent = line.text || '';
+        alert.appendChild(element);
+    }
+
+    if (withUpdateButton) {
+        const button = document.createElement('button');
+        button.id = 'performUpdateBtn';
+        button.className = 'button button-success';
+        button.type = 'button';
+        button.textContent = 'Обновить сейчас';
+        alert.appendChild(button);
+    }
+
+    statusArea.appendChild(alert);
+}
+
 document.getElementById('checkUpdatesBtn').addEventListener('click', async () => {
     const btn = document.getElementById('checkUpdatesBtn');
     const statusArea = document.getElementById('updateStatusArea');
@@ -56,29 +79,26 @@ document.getElementById('checkUpdatesBtn').addEventListener('click', async () =>
         if (json.status === 'success') {
             const data = json.data;
             if (data.update_available) {
-                statusArea.innerHTML = `
-                    <div class="alert alert-info">
-                        <h4>🔥 Доступно обновление: ${data.latest_version}</h4>
-                        <p>${data.release_notes || 'Нет описания релиза.'}</p>
-                        <button id="performUpdateBtn" class="button button-success">
-                            Обновить сейчас
-                        </button>
-                    </div>
-                `;
+                setUpdateAlert(statusArea, 'info', [
+                    { tag: 'h4', text: `Доступно обновление: ${data.latest_version || ''}` },
+                    { tag: 'p', text: data.release_notes || 'Нет описания релиза.' },
+                ], true);
                 
                 document.getElementById('performUpdateBtn').addEventListener('click', performUpdate);
             } else {
-                statusArea.innerHTML = `
-                    <div class="alert alert-success">
-                        У вас установлена последняя версия.
-                    </div>
-                `;
+                setUpdateAlert(statusArea, 'success', [
+                    { tag: 'p', text: 'У вас установлена последняя версия.' },
+                ]);
             }
         } else {
-            statusArea.innerHTML = `<div class="alert alert-danger">Ошибка: ${json.message}</div>`;
+            setUpdateAlert(statusArea, 'danger', [
+                { tag: 'p', text: `Ошибка: ${json.message || 'неизвестная ошибка'}` },
+            ]);
         }
     } catch (e) {
-        statusArea.innerHTML = `<div class="alert alert-danger">Ошибка сети: ${e}</div>`;
+        setUpdateAlert(statusArea, 'danger', [
+            { tag: 'p', text: `Ошибка сети: ${e}` },
+        ]);
     } finally {
         btn.disabled = false;
         btn.textContent = 'Проверить снова';
@@ -89,7 +109,9 @@ async function performUpdate() {
     if (!confirm('Вы уверены? Это действие перезапустит бота.')) return;
     
     const statusArea = document.getElementById('updateStatusArea');
-    statusArea.innerHTML = '<div class="alert alert-warning">Выполняется обновление... Пожалуйста, подождите. Страница может перезагрузиться.</div>';
+    setUpdateAlert(statusArea, 'warning', [
+        { tag: 'p', text: 'Выполняется обновление... Пожалуйста, подождите. Страница может перезагрузиться.' },
+    ]);
     
     try {
         const response = await fetch("{{ url_for('perform_update_route') }}", {
@@ -99,13 +121,19 @@ async function performUpdate() {
         const json = await response.json();
         
         if (json.status === 'success') {
-            statusArea.innerHTML = '<div class="alert alert-success">Обновление успешно! Бот перезагружается...</div>';
+            setUpdateAlert(statusArea, 'success', [
+                { tag: 'p', text: 'Обновление успешно! Бот перезагружается...' },
+            ]);
             setTimeout(() => window.location.reload(), 10000);
         } else {
-            statusArea.innerHTML = `<div class="alert alert-danger">Ошибка обновления: ${json.message}</div>`;
+            setUpdateAlert(statusArea, 'danger', [
+                { tag: 'p', text: `Ошибка обновления: ${json.message || 'неизвестная ошибка'}` },
+            ]);
         }
     } catch (e) {
-         statusArea.innerHTML = '<div class="alert alert-warning">Команда отправлена. Возможно, сервер уже перезагружается. Попробуйте обновить страницу через минуту.</div>';
+         setUpdateAlert(statusArea, 'warning', [
+             { tag: 'p', text: 'Команда отправлена. Возможно, сервер уже перезагружается. Попробуйте обновить страницу через минуту.' },
+         ]);
     }
 }
 </script>

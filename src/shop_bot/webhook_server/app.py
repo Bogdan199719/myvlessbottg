@@ -24,6 +24,7 @@ from shop_bot.version import APP_VERSION
 from functools import wraps
 from math import ceil
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import (
     Flask,
     request,
@@ -33,6 +34,7 @@ from flask import (
     flash,
     session,
     current_app,
+    g,
     send_file,
     after_this_request,
     Response,
@@ -76,7 +78,6 @@ from shop_bot.data_manager.database import (
     get_next_key_number,
     get_key_by_id,
     update_key_info,
-    set_trial_used,
     set_terms_agreed,
     get_plan_by_id,
     log_transaction,
@@ -111,9 +112,31 @@ from shop_bot.data_manager.database import (
     delete_payment_rules_for_context,
     delete_keys_by_ids,
     ALL_PAYMENT_METHODS,
+    get_global_plan_ids,
+    is_global_xui_key,
+    create_promo_code,
+    get_all_promo_codes,
+    update_promo_code,
+    set_promo_code_active,
+    delete_promo_code,
+    get_paid_revenue_between,
+    create_profit_distribution,
+    get_profit_distributions,
+    get_last_active_profit_distribution,
+    get_first_paid_transaction_date,
+    has_profit_distribution_overlap,
+    update_profit_distribution,
+    void_profit_distribution,
+    mark_profit_distribution_paid,
 )
 
 _bot_controller = None
+APP_ROOT = Path(__file__).resolve().parents[3]
+ENV_FILE = APP_ROOT / ".env"
+MAX_BACKUP_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_BACKUP_UNPACKED_BYTES = 100 * 1024 * 1024
+MAX_BACKUP_FILES = 3
+ALLOWED_BACKUP_FILES = {"users.db", "metadata.json", ".env"}
 
 
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
@@ -124,6 +147,195 @@ def _build_subscription_link(domain: str | None, token: str | None) -> str | Non
     if not domain_value.startswith(("http://", "https://")):
         domain_value = f"https://{domain_value}"
     return f"{domain_value.rstrip('/')}/sub/{token_value}"
+
+
+def _key_plan_id(key: dict) -> int:
+    try:
+        return int(key.get("plan_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_xui_key(key: dict) -> bool:
+    return key.get("service_type", "xui") != "mtg"
+
+
+def _is_trial_key(key: dict) -> bool:
+    return _is_xui_key(key) and _key_plan_id(key) <= 0
+
+
+def _user_has_paid_subscription(user: dict) -> bool:
+    try:
+        total_spent = float(user.get("total_spent") or 0)
+    except (TypeError, ValueError):
+        total_spent = 0
+    try:
+        total_months = int(user.get("total_months") or 0)
+    except (TypeError, ValueError):
+        total_months = 0
+    return total_spent > 0 or total_months > 0
+
+
+def _key_is_trial_for_user(key: dict, user: dict | None = None) -> bool:
+    if not _is_xui_key(key):
+        return False
+    if _is_trial_key(key):
+        return True
+
+    owner = user or key
+    return bool(owner.get("trial_used")) and not _user_has_paid_subscription(owner)
+
+
+def _key_is_trial_for_owner(key: dict) -> bool:
+    return _key_is_trial_for_user(key, key)
+
+
+def _build_user_metrics(users: list[dict]) -> dict:
+    metrics = {
+        "total_users": len(users),
+        "paid_users": 0,
+        "trial_users": 0,
+        "no_subscription_users": 0,
+        "banned_users": 0,
+    }
+    for user in users:
+        summary = user.get("subscription_summary") or {}
+        status = summary.get("status")
+        if status == "paid":
+            metrics["paid_users"] += 1
+        elif status == "trial":
+            metrics["trial_users"] += 1
+        elif status == "banned":
+            metrics["banned_users"] += 1
+        else:
+            metrics["no_subscription_users"] += 1
+    return metrics
+
+
+def _summarize_user_subscription(
+    user: dict, keys: list[dict], now: datetime | None = None
+) -> dict:
+    now = now or time_utils.get_msk_now()
+    paid_active = 0
+    trial_active = 0
+    active_total = 0
+
+    for key in keys:
+        if not _is_xui_key(key):
+            continue
+
+        expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        if not expiry or expiry <= now:
+            continue
+
+        active_total += 1
+
+        if _key_is_trial_for_user(key, user):
+            trial_active += 1
+        else:
+            paid_active += 1
+
+    if user.get("is_banned"):
+        status = "banned"
+        label = "Забанен"
+        css_class = "status-banned"
+    elif paid_active > 0:
+        status = "paid"
+        label = "Платная подписка"
+        css_class = "status-active"
+    elif trial_active > 0:
+        status = "trial"
+        label = "Пробная подписка"
+        css_class = "status-trial"
+    elif user.get("trial_used"):
+        status = "trial_expired"
+        label = "Пробник истек"
+        css_class = "status-warning"
+    else:
+        status = "no_subscription"
+        label = "Без подписки"
+        css_class = "status-stopped"
+
+    return {
+        "status": status,
+        "label": label,
+        "css_class": css_class,
+        "active_total": active_total,
+        "paid_active": paid_active,
+        "trial_active": trial_active,
+        "is_active": active_total > 0,
+    }
+
+
+def _format_remaining_time(seconds_left: float) -> str:
+    total_minutes = max(1, int(ceil(seconds_left / 60)))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours <= 0:
+        return f"{minutes} мин."
+
+    days, hours = divmod(hours, 24)
+    parts = []
+    if days:
+        parts.append(f"{days} дн.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes and not days:
+        parts.append(f"{minutes} мин.")
+    return " ".join(parts)
+
+
+def _build_key_expiry_status(
+    key: dict, *, is_trial: bool = False, now: datetime | None = None
+) -> dict:
+    now = now or time_utils.get_msk_now()
+    expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+
+    if not expiry:
+        return {
+            "filter": "active",
+            "css_class": "status-active",
+            "label": "Бессрочно",
+            "expires_at": "∞",
+        }
+
+    expires_at = expiry.strftime("%d.%m.%Y %H:%M")
+    seconds_left = (expiry - now).total_seconds()
+
+    if seconds_left <= 0:
+        return {
+            "filter": "expired",
+            "css_class": "status-banned",
+            "label": "Триал истек" if is_trial else "Просрочено",
+            "expires_at": expires_at,
+        }
+
+    remaining = _format_remaining_time(seconds_left)
+    if seconds_left < 24 * 3600:
+        return {
+            "filter": "expiring",
+            "css_class": "status-warning",
+            "label": (
+                f"Триал: {remaining}" if is_trial else f"Осталось {remaining}"
+            ),
+            "expires_at": expires_at,
+        }
+
+    if seconds_left < 3 * 24 * 3600:
+        return {
+            "filter": "expiring",
+            "css_class": "status-warning",
+            "label": (
+                f"Триал: {remaining}" if is_trial else f"Осталось {remaining}"
+            ),
+            "expires_at": expires_at,
+        }
+
+    return {
+        "filter": "active",
+        "css_class": "status-active",
+        "label": f"Осталось {remaining}",
+        "expires_at": expires_at,
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -144,6 +356,33 @@ def _get_schema_version(db_path: Path) -> int:
     except Exception as e:
         logger.error(f"Failed to read schema version from {db_path}: {e}")
         return 0
+
+
+def _validate_restore_db(db_path: Path) -> None:
+    """Validate uploaded SQLite DB before it can replace the live database."""
+    required_tables = {"users", "vpn_keys", "transactions", "bot_settings"}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA integrity_check")
+            integrity_row = cursor.fetchone()
+            integrity_result = str(integrity_row[0] if integrity_row else "").lower()
+            if integrity_result != "ok":
+                raise ValueError("Проверка целостности БД не пройдена.")
+
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+            tables = {str(row[0]) for row in cursor.fetchall()}
+    except sqlite3.DatabaseError as e:
+        raise ValueError("Файл users.db в архиве не является корректной SQLite БД.") from e
+
+    missing_tables = sorted(required_tables - tables)
+    if missing_tables:
+        raise ValueError(
+            "В backup-базе отсутствуют обязательные таблицы: "
+            + ", ".join(missing_tables)
+        )
 
 
 def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
@@ -168,10 +407,8 @@ def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        if include_env:
-            env_path = Path(".env")
-            if env_path.exists():
-                shutil.copy(env_path, temp_dir / ".env")
+        if include_env and ENV_FILE.exists():
+            shutil.copy(ENV_FILE, temp_dir / ".env")
 
         zip_path = (
             temp_dir
@@ -191,8 +428,20 @@ def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
 
 def _safe_extract_zip(zip_ref: zipfile.ZipFile, extract_dir: Path) -> None:
     extract_root = extract_dir.resolve()
-    for member in zip_ref.infolist():
+    members = zip_ref.infolist()
+    if len(members) > MAX_BACKUP_FILES:
+        raise ValueError("В архиве слишком много файлов.")
+
+    total_unpacked = 0
+    for member in members:
         member_name = member.filename
+        if member.is_dir():
+            raise ValueError("Архив не должен содержать директории.")
+        if member_name not in ALLOWED_BACKUP_FILES:
+            raise ValueError("Архив содержит недопустимый файл.")
+        total_unpacked += int(member.file_size or 0)
+        if total_unpacked > MAX_BACKUP_UNPACKED_BYTES:
+            raise ValueError("Архив слишком большой после распаковки.")
         if Path(member_name).is_absolute():
             raise ValueError("Недопустимый путь в архиве.")
         member_path = (extract_dir / member_name).resolve()
@@ -224,6 +473,8 @@ def _restore_from_backup(zip_file, apply_env: bool = False) -> dict:
 
         if not db_src.exists():
             raise ValueError("В архиве нет файла users.db")
+
+        _validate_restore_db(db_src)
 
         if metadata_path.exists():
             meta = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -259,7 +510,7 @@ def _restore_from_backup(zip_file, apply_env: bool = False) -> dict:
         if apply_env:
             env_src = extract_dir / ".env"
             if env_src.exists():
-                shutil.copyfile(env_src, Path(".env"))
+                shutil.copyfile(env_src, ENV_FILE)
 
         if _bot_controller:
             if previous_status.get("shop_bot_running"):
@@ -330,7 +581,7 @@ def _set_webhook_processed(provider: str, external_id: str) -> None:
 
 def _sanitize_csv_cell(value) -> str:
     text = str(value or "")
-    if text[:1] in {"=", "+", "-", "@"}:
+    if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
         return f"'{text}"
     return text
 
@@ -382,6 +633,7 @@ def _is_valid_cryptobot_signature() -> bool:
 ALL_SETTINGS_KEYS = [
     "panel_login",
     "panel_password",
+    "show_about_menu_item",
     "about_text",
     "terms_url",
     "privacy_url",
@@ -420,7 +672,47 @@ ALL_SETTINGS_KEYS = [
     "subscription_auto_provision",
     "panel_sync_enabled",
     "xtls_sync_enabled",
+    "enable_promo_codes",
+    "profit_vlad_tax_percent",
+    "profit_server_cost_rub",
 ]
+
+SECRET_SETTINGS_KEYS = {
+    "telegram_bot_token",
+    "support_bot_token",
+    "yookassa_secret_key",
+    "cryptobot_token",
+    "cryptobot_webhook_secret",
+}
+
+
+def _validate_panel_url(raw_url: str) -> tuple[bool, str]:
+    try:
+        parsed = urlparse((raw_url or "").strip())
+    except ValueError:
+        return False, "некорректный URL"
+
+    if parsed.scheme not in {"http", "https"}:
+        return False, "URL должен начинаться с http:// или https://"
+    if not parsed.hostname:
+        return False, "в URL должен быть указан host"
+    if parsed.username or parsed.password:
+        return False, "логин и пароль нельзя передавать внутри URL"
+    if parsed.fragment:
+        return False, "URL не должен содержать fragment"
+    return True, ""
+
+
+def _is_usable_flask_secret(value: str | None) -> bool:
+    normalized = (value or "").strip()
+    if len(normalized) < 32:
+        return False
+    return normalized.lower() not in {
+        "change_me_to_a_long_random_secret",
+        "generate_a_long_random_secret_here",
+        "changeme",
+        "change_me",
+    }
 
 
 def create_webhook_app(bot_controller_instance):
@@ -438,18 +730,26 @@ def create_webhook_app(bot_controller_instance):
         static_folder=os.path.join(base_dir, "static"),
     )
     flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
+    flask_app.config["MAX_CONTENT_LENGTH"] = MAX_BACKUP_UPLOAD_BYTES
 
     flask_app.register_blueprint(subscription_bp)
 
-    secret_key = os.getenv("FLASK_SECRET_KEY")
-    if not secret_key:
-        secret_key = get_setting("flask_secret_key")
-    if not secret_key:
+    env_secret_key = os.getenv("FLASK_SECRET_KEY")
+    db_secret_key = get_setting("flask_secret_key")
+    if _is_usable_flask_secret(env_secret_key):
+        secret_key = env_secret_key.strip()
+    elif _is_usable_flask_secret(db_secret_key):
+        secret_key = db_secret_key.strip()
+        if env_secret_key:
+            logger.warning("Ignoring weak FLASK_SECRET_KEY from environment.")
+    else:
         secret_key = os.urandom(32).hex()
         update_setting("flask_secret_key", secret_key)
+        logger.warning("Generated a new Flask secret key because no strong key was configured.")
     flask_app.config["SECRET_KEY"] = secret_key
 
     # Security Hardening
+    flask_app.config["SESSION_COOKIE_SECURE"] = True
     flask_app.config["SESSION_COOKIE_HTTPONLY"] = True
     flask_app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     flask_app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
@@ -462,6 +762,26 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/favicon.ico")
     def favicon():
         return ("", 204)
+
+    @flask_app.route("/healthz", methods=["GET"])
+    def healthz():
+        db_ok = False
+        try:
+            with sqlite3.connect(DB_FILE, timeout=2) as conn:
+                conn.execute("SELECT 1")
+            db_ok = True
+        except sqlite3.Error:
+            logger.exception("Health check failed: database is unavailable")
+
+        loop = current_app.config.get("EVENT_LOOP")
+        loop_ok = bool(loop and loop.is_running())
+        status_code = 200 if db_ok and loop_ok else 503
+        payload = {"status": "ok" if status_code == 200 else "degraded"}
+        return Response(
+            json.dumps(payload, ensure_ascii=False),
+            status=status_code,
+            mimetype="application/json",
+        )
 
     # CSRF Protection
     @flask_app.before_request
@@ -485,10 +805,17 @@ def create_webhook_app(bot_controller_instance):
             session["_csrf_token"] = os.urandom(24).hex()
         return session["_csrf_token"]
 
+    def csp_nonce():
+        if not hasattr(g, "_csp_nonce"):
+            g._csp_nonce = base64.b64encode(os.urandom(16)).decode("ascii")
+        return g._csp_nonce
+
     flask_app.jinja_env.globals["csrf_token"] = generate_csrf_token
+    flask_app.jinja_env.globals["csp_nonce"] = csp_nonce
 
     @flask_app.after_request
     def add_secure_flag_to_session_cookie(response):
+        nonce = csp_nonce()
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -499,7 +826,8 @@ def create_webhook_app(bot_controller_instance):
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+            "script-src-attr 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
             "font-src 'self' data:; "
@@ -733,6 +1061,750 @@ def create_webhook_app(bot_controller_instance):
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
+    def _date_range(days: int | None, start_day: str | None = None) -> list[str]:
+        today = time_utils.get_msk_now().date()
+        if days is None:
+            try:
+                start = datetime.fromisoformat(start_day).date() if start_day else today
+            except (TypeError, ValueError):
+                start = today
+            if start > today:
+                start = today
+            span = (today - start).days + 1
+            return [
+                (start + timedelta(days=offset)).isoformat()
+                for offset in range(span)
+            ]
+        return [
+            (today - timedelta(days=offset)).isoformat()
+            for offset in range(days - 1, -1, -1)
+        ]
+
+    def _safe_metadata(raw: str | None) -> dict:
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    def _format_payment_method(method: str | None) -> str:
+        normalized = str(method or "").strip().lower()
+        labels = {
+            "yookassa": "ЮKassa / СБП",
+            "yoo_kassa": "ЮKassa / СБП",
+            "telegram_stars": "Telegram Stars",
+            "stars": "Telegram Stars",
+            "cryptobot": "CryptoBot",
+            "crypto_bot": "CryptoBot",
+        }
+        return labels.get(normalized, str(method or "Не указан"))
+
+    def _format_chart_day(day: str) -> str:
+        try:
+            return datetime.fromisoformat(day).strftime("%d.%m")
+        except ValueError:
+            return day
+
+    def _dashboard_period_options(selected_period: str) -> list[dict]:
+        return [
+            {
+                "period": period,
+                "label": label,
+                "is_active": selected_period == period,
+            }
+            for period, label in (
+                ("1", "1 день"),
+                ("7", "7 дней"),
+                ("30", "30 дней"),
+                ("all", "Всё время"),
+            )
+        ]
+
+    def _format_period_label(period: str) -> str:
+        labels = {
+            "1": "за 1 день",
+            "7": "за 7 дней",
+            "30": "за 30 дней",
+            "all": "за всё время",
+        }
+        return labels.get(period, "за 30 дней")
+
+    def _parse_money_value(value, default: float = 0.0) -> float:
+        try:
+            normalized = str(value if value is not None else "").replace(",", ".")
+            return max(0.0, float(normalized))
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_percent_value(value, default: float = 0.0) -> float:
+        try:
+            normalized = str(value if value is not None else "").replace(",", ".")
+            return min(100.0, max(0.0, float(normalized)))
+        except (TypeError, ValueError):
+            return default
+
+    def _profit_settings(settings: dict | None = None) -> dict:
+        settings = settings or get_all_settings()
+        bogdan_share = _parse_percent_value(
+            settings.get("profit_bogdan_share_percent"), 40.0
+        )
+        vlad_share = _parse_percent_value(
+            settings.get("profit_vlad_share_percent"), 60.0
+        )
+        return {
+            "bogdan_share_percent": bogdan_share,
+            "vlad_share_percent": vlad_share,
+            "vlad_tax_percent": _parse_percent_value(
+                settings.get("profit_vlad_tax_percent"), 9.0
+            ),
+            "server_cost_rub": _parse_money_value(
+                settings.get("profit_server_cost_rub"), 0.0
+            ),
+        }
+
+    def _calculate_partner_profit(revenue_rub: float, settings: dict) -> dict:
+        revenue = max(0.0, float(revenue_rub or 0.0))
+        bogdan_share = float(settings["bogdan_share_percent"])
+        vlad_share = float(settings["vlad_share_percent"])
+        tax_percent = float(settings["vlad_tax_percent"])
+        server_cost = float(settings["server_cost_rub"])
+
+        total_tax = revenue * tax_percent / 100
+        revenue_after_tax = revenue - total_tax
+        server_share = server_cost / 2
+        bogdan_gross = revenue_after_tax * bogdan_share / 100
+        vlad_gross = revenue_after_tax * vlad_share / 100
+        bogdan_profit = bogdan_gross - server_share
+        vlad_net = vlad_gross - server_share
+
+        return {
+            "revenue_rub": round(revenue, 2),
+            "revenue_after_tax_rub": round(revenue_after_tax, 2),
+            "bogdan_share_percent": bogdan_share,
+            "vlad_share_percent": vlad_share,
+            "vlad_tax_percent": tax_percent,
+            "server_cost_rub": round(server_cost, 2),
+            "server_share_rub": round(server_share, 2),
+            "bogdan_gross_rub": round(bogdan_gross, 2),
+            "bogdan_profit_rub": round(bogdan_profit, 2),
+            "vlad_gross_rub": round(vlad_gross, 2),
+            "vlad_tax_rub": round(total_tax, 2),
+            "vlad_net_rub": round(vlad_net, 2),
+            "total_net_rub": round(bogdan_profit + vlad_net, 2),
+        }
+
+    def _month_bounds(now: datetime, offset: int = 0) -> tuple[datetime, datetime]:
+        month_index = now.month - 1 + offset
+        year = now.year + month_index // 12
+        month = month_index % 12 + 1
+        start = now.replace(
+            year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        next_index = month_index + 1
+        next_year = now.year + next_index // 12
+        next_month = next_index % 12 + 1
+        end = now.replace(
+            year=next_year,
+            month=next_month,
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return start, end
+
+    def _format_profit_dt(value: str | None) -> str:
+        if not value:
+            return "старт проекта"
+        try:
+            normalized = str(value).replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).strftime("%d.%m.%Y %H:%M")
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _profit_iso(dt: datetime) -> str:
+        return dt.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+
+    def _normalize_profit_dt(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            return _profit_iso(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _parse_profit_dt_input(value: str | None) -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return _profit_iso(datetime.fromisoformat(raw.replace("T", " ")))
+        except ValueError:
+            return None
+
+    def _profit_input_value(value: str | None) -> str:
+        if not value:
+            return ""
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime(
+                "%Y-%m-%dT%H:%M"
+            )
+        except ValueError:
+            return ""
+
+    def _profit_display_amount(value: float | int | None) -> str:
+        amount = round(float(value or 0))
+        return f"{amount:,}".replace(",", " ")
+
+    def _selected_period_bounds(
+        selected_period: str, selected_period_days: int | None, now: datetime
+    ) -> tuple[str | None, str]:
+        if selected_period == "all" or selected_period_days is None:
+            return get_first_paid_transaction_date(), _profit_iso(now)
+
+        start = (now - timedelta(days=selected_period_days - 1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return _profit_iso(start), _profit_iso(now)
+
+    def _build_profit_context(
+        selected_period_revenue: float,
+        selected_period: str,
+        selected_period_days: int | None,
+    ) -> dict:
+        settings = _profit_settings()
+        now = time_utils.get_msk_now()
+        current_month_start, current_month_end = _month_bounds(now, 0)
+        previous_month_start, previous_month_end = _month_bounds(now, -1)
+        last_distribution = get_last_active_profit_distribution()
+        project_start = _normalize_profit_dt(get_first_paid_transaction_date())
+        last_distribution_end = _normalize_profit_dt(
+            last_distribution.get("period_end") if last_distribution else None
+        )
+        unsettled_start = last_distribution_end if last_distribution else project_start
+        selected_start, selected_end = _selected_period_bounds(
+            selected_period, selected_period_days, now
+        )
+        now_iso = _profit_iso(now)
+
+        slices = {
+            "selected": _calculate_partner_profit(selected_period_revenue, settings),
+            "all_time": _calculate_partner_profit(
+                get_paid_revenue_between(None, now_iso), settings
+            ),
+            "current_month": _calculate_partner_profit(
+                get_paid_revenue_between(
+                    _profit_iso(current_month_start), _profit_iso(current_month_end)
+                ),
+                settings,
+            ),
+            "previous_month": _calculate_partner_profit(
+                get_paid_revenue_between(
+                    _profit_iso(previous_month_start), _profit_iso(previous_month_end)
+                ),
+                settings,
+            ),
+            "unsettled": _calculate_partner_profit(
+                get_paid_revenue_between(unsettled_start, now_iso), settings
+            ),
+        }
+        distribution_periods = [
+            {
+                "value": "unsettled",
+                "label": "К распределению",
+                "start": unsettled_start,
+                "end": now_iso,
+                "note": f"{_format_profit_dt(unsettled_start)} → {_format_profit_dt(now_iso)}",
+                "calculation": slices["unsettled"],
+            },
+            {
+                "value": "current_month",
+                "label": "Текущий месяц",
+                "start": _profit_iso(current_month_start),
+                "end": now_iso,
+                "note": f"{_format_profit_dt(_profit_iso(current_month_start))} → {_format_profit_dt(now_iso)}",
+                "calculation": slices["current_month"],
+            },
+            {
+                "value": "previous_month",
+                "label": "Прошлый месяц",
+                "start": _profit_iso(previous_month_start),
+                "end": _profit_iso(previous_month_end),
+                "note": f"{_format_profit_dt(_profit_iso(previous_month_start))} → {_format_profit_dt(_profit_iso(previous_month_end))}",
+                "calculation": slices["previous_month"],
+            },
+            {
+                "value": "selected",
+                "label": "Выбранный сверху период",
+                "start": selected_start,
+                "end": selected_end,
+                "note": f"{_format_profit_dt(selected_start)} → {_format_profit_dt(selected_end)}",
+                "calculation": slices["selected"],
+            },
+            {
+                "value": "all_time",
+                "label": "Всё время",
+                "start": project_start,
+                "end": now_iso,
+                "note": f"{_format_profit_dt(project_start)} → {_format_profit_dt(now_iso)}",
+                "calculation": slices["all_time"],
+            },
+            {
+                "value": "custom",
+                "label": "Вручную с/по",
+                "start": None,
+                "end": None,
+                "note": "укажи даты ниже",
+                "calculation": None,
+            },
+        ]
+        for item in distribution_periods:
+            calculation = item.get("calculation") or {}
+            item["revenue_display"] = _profit_display_amount(calculation.get("revenue_rub"))
+            item["tax_display"] = _profit_display_amount(calculation.get("vlad_tax_rub"))
+            item["server_share_display"] = _profit_display_amount(
+                calculation.get("server_share_rub")
+            )
+            item["bogdan_display"] = _profit_display_amount(
+                calculation.get("bogdan_profit_rub")
+            )
+            item["vlad_display"] = _profit_display_amount(calculation.get("vlad_net_rub"))
+        history = get_profit_distributions(limit=8, include_void=True)
+        for row in history:
+            row["period_start_label"] = _format_profit_dt(row.get("period_start"))
+            row["period_end_label"] = _format_profit_dt(row.get("period_end"))
+            row["status_label"] = {
+                "active": "рассчитано",
+                "paid": "выплачено",
+                "void": "отменено",
+            }.get(str(row.get("status") or ""), str(row.get("status") or ""))
+
+        return {
+            "settings": settings,
+            "slices": slices,
+            "last_distribution": last_distribution,
+            "project_start": project_start,
+            "project_start_label": _format_profit_dt(project_start),
+            "unsettled_start": unsettled_start,
+            "unsettled_start_label": _format_profit_dt(unsettled_start),
+            "now_iso": now_iso,
+            "now_label": _format_profit_dt(now_iso),
+            "now_input": _profit_input_value(now_iso),
+            "current_month_start_input": _profit_input_value(
+                _profit_iso(current_month_start)
+            ),
+            "distribution_periods": distribution_periods,
+            "history": history,
+        }
+
+    def _build_dashboard_analytics(days: int | None = 30) -> dict:
+        period_key = "all" if days is None else str(days)
+        start_day = None
+        if days is None:
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT MIN(day)
+                        FROM (
+                            SELECT substr(registration_date, 1, 10) AS day
+                            FROM users
+                            WHERE registration_date IS NOT NULL
+                            UNION ALL
+                            SELECT substr(created_date, 1, 10) AS day
+                            FROM transactions
+                            WHERE created_date IS NOT NULL
+                            UNION ALL
+                            SELECT substr(created_date, 1, 10) AS day
+                            FROM vpn_keys
+                            WHERE created_date IS NOT NULL
+                        )
+                        WHERE day IS NOT NULL AND day != ''
+                        """
+                    )
+                    start_day = cursor.fetchone()[0]
+            except sqlite3.Error as e:
+                logger.error("Failed to detect all-time dashboard start day: %s", e)
+        dates = _date_range(days, start_day=start_day)
+        date_set = set(dates)
+        analytics = {
+            "dates": dates,
+            "labels": [_format_chart_day(day) for day in dates],
+            "period": period_key,
+            "period_days": days,
+            "period_label": _format_period_label(period_key),
+            "series": {
+                "users": {day: 0 for day in dates},
+                "revenue": {day: 0.0 for day in dates},
+                "orders": {day: 0 for day in dates},
+                "keys": {day: 0 for day in dates},
+            },
+            "summary": {
+                "today_users": 0,
+                "today_revenue": 0.0,
+                "today_orders": 0,
+                "period_users": 0,
+                "period_revenue": 0.0,
+                "period_orders": 0,
+                "all_time_revenue": 0.0,
+                "all_time_orders": 0,
+                "active_paid_keys": 0,
+                "expired_paid_keys": 0,
+                "active_total_keys": 0,
+                "expired_total_keys": 0,
+                "active_trial_keys": 0,
+                "expired_trial_keys": 0,
+                "total_paid_keys": 0,
+                "total_trial_keys": 0,
+                "total_users": 0,
+                "trial_users": 0,
+                "trial_used_users": 0,
+                "expired_trial_users": 0,
+                "paying_users": 0,
+                "paid_transaction_users": 0,
+                "period_paid_transaction_users": 0,
+                "paid_subscription_users": 0,
+                "active_subscriptions": 0,
+                "active_paid_subscriptions": 0,
+                "active_access_subscriptions": 0,
+                "expired_paid_subscriptions": 0,
+                "expired_subscriptions": 0,
+                "active_trial_subscriptions": 0,
+                "active_paid_users": 0,
+                "active_paid_users_with_payment": 0,
+                "active_paid_users_without_payment": 0,
+                "active_trial_users": 0,
+                "expired_paid_users": 0,
+                "expired_trial_users": 0,
+                "conversion_percent": 0.0,
+                "avg_order": 0.0,
+            },
+            "payment_methods": [],
+            "plan_revenue": [],
+            "top_days": [],
+            "recent_paid": [],
+            "transaction_statuses": [],
+        }
+
+        today_key = time_utils.get_msk_now().date().isoformat()
+        now = time_utils.get_msk_now()
+
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                cursor.execute("SELECT COUNT(*) FROM users")
+                total_users = int(cursor.fetchone()[0] or 0)
+                analytics["summary"]["total_users"] = total_users
+
+                cursor.execute(
+                    """
+                    SELECT substr(registration_date, 1, 10) AS day, COUNT(*) AS count
+                    FROM users
+                    WHERE registration_date IS NOT NULL
+                    GROUP BY day
+                    """
+                )
+                for row in cursor.fetchall():
+                    day = row["day"]
+                    if day in date_set:
+                        analytics["series"]["users"][day] = int(row["count"] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT telegram_id, username, total_spent, total_months, trial_used
+                    FROM users
+                    """
+                )
+                user_states = {
+                    int(row["telegram_id"]): {
+                        "user": dict(row),
+                        "has_xui_key": False,
+                        "has_active_xui_key": False,
+                        "has_paid_key": False,
+                        "has_active_paid_key": False,
+                        "has_trial_key": False,
+                        "has_active_trial_key": False,
+                    }
+                    for row in cursor.fetchall()
+                }
+
+                cursor.execute(
+                    """
+                    SELECT key_id, user_id, expiry_date, plan_id, service_type
+                    FROM vpn_keys
+                    WHERE COALESCE(service_type, 'xui') != 'mtg'
+                    """
+                )
+                paying_users: set[int] = set()
+                paid_transaction_users: set[int] = set()
+                trial_users: set[int] = set()
+                trial_used_users: set[int] = set()
+                paid_subscription_users: set[int] = set()
+                active_paid_users: set[int] = set()
+                active_trial_users: set[int] = set()
+                expired_paid_users: set[int] = set()
+                expired_trial_users: set[int] = set()
+                for row in cursor.fetchall():
+                    key_row = dict(row)
+                    user_id = int(key_row["user_id"])
+                    state = user_states.setdefault(
+                        user_id,
+                        {
+                            "user": {
+                                "telegram_id": user_id,
+                                "total_spent": 0,
+                                "total_months": 0,
+                                "trial_used": 0,
+                            },
+                            "has_xui_key": False,
+                            "has_active_xui_key": False,
+                            "has_paid_key": False,
+                            "has_active_paid_key": False,
+                            "has_trial_key": False,
+                            "has_active_trial_key": False,
+                        },
+                    )
+                    state["has_xui_key"] = True
+                    expiry_dt = time_utils.parse_iso_to_msk(key_row["expiry_date"])
+                    is_active = bool(expiry_dt and expiry_dt > now)
+                    is_trial_key = _key_is_trial_for_user(key_row, state["user"])
+                    if is_active:
+                        state["has_active_xui_key"] = True
+                    if not is_trial_key:
+                        paid_subscription_users.add(user_id)
+                        state["has_paid_key"] = True
+                        analytics["summary"]["total_paid_keys"] += 1
+                        if is_active:
+                            analytics["summary"]["active_paid_keys"] += 1
+                            state["has_active_paid_key"] = True
+                            active_paid_users.add(user_id)
+                        else:
+                            analytics["summary"]["expired_paid_keys"] += 1
+                            expired_paid_users.add(user_id)
+                    else:
+                        state["has_trial_key"] = True
+                        analytics["summary"]["total_trial_keys"] += 1
+                        if is_active:
+                            analytics["summary"]["active_trial_keys"] += 1
+                            state["has_active_trial_key"] = True
+                            active_trial_users.add(user_id)
+                            trial_users.add(user_id)
+                        else:
+                            analytics["summary"]["expired_trial_keys"] += 1
+                            expired_trial_users.add(user_id)
+
+                for state in user_states.values():
+                    user = state["user"]
+                    user_id = int(user["telegram_id"])
+                    if _user_has_paid_subscription(user):
+                        paying_users.add(user_id)
+                    if user.get("trial_used"):
+                        trial_used_users.add(user_id)
+                        trial_users.add(user_id)
+                        if not state["has_active_trial_key"]:
+                            expired_trial_users.add(user_id)
+
+                analytics["summary"]["active_total_keys"] = (
+                    analytics["summary"]["active_paid_keys"]
+                    + analytics["summary"]["active_trial_keys"]
+                )
+                analytics["summary"]["expired_total_keys"] = (
+                    analytics["summary"]["expired_paid_keys"]
+                    + analytics["summary"]["expired_trial_keys"]
+                )
+                analytics["summary"].update(
+                    {
+                        "paid_subscription_users": len(paid_subscription_users),
+                        "active_paid_users": len(active_paid_users),
+                        "active_trial_users": len(active_trial_users),
+                        "expired_paid_users": len(expired_paid_users),
+                        "expired_trial_users": len(expired_trial_users),
+                    }
+                )
+
+                cursor.execute(
+                    """
+                    SELECT substr(created_date, 1, 10) AS day, COUNT(*) AS count
+                    FROM vpn_keys
+                    WHERE created_date IS NOT NULL
+                      AND COALESCE(service_type, 'xui') != 'mtg'
+                    GROUP BY day
+                    """
+                )
+                for row in cursor.fetchall():
+                    day = row["day"]
+                    if day in date_set:
+                        analytics["series"]["keys"][day] = int(row["count"] or 0)
+
+                cursor.execute(
+                    "SELECT plan_id, plan_name FROM plans"
+                )
+                plan_names = {
+                    str(row["plan_id"]): row["plan_name"] for row in cursor.fetchall()
+                }
+
+                cursor.execute(
+                    """
+                    SELECT payment_id, user_id, username, status, amount_rub,
+                           payment_method, metadata, created_date
+                    FROM transactions
+                    ORDER BY created_date DESC
+                    """
+                )
+                method_totals: dict[str, dict] = {}
+                plan_totals: dict[str, dict] = {}
+                status_counts: dict[str, int] = {}
+                period_paid_transaction_users: set[int] = set()
+                top_days: dict[str, dict] = {
+                    day: {
+                        "day": _format_chart_day(day),
+                        "revenue": 0.0,
+                        "orders": 0,
+                        "users": 0,
+                    }
+                    for day in dates
+                }
+                recent_paid: list[dict] = []
+
+                for row in cursor.fetchall():
+                    status = str(row["status"] or "unknown")
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    day = str(row["created_date"] or "")[:10]
+                    metadata = _safe_metadata(row["metadata"])
+                    method = _format_payment_method(
+                        row["payment_method"] or metadata.get("payment_method")
+                    )
+                    amount = float(row["amount_rub"] or 0)
+
+                    if status != "paid":
+                        continue
+
+                    paid_transaction_users.add(int(row["user_id"]))
+                    analytics["summary"]["all_time_revenue"] += amount
+                    analytics["summary"]["all_time_orders"] += 1
+
+                    if day in date_set:
+                        period_paid_transaction_users.add(int(row["user_id"]))
+                        analytics["series"]["revenue"][day] += amount
+                        analytics["series"]["orders"][day] += 1
+                        top_days[day]["revenue"] += amount
+                        top_days[day]["orders"] += 1
+                        top_days[day]["users"] += 1
+
+                    method_bucket = method_totals.setdefault(
+                        method, {"method": method, "revenue": 0.0, "orders": 0}
+                    )
+                    method_bucket["revenue"] += amount
+                    method_bucket["orders"] += 1
+
+                    plan_id = str(metadata.get("plan_id") or "")
+                    plan_name = (
+                        metadata.get("plan_name")
+                        or plan_names.get(plan_id)
+                        or (f"Тариф #{plan_id}" if plan_id else "Не указан")
+                    )
+                    plan_bucket = plan_totals.setdefault(
+                        plan_name, {"plan": plan_name, "revenue": 0.0, "orders": 0}
+                    )
+                    plan_bucket["revenue"] += amount
+                    plan_bucket["orders"] += 1
+
+                    if len(recent_paid) < 8:
+                        recent_paid.append(
+                            {
+                                "user_id": row["user_id"],
+                                "username": row["username"] or "N/A",
+                                "amount": amount,
+                                "method": method,
+                                "plan": plan_name,
+                                "date": row["created_date"],
+                            }
+                        )
+
+                period_revenue = sum(analytics["series"]["revenue"].values())
+                period_orders = sum(analytics["series"]["orders"].values())
+                period_users = sum(analytics["series"]["users"].values())
+                paying_users.update(paid_transaction_users)
+                expired_paid_users_count = len(
+                    paid_transaction_users - active_paid_users
+                )
+                analytics["summary"].update(
+                    {
+                        "today_users": analytics["series"]["users"].get(today_key, 0),
+                        "today_revenue": analytics["series"]["revenue"].get(
+                            today_key, 0.0
+                        ),
+                        "today_orders": analytics["series"]["orders"].get(today_key, 0),
+                        "period_users": period_users,
+                        "period_revenue": period_revenue,
+                        "period_orders": period_orders,
+                        "paying_users": len(paid_transaction_users),
+                        "paid_transaction_users": len(paid_transaction_users),
+                        "period_paid_transaction_users": len(
+                            period_paid_transaction_users
+                        ),
+                        "active_subscriptions": len(active_paid_users),
+                        "active_paid_subscriptions": len(active_paid_users),
+                        "active_access_subscriptions": len(active_paid_users),
+                        "expired_paid_subscriptions": expired_paid_users_count,
+                        "expired_subscriptions": expired_paid_users_count,
+                        "active_trial_subscriptions": len(active_trial_users),
+                        "active_paid_users_with_payment": len(
+                            active_paid_users & paid_transaction_users
+                        ),
+                        "active_paid_users_without_payment": len(
+                            active_paid_users - paid_transaction_users
+                        ),
+                        "expired_paid_users": expired_paid_users_count,
+                        "trial_users": len(trial_used_users),
+                        "trial_used_users": len(trial_used_users),
+                        "expired_trial_users": len(
+                            trial_used_users - active_trial_users
+                        ),
+                        "conversion_percent": (
+                            round(len(paid_transaction_users) / total_users * 100, 1)
+                            if total_users
+                            else 0.0
+                        ),
+                        "avg_order": (
+                            round(period_revenue / period_orders, 2)
+                            if period_orders
+                            else 0.0
+                        ),
+                    }
+                )
+
+                analytics["payment_methods"] = sorted(
+                    method_totals.values(),
+                    key=lambda item: item["revenue"],
+                    reverse=True,
+                )
+                analytics["plan_revenue"] = sorted(
+                    plan_totals.values(),
+                    key=lambda item: item["revenue"],
+                    reverse=True,
+                )[:6]
+                analytics["top_days"] = sorted(
+                    top_days.values(),
+                    key=lambda item: item["revenue"],
+                    reverse=True,
+                )[:5]
+                analytics["recent_paid"] = recent_paid
+                analytics["transaction_statuses"] = [
+                    {"status": status, "count": count}
+                    for status, count in sorted(status_counts.items())
+                ]
+        except sqlite3.Error as e:
+            logger.error("Failed to build dashboard analytics: %s", e, exc_info=True)
+
+        return analytics
+
     def _run_async(coro, timeout: int = 45):
         """Run an async coroutine from a Flask sync route via the shared event loop.
 
@@ -795,18 +1867,28 @@ def create_webhook_app(bot_controller_instance):
         hosts = get_all_hosts()
         for host in hosts:
             host["plans"] = get_plans_for_host(host["host_name"], service_type="xui")
+            if host.get("api_token"):
+                host["api_token_configured"] = True
+                host["api_token"] = ""
 
         mtg_hosts = get_all_mtg_hosts()
         for host in mtg_hosts:
             host["plans"] = get_plans_for_host(host["host_name"], service_type="mtg")
 
+        safe_settings = dict(current_settings)
+        for secret_key in SECRET_SETTINGS_KEYS:
+            if safe_settings.get(secret_key):
+                safe_settings[f"{secret_key}_configured"] = True
+                safe_settings[secret_key] = ""
+
         return {
-            "settings": current_settings,
+            "settings": safe_settings,
             "hosts": hosts,
             "global_plans": get_plans_for_host("ALL", service_type="xui"),
             "mtg_hosts": mtg_hosts,
             "payment_rules": get_all_payment_rules(),
             "all_payment_methods": ALL_PAYMENT_METHODS,
+            "promo_codes": get_all_promo_codes(),
         }
 
     def _delete_remote_user_key(key: dict) -> bool:
@@ -915,6 +1997,11 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/dashboard")
     @login_required
     def dashboard_page():
+        requested_period = (request.args.get("period") or "30").strip().lower()
+        selected_period = (
+            requested_period if requested_period in {"1", "7", "30", "all"} else "30"
+        )
+        period_days = None if selected_period == "all" else int(selected_period)
         problem_users = _build_problem_users(limit=10)
         stats = {
             "user_count": get_user_count(),
@@ -932,26 +2019,263 @@ def create_webhook_app(bot_controller_instance):
         )
         total_pages = ceil(total_transactions / per_page)
 
-        chart_data = get_daily_stats_for_charts(days=30)
+        analytics = _build_dashboard_analytics(days=period_days)
+        profit = _build_profit_context(
+            analytics["summary"]["period_revenue"], selected_period, period_days
+        )
         common_data = get_common_template_data()
 
         return render_template(
             "dashboard.html",
             stats=stats,
             problem_users=problem_users,
-            chart_data=chart_data,
+            analytics=analytics,
+            profit=profit,
             transactions=transactions,
             current_page=page,
             total_pages=total_pages,
+            period_options=_dashboard_period_options(selected_period),
             **common_data,
         )
+
+    @flask_app.route("/dashboard/profit-settings", methods=["POST"])
+    @login_required
+    def update_profit_settings_route():
+        tax_percent = _parse_percent_value(request.form.get("vlad_tax_percent"), 9.0)
+        server_cost = _parse_money_value(request.form.get("server_cost_rub"), 0.0)
+        update_setting("profit_vlad_tax_percent", str(tax_percent))
+        update_setting("profit_server_cost_rub", str(server_cost))
+        flash("Настройки дележа прибыли сохранены.", "success")
+        return redirect(request.referrer or url_for("dashboard_page"))
+
+    @flask_app.route("/dashboard/profit-distributions/create", methods=["POST"])
+    @login_required
+    def create_profit_distribution_route():
+        settings = _profit_settings()
+        now = time_utils.get_msk_now()
+        now_iso = _profit_iso(now)
+        current_month_start, _ = _month_bounds(now, 0)
+        previous_month_start, previous_month_end = _month_bounds(now, -1)
+        last_distribution = get_last_active_profit_distribution()
+        project_start = _normalize_profit_dt(get_first_paid_transaction_date())
+        last_distribution_end = _normalize_profit_dt(
+            last_distribution.get("period_end") if last_distribution else None
+        )
+        selected_period = (request.form.get("selected_period") or "30").strip().lower()
+        selected_days = (
+            None
+            if selected_period == "all"
+            else int(selected_period)
+            if selected_period in {"1", "7", "30"}
+            else 30
+        )
+        selected_start, selected_end = _selected_period_bounds(
+            selected_period, selected_days, now
+        )
+        period_scope = (request.form.get("distribution_period") or "unsettled").strip()
+        period_options = {
+            "unsettled": (
+                last_distribution_end if last_distribution else project_start,
+                now_iso,
+            ),
+            "current_month": (_profit_iso(current_month_start), now_iso),
+            "previous_month": (
+                _profit_iso(previous_month_start),
+                _profit_iso(previous_month_end),
+            ),
+            "selected": (selected_start, selected_end),
+            "all_time": (project_start, now_iso),
+        }
+
+        if period_scope == "custom":
+            period_start = _parse_profit_dt_input(request.form.get("custom_period_start"))
+            period_end = _parse_profit_dt_input(request.form.get("custom_period_end"))
+            if not period_end:
+                period_end = now_iso
+        else:
+            period_start, period_end = period_options.get(
+                period_scope, period_options["unsettled"]
+            )
+
+        if not period_end:
+            period_end = now_iso
+
+        if period_start and datetime.fromisoformat(period_start) >= datetime.fromisoformat(
+            period_end
+        ):
+            flash("Дата начала периода должна быть раньше даты окончания.", "warning")
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        if has_profit_distribution_overlap(period_start, period_end):
+            flash(
+                "Этот период пересекается с уже зафиксированной выплатой. Выберите другой период или отмените старую фиксацию.",
+                "warning",
+            )
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        revenue = get_paid_revenue_between(period_start, period_end)
+        calculated = _calculate_partner_profit(revenue, settings)
+        distribution_id = create_profit_distribution(
+            period_start=period_start,
+            period_end=period_end,
+            revenue_rub=calculated["revenue_rub"],
+            bogdan_share_percent=calculated["bogdan_share_percent"],
+            vlad_share_percent=calculated["vlad_share_percent"],
+            vlad_tax_percent=calculated["vlad_tax_percent"],
+            server_cost_rub=calculated["server_cost_rub"],
+            bogdan_profit_rub=calculated["bogdan_profit_rub"],
+            vlad_gross_rub=calculated["vlad_gross_rub"],
+            vlad_tax_rub=calculated["vlad_tax_rub"],
+            vlad_net_rub=calculated["vlad_net_rub"],
+            note=(request.form.get("note") or "").strip() or None,
+        )
+        if distribution_id:
+            flash("Распределение прибыли зафиксировано в истории.", "success")
+        else:
+            flash("Не удалось зафиксировать распределение прибыли.", "danger")
+        return redirect(request.referrer or url_for("dashboard_page"))
+
+    @flask_app.route(
+        "/dashboard/profit-distributions/<int:distribution_id>/update",
+        methods=["POST"],
+    )
+    @login_required
+    def update_profit_distribution_route(distribution_id: int):
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT status FROM profit_distributions WHERE distribution_id = ?",
+                    (distribution_id,),
+                )
+                row = cursor.fetchone()
+            if not row:
+                flash("Запись распределения не найдена.", "warning")
+                return redirect(request.referrer or url_for("dashboard_page"))
+            if row[0] != "active":
+                flash(
+                    "Можно редактировать только активную фиксацию. Выплаченную или отменённую запись сначала нельзя менять.",
+                    "warning",
+                )
+                return redirect(request.referrer or url_for("dashboard_page"))
+        except sqlite3.Error as e:
+            logger.error(
+                "Failed to read profit distribution %s before update: %s",
+                distribution_id,
+                e,
+            )
+            flash("Не удалось проверить запись распределения.", "danger")
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        settings = {
+            "bogdan_share_percent": _parse_percent_value(
+                request.form.get("bogdan_share_percent"), 40.0
+            ),
+            "vlad_share_percent": _parse_percent_value(
+                request.form.get("vlad_share_percent"), 60.0
+            ),
+            "vlad_tax_percent": _parse_percent_value(
+                request.form.get("vlad_tax_percent"), 9.0
+            ),
+            "server_cost_rub": _parse_money_value(
+                request.form.get("server_cost_rub"), 0.0
+            ),
+        }
+        period_start = (request.form.get("period_start") or "").strip() or None
+        period_end = (
+            (request.form.get("period_end") or "").strip()
+            or time_utils.get_msk_now().isoformat()
+        )
+        try:
+            parsed_period_start = (
+                datetime.fromisoformat(period_start) if period_start else None
+            )
+            parsed_period_end = datetime.fromisoformat(period_end)
+        except ValueError:
+            flash("Неверный формат даты периода.", "warning")
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        if parsed_period_start and parsed_period_start >= parsed_period_end:
+            flash("Дата начала периода должна быть раньше даты окончания.", "warning")
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        if has_profit_distribution_overlap(
+            period_start, period_end, exclude_distribution_id=distribution_id
+        ):
+            flash(
+                "После правки период пересекается с другой фиксацией. Изменения не сохранены.",
+                "warning",
+            )
+            return redirect(request.referrer or url_for("dashboard_page"))
+
+        revenue = get_paid_revenue_between(period_start, period_end)
+        calculated = _calculate_partner_profit(revenue, settings)
+        ok = update_profit_distribution(
+            distribution_id,
+            period_start=period_start,
+            period_end=period_end,
+            revenue_rub=revenue,
+            bogdan_share_percent=calculated["bogdan_share_percent"],
+            vlad_share_percent=calculated["vlad_share_percent"],
+            vlad_tax_percent=calculated["vlad_tax_percent"],
+            server_cost_rub=calculated["server_cost_rub"],
+            bogdan_profit_rub=calculated["bogdan_profit_rub"],
+            vlad_gross_rub=calculated["vlad_gross_rub"],
+            vlad_tax_rub=calculated["vlad_tax_rub"],
+            vlad_net_rub=calculated["vlad_net_rub"],
+            note=(request.form.get("note") or "").strip() or None,
+        )
+        flash(
+            (
+                "Запись распределения обновлена."
+                if ok
+                else "Запись распределения не найдена."
+            ),
+            "success" if ok else "warning",
+        )
+        return redirect(request.referrer or url_for("dashboard_page"))
+
+    @flask_app.route(
+        "/dashboard/profit-distributions/<int:distribution_id>/paid",
+        methods=["POST"],
+    )
+    @login_required
+    def mark_profit_distribution_paid_route(distribution_id: int):
+        ok = mark_profit_distribution_paid(distribution_id)
+        flash(
+            "Фиксация отмечена как выплаченная."
+            if ok
+            else "Можно отметить выплаченной только активную фиксацию.",
+            "success" if ok else "warning",
+        )
+        return redirect(request.referrer or url_for("dashboard_page"))
+
+    @flask_app.route(
+        "/dashboard/profit-distributions/<int:distribution_id>/void",
+        methods=["POST"],
+    )
+    @login_required
+    def void_profit_distribution_route(distribution_id: int):
+        ok = void_profit_distribution(distribution_id)
+        flash(
+            "Фиксация отменена. Следующий расчёт снова учтёт этот период."
+            if ok
+            else "Активная фиксация не найдена.",
+            "success" if ok else "warning",
+        )
+        return redirect(request.referrer or url_for("dashboard_page"))
 
     @flask_app.route("/users")
     @login_required
     def users_page():
         users = get_all_users()
+        now = time_utils.get_msk_now()
         for user in users:
             user["user_keys"] = get_user_keys(user["telegram_id"])
+            user["subscription_summary"] = _summarize_user_subscription(
+                user, user["user_keys"], now
+            )
+        user_metrics = _build_user_metrics(users)
 
         # Prepare plans for manual issuance
         all_hosts = get_all_hosts()
@@ -967,7 +2291,11 @@ def create_webhook_app(bot_controller_instance):
 
         common_data = get_common_template_data()
         return render_template(
-            "users.html", users=users, issuance_data=issuance_data, **common_data
+            "users.html",
+            users=users,
+            user_metrics=user_metrics,
+            issuance_data=issuance_data,
+            **common_data,
         )
 
     @flask_app.route("/export/users.csv")
@@ -977,22 +2305,22 @@ def create_webhook_app(bot_controller_instance):
         now = time_utils.get_msk_now()
         for user in get_all_users():
             keys = get_user_keys(int(user["telegram_id"]))
-            active_keys = 0
-            for key in keys:
-                expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-                if expiry and expiry > now:
-                    active_keys += 1
+            summary = _summarize_user_subscription(user, keys, now)
             rows.append(
                 {
                     "telegram_id": user.get("telegram_id"),
                     "username": user.get("username") or "",
+                    "receipt_email": user.get("receipt_email") or "",
                     "is_banned": int(bool(user.get("is_banned"))),
                     "trial_used": int(bool(user.get("trial_used"))),
+                    "subscription_status": summary["status"],
                     "registration_date": user.get("registration_date") or "",
                     "total_spent": user.get("total_spent") or 0,
                     "total_months": user.get("total_months") or 0,
                     "keys_total": len(keys),
-                    "keys_active": active_keys,
+                    "keys_active": summary["active_total"],
+                    "paid_keys_active": summary["paid_active"],
+                    "trial_keys_active": summary["trial_active"],
                 }
             )
 
@@ -1002,13 +2330,17 @@ def create_webhook_app(bot_controller_instance):
             fieldnames=[
                 "telegram_id",
                 "username",
+                "receipt_email",
                 "is_banned",
                 "trial_used",
+                "subscription_status",
                 "registration_date",
                 "total_spent",
                 "total_months",
                 "keys_total",
                 "keys_active",
+                "paid_keys_active",
+                "trial_keys_active",
             ],
         )
 
@@ -1119,6 +2451,7 @@ def create_webhook_app(bot_controller_instance):
                         username=host_data["host_username"],
                         password=host_data["host_pass"],
                         inbound_id=host_data["host_inbound_id"],
+                        api_token=host_data.get("api_token"),
                     )
                     if not api or not inbound:
                         issue_list.append("Не удалось подключиться к панели XUI")
@@ -1212,24 +2545,23 @@ def create_webhook_app(bot_controller_instance):
     def keys_page():
         all_keys = get_all_keys_with_usernames()
         subscription_domain = get_setting("domain")
+        now = time_utils.get_msk_now()
         enabled_xui_hosts = {
             host.get("host_name")
             for host in get_all_hosts(only_enabled=True)
             if host.get("host_name")
         }
 
-        # Identify global plan IDs
         try:
-            global_plan_ids = {
-                int(p["plan_id"])
-                for p in get_plans_for_host("ALL", service_type="xui")
-                if p.get("plan_id") is not None
-            }
+            global_plan_ids = get_global_plan_ids()
         except Exception:
             global_plan_ids = set()
 
         # Group keys by user and mark global ones
         users_map = {}
+        active_subscription_users: set[int] = set()
+        active_trial_users: set[int] = set()
+        active_paid_users: set[int] = set()
         for key in all_keys:
             uid = key["user_id"]
             if uid not in users_map:
@@ -1240,17 +2572,19 @@ def create_webhook_app(bot_controller_instance):
                     "user_keys": [],
                 }
 
-            # Mark if key is part of a global subscription
-            plan_id = key.get("plan_id")
-            host_name = key.get("host_name")
-            is_xui_bundle = (
-                key.get("service_type") == "xui"
-                and bool(key.get("subscription_token"))
-                and host_name in enabled_xui_hosts
+            key["is_global"] = is_global_xui_key(
+                key, global_plan_ids, enabled_xui_hosts
             )
-            key["is_global"] = is_xui_bundle or (
-                plan_id is not None and int(plan_id) in global_plan_ids
+            key["is_trial"] = _key_is_trial_for_owner(key)
+            key["expiry_status"] = _build_key_expiry_status(
+                key, is_trial=key["is_trial"], now=now
             )
+            if key["expiry_status"]["filter"] != "expired" and _is_xui_key(key):
+                active_subscription_users.add(int(uid))
+                if key["is_trial"]:
+                    active_trial_users.add(int(uid))
+                else:
+                    active_paid_users.add(int(uid))
             key["copy_value"] = (key.get("connection_string") or "").strip()
             key["has_copy_value"] = bool(key["copy_value"])
             key["copy_kind"] = (
@@ -1284,15 +2618,24 @@ def create_webhook_app(bot_controller_instance):
             deduped_global = sorted(global_by_host.values(), key=_expiry_ts)
             user_data["user_keys"] = deduped_global + regular_keys
             user_data["is_trial"] = bool(deduped_global) and all(
-                int(key.get("plan_id") or 0) == 0 for key in deduped_global
+                key.get("is_trial") for key in deduped_global
             )
 
         grouped_users = sorted(users_map.values(), key=lambda u: u["username"])
+        key_stats = {
+            "total_users": get_user_count(),
+            "users_with_keys": len(grouped_users),
+            "total_key_rows": len(all_keys),
+            "active_subscriptions": len(active_subscription_users),
+            "active_paid_users": len(active_paid_users),
+            "active_trial_users": len(active_trial_users),
+        }
 
         common_data = get_common_template_data()
         return render_template(
             "keys.html",
             grouped_users=grouped_users,
+            key_stats=key_stats,
             task_statuses=_task_status_snapshot(),
             **common_data,
         )
@@ -1330,16 +2673,8 @@ def create_webhook_app(bot_controller_instance):
                     for host in get_all_hosts(only_enabled=True)
                     if host.get("host_name")
                 }
-                global_plan_ids = {
-                    int(p["plan_id"])
-                    for p in get_plans_for_host("ALL", service_type="xui")
-                    if p.get("plan_id") is not None
-                }
-                plan_id = key_data.get("plan_id")
-                if (
-                    key_data.get("service_type") == "xui"
-                    and key_data.get("host_name") in enabled_xui_hosts
-                ) or (plan_id is not None and int(plan_id) in global_plan_ids):
+                global_plan_ids = get_global_plan_ids()
+                if is_global_xui_key(key_data, global_plan_ids, enabled_xui_hosts):
                     is_global = True
             except Exception as e:
                 logger.error(f"Error checking global plan status: {e}")
@@ -1349,13 +2684,8 @@ def create_webhook_app(bot_controller_instance):
                 user_keys = get_user_keys(key_data["user_id"])
                 # Find other global keys for this user
                 for k in user_keys:
-                    plan_id = k.get("plan_id")
-                    if k["key_id"] != key_id and (
-                        (
-                            k.get("service_type") == "xui"
-                            and k.get("host_name") in enabled_xui_hosts
-                        )
-                        or (plan_id is not None and int(plan_id) in global_plan_ids)
+                    if k["key_id"] != key_id and is_global_xui_key(
+                        k, global_plan_ids, enabled_xui_hosts
                     ):
                         keys_to_adjust.append(k)
 
@@ -1587,6 +2917,7 @@ def create_webhook_app(bot_controller_instance):
 
             for checkbox_key in [
                 "force_subscription",
+                "show_about_menu_item",
                 "sbp_enabled",
                 "trial_enabled",
                 "enable_referrals",
@@ -1597,6 +2928,7 @@ def create_webhook_app(bot_controller_instance):
                 "enable_admin_payment_notifications",
                 "enable_admin_trial_notifications",
                 "email_prompt_enabled",
+                "enable_promo_codes",
             ]:
                 values = request.form.getlist(checkbox_key)
                 value = values[-1] if values else "false"
@@ -1606,6 +2938,7 @@ def create_webhook_app(bot_controller_instance):
                 if key in [
                     "panel_password",
                     "force_subscription",
+                    "show_about_menu_item",
                     "sbp_enabled",
                     "trial_enabled",
                     "enable_referrals",
@@ -1616,10 +2949,13 @@ def create_webhook_app(bot_controller_instance):
                     "enable_admin_payment_notifications",
                     "enable_admin_trial_notifications",
                     "email_prompt_enabled",
+                    "enable_promo_codes",
                 ]:
                     continue
                 value = request.form.get(key)
                 if value is not None:
+                    if key in SECRET_SETTINGS_KEYS and not value.strip():
+                        continue
                     update_setting(key, value)
 
             flash("Настройки успешно сохранены!", "success")
@@ -2053,12 +3389,42 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def add_host_route():
         host_name = request.form["host_name"].strip()
+        host_url = request.form["host_url"].strip()
+        host_username = request.form["host_username"].strip()
+        host_pass = request.form["host_pass"]
+        api_token = request.form.get("api_token", "").strip()
+        url_ok, url_error = _validate_panel_url(host_url)
+        if not url_ok:
+            flash(f"Хост '{host_name}' не добавлен: {url_error}.", "warning")
+            return redirect(url_for("settings_page"))
+
+        try:
+            inbound = int(request.form["host_inbound_id"].strip())
+        except ValueError:
+            flash("ID входящего подключения должен быть целым числом.", "warning")
+            return redirect(url_for("settings_page"))
+
+        preflight_ok, preflight_message = xui_api.validate_host_write_access(
+            host_url=host_url,
+            username=host_username,
+            password=host_pass,
+            inbound_id=inbound,
+            api_token=api_token,
+        )
+        if not preflight_ok:
+            flash(
+                f"Хост '{host_name}' не добавлен: {preflight_message}.",
+                "danger",
+            )
+            return redirect(url_for("settings_page"))
+
         success = create_host(
             name=host_name,
-            url=request.form["host_url"].strip(),
-            user=request.form["host_username"].strip(),
-            passwd=request.form["host_pass"],
-            inbound=int(request.form["host_inbound_id"].strip()),
+            url=host_url,
+            user=host_username,
+            passwd=host_pass,
+            inbound=inbound,
+            api_token=api_token,
         )
 
         if not success:
@@ -2155,6 +3521,7 @@ def create_webhook_app(bot_controller_instance):
         host_url = request.form.get("host_url", "").strip()
         host_username = request.form.get("host_username", "").strip()
         host_pass = request.form.get("host_pass", "")
+        api_token = request.form.get("api_token", "").strip()
         inbound_raw = request.form.get("host_inbound_id", "").strip()
 
         if (
@@ -2168,11 +3535,36 @@ def create_webhook_app(bot_controller_instance):
             return redirect(
                 url_for("edit_host_page", host_name=old_host_name or new_host_name)
             )
+        url_ok, url_error = _validate_panel_url(host_url)
+        if not url_ok:
+            flash(f"Хост '{new_host_name}' не обновлен: {url_error}.", "warning")
+            return redirect(url_for("edit_host_page", host_name=old_host_name))
 
         try:
             inbound = int(inbound_raw)
         except ValueError:
             flash("ID входящего подключения должен быть целым числом.", "warning")
+            return redirect(url_for("edit_host_page", host_name=old_host_name))
+
+        current_host = get_host(old_host_name)
+        preflight_password = host_pass or (
+            current_host.get("host_pass") if current_host else ""
+        )
+        api_token_to_store = api_token or (
+            current_host.get("api_token") if current_host else ""
+        )
+        preflight_ok, preflight_message = xui_api.validate_host_write_access(
+            host_url=host_url,
+            username=host_username,
+            password=preflight_password,
+            inbound_id=inbound,
+            api_token=api_token_to_store,
+        )
+        if not preflight_ok:
+            flash(
+                f"Хост '{new_host_name}' не обновлен: {preflight_message}.",
+                "danger",
+            )
             return redirect(url_for("edit_host_page", host_name=old_host_name))
 
         success = update_host(
@@ -2182,6 +3574,7 @@ def create_webhook_app(bot_controller_instance):
             user=host_username,
             passwd=host_pass,
             inbound=inbound,
+            api_token=api_token_to_store,
         )
 
         if not success:
@@ -2222,76 +3615,17 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/delete-host/<host_name>", methods=["POST"])
     @login_required
     def delete_host_route(host_name):
-        keys = get_keys_for_host(host_name)
-        if keys:
-
-            async def _delete_all_clients_strict():
-                tasks = [
-                    xui_api.delete_client_on_host(host_name, key.get("key_email"))
-                    for key in keys
-                    if key.get("key_email")
-                ]
-                if not tasks:
-                    return True
-                # Use semaphore to limit concurrent deletions (avoid overwhelming the API)
-                semaphore = asyncio.Semaphore(5)
-
-                async def delete_with_semaphore(client_task):
-                    async with semaphore:
-                        return await client_task
-
-                results = await asyncio.wait_for(
-                    asyncio.gather(
-                        *[delete_with_semaphore(task) for task in tasks],
-                        return_exceptions=True,
-                    ),
-                    timeout=300,  # Increased timeout for large number of clients
-                )
-                all_ok = True
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error(
-                            f"Error deleting client during host removal: {result}",
-                            exc_info=True,
-                        )
-                        all_ok = False
-                    elif result is False:
-                        all_ok = False
-                return all_ok
-
-            loop = current_app.config.get("EVENT_LOOP")
-            try:
-                if loop and loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        _delete_all_clients_strict(), loop
-                    )
-                    all_ok = future.result(timeout=305)  # Match the increased timeout
-                else:
-                    logger.error(
-                        f"Cannot delete clients from host '{host_name}': event loop is not running."
-                    )
-                    all_ok = False
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete clients from host '{host_name}': {e}",
-                    exc_info=True,
-                )
-                all_ok = False
-
-            if not all_ok:
-                flash(
-                    "Удаление остановлено: не все клиенты удалены из 3x-ui. Хост не удалён.",
-                    "danger",
-                )
-                return redirect(url_for("settings_page"))
-
         if not delete_host(host_name):
             flash(
                 "Хост не удалось удалить из локальной базы. Проверьте логи.",
                 "danger",
             )
             return redirect(url_for("settings_page"))
-        flash(f"Хост '{host_name}' и все его тарифы были удалены.", "success")
+        flash(
+            f"Хост '{host_name}', его тарифы, ключи и связанные локальные записи удалены. "
+            "Доступность 3x-ui панели при удалении не проверялась.",
+            "success",
+        )
         return redirect(url_for("settings_page"))
 
     @flask_app.route("/add-plan", methods=["POST"])
@@ -2317,15 +3651,108 @@ def create_webhook_app(bot_controller_instance):
         flash("Тариф успешно удален.", "success")
         return redirect(url_for("settings_page"))
 
+    @flask_app.route("/promo-codes/toggle-feature", methods=["POST"])
+    @login_required
+    def toggle_promo_codes_feature_route():
+        enabled = request.form.get("enable_promo_codes") == "true"
+        update_setting("enable_promo_codes", "true" if enabled else "false")
+        flash(
+            "Промокоды включены." if enabled else "Промокоды отключены.",
+            "success",
+        )
+        return redirect(url_for("settings_page") + "#promo-codes")
+
+    def _promo_expires_at_from_form() -> str | None:
+        raw_date = (request.form.get("expires_on") or "").strip()
+        if not raw_date:
+            return None
+        expiry_date = datetime.strptime(raw_date, "%Y-%m-%d")
+        expiry_dt = time_utils.MSK_TZ.localize(
+            expiry_date.replace(hour=23, minute=59, second=59)
+        )
+        return expiry_dt.isoformat()
+
+    @flask_app.route("/promo-codes/add", methods=["POST"])
+    @login_required
+    def add_promo_code_route():
+        try:
+            duration_days = int(request.form.get("duration_days", "0"))
+            max_uses = int(request.form.get("max_uses", "0"))
+            expires_at = _promo_expires_at_from_form()
+        except ValueError:
+            flash(
+                "Дни подписки, лимит применений и дата действия должны быть корректными.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#promo-codes")
+
+        success, message = create_promo_code(
+            code=request.form.get("code", ""),
+            duration_days=duration_days,
+            max_uses=max_uses,
+            expires_at=expires_at,
+        )
+        flash(message, "success" if success else "warning")
+        return redirect(url_for("settings_page") + "#promo-codes")
+
+    @flask_app.route("/promo-codes/update/<int:promo_id>", methods=["POST"])
+    @login_required
+    def update_promo_code_route(promo_id):
+        try:
+            duration_days = int(request.form.get("duration_days", "0"))
+            max_uses = int(request.form.get("max_uses", "0"))
+            expires_at = _promo_expires_at_from_form()
+        except ValueError:
+            flash(
+                "Дни подписки, лимит применений и дата действия должны быть корректными.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#promo-codes")
+
+        success, message = update_promo_code(
+            promo_id=promo_id,
+            code=request.form.get("code", ""),
+            duration_days=duration_days,
+            max_uses=max_uses,
+            expires_at=expires_at,
+            is_active=request.form.get("is_active") == "true",
+        )
+        flash(message, "success" if success else "warning")
+        return redirect(url_for("settings_page") + "#promo-codes")
+
+    @flask_app.route("/promo-codes/toggle/<int:promo_id>", methods=["POST"])
+    @login_required
+    def toggle_promo_code_route(promo_id):
+        is_active = request.form.get("is_active") == "true"
+        if set_promo_code_active(promo_id, is_active):
+            flash("Промокод включён." if is_active else "Промокод отключён.", "success")
+        else:
+            flash("Не удалось изменить статус промокода.", "danger")
+        return redirect(url_for("settings_page") + "#promo-codes")
+
+    @flask_app.route("/promo-codes/delete/<int:promo_id>", methods=["POST"])
+    @login_required
+    def delete_promo_code_route(promo_id):
+        if delete_promo_code(promo_id):
+            flash("Промокод удалён.", "success")
+        else:
+            flash("Не удалось удалить промокод.", "danger")
+        return redirect(url_for("settings_page") + "#promo-codes")
+
     # ── MTG Proxy host routes ─────────────────────────────────────────────────
 
     @flask_app.route("/add-mtg-host", methods=["POST"])
     @login_required
     def add_mtg_host_route():
         host_name = request.form["host_name"]
+        host_url = request.form["host_url"]
+        url_ok, url_error = _validate_panel_url(host_url)
+        if not url_ok:
+            flash(f"MTG-хост '{host_name}' не добавлен: {url_error}.", "warning")
+            return redirect(url_for("settings_page"))
         success = create_mtg_host(
             name=host_name,
-            url=request.form["host_url"],
+            url=host_url,
             user=request.form["host_username"],
             passwd=request.form["host_pass"],
         )
@@ -2358,10 +3785,15 @@ def create_webhook_app(bot_controller_instance):
     def update_mtg_host_route():
         old_host_name = request.form["old_host_name"]
         new_host_name = request.form["host_name"]
+        host_url = request.form["host_url"]
+        url_ok, url_error = _validate_panel_url(host_url)
+        if not url_ok:
+            flash(f"MTG-хост '{new_host_name}' не обновлён: {url_error}.", "warning")
+            return redirect(url_for("settings_page"))
         success = update_mtg_host(
             old_name=old_host_name,
             new_name=new_host_name,
-            url=request.form["host_url"],
+            url=host_url,
             user=request.form["host_username"],
             passwd=request.form.get("host_pass", ""),
         )
@@ -2392,54 +3824,17 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/delete-mtg-host/<host_name>", methods=["POST"])
     @login_required
     def delete_mtg_host_route(host_name):
-        from shop_bot.modules import mtg_api as _mtg_api
-
-        keys = get_keys_for_host(host_name)
-        # Remove proxies from MTG panel before deleting DB state to avoid orphaned remote users.
-        if keys:
-
-            async def _delete_mtg_proxies():
-                all_ok = True
-                for key in keys:
-                    proxy_name = key.get("key_email")
-                    node_id_str = key.get("xui_client_uuid")
-                    if proxy_name and node_id_str and key.get("service_type") == "mtg":
-                        try:
-                            deleted = await _mtg_api.delete_proxy_for_user(
-                                host_name, proxy_name, int(node_id_str)
-                            )
-                            if not deleted:
-                                all_ok = False
-                        except Exception as e:
-                            logger.warning(
-                                f"Could not delete MTG proxy '{proxy_name}': {e}"
-                            )
-                            all_ok = False
-                return all_ok
-
-            try:
-                all_ok = _run_async(_delete_mtg_proxies(), timeout=120)
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete MTG proxies for host '{host_name}': {e}",
-                    exc_info=True,
-                )
-                all_ok = False
-
-            if not all_ok:
-                flash(
-                    "Удаление остановлено: не все MTG proxy удалены с панели. Хост не удалён.",
-                    "danger",
-                )
-                return redirect(url_for("settings_page"))
-
         if not delete_mtg_host(host_name):
             flash(
                 "MTG-хост не удалось удалить из локальной базы. Проверьте логи.",
                 "danger",
             )
             return redirect(url_for("settings_page"))
-        flash(f"MTG-хост '{host_name}' и все его тарифы удалены.", "success")
+        flash(
+            f"MTG-хост '{host_name}', его тарифы, ключи и связанные локальные записи удалены. "
+            "Доступность MTG панели при удалении не проверялась.",
+            "success",
+        )
         return redirect(url_for("settings_page"))
 
     # ── Payment method rules ──────────────────────────────────────────────────
@@ -2532,6 +3927,11 @@ def create_webhook_app(bot_controller_instance):
                 api_currency = getattr(
                     getattr(payment, "amount", None), "currency", None
                 )
+                if str(api_currency or "").upper() != "RUB":
+                    logger.error(
+                        f"YooKassa webhook: Unexpected currency for {payment_id}: {api_currency}"
+                    )
+                    return "Service Unavailable", 503
                 meta_price = metadata.get("price")
                 if api_amount and meta_price is not None:
                     try:
@@ -2601,6 +4001,20 @@ def create_webhook_app(bot_controller_instance):
                             )
                             return "Service Unavailable", 503
                     else:
+                        if reserved_payment_id:
+                            finalize_reserved_transaction(
+                                reserved_payment_id,
+                                success=False,
+                                metadata=metadata,
+                                payment_method="YooKassa",
+                                amount_currency=(
+                                    float(api_amount)
+                                    if api_amount is not None
+                                    else None
+                                ),
+                                currency_name=api_currency,
+                            )
+                            reserved_payment_id = None
                         logger.error(
                             "YooKassa webhook: Event loop is not available! Will retry."
                         )
@@ -2614,20 +4028,21 @@ def create_webhook_app(bot_controller_instance):
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
             return "Error", 500
 
-    def _cryptobot_webhook_handler_impl():
+    def _cryptobot_webhook_handler_impl(path_secret_valid: bool = False):
         reserved_payment_id: str | None = None
         try:
             signature_valid = _is_valid_cryptobot_signature()
 
             configured_secret = get_setting("cryptobot_webhook_secret")
             request_secret = _extract_cryptobot_secret_from_request()
-            legacy_secret_valid = bool(
-                configured_secret
-                and request_secret
+            legacy_secret_valid = (
+                not get_setting("cryptobot_token")
+                and bool(configured_secret)
+                and bool(request_secret)
                 and compare_digest(str(request_secret), str(configured_secret))
             )
 
-            if not signature_valid and not legacy_secret_valid:
+            if not signature_valid and not legacy_secret_valid and not path_secret_valid:
                 logger.warning(
                     "CryptoBot Webhook: missing valid signature and legacy secret check failed."
                 )
@@ -2687,6 +4102,19 @@ def create_webhook_app(bot_controller_instance):
                 currency_name = payload_data.get("asset") or payload_data.get(
                     "currency"
                 )
+                currency_type = payload_data.get("currency_type")
+                fiat_name = payload_data.get("fiat")
+                normalized_currency = str(currency_name or fiat_name or "").upper()
+                if normalized_currency != "RUB" or (
+                    currency_type and str(currency_type).lower() != "fiat"
+                ):
+                    logger.error(
+                        "CryptoBot webhook: Unexpected currency fields: currency=%s fiat=%s currency_type=%s",
+                        currency_name,
+                        fiat_name,
+                        currency_type,
+                    )
+                    return "Bad Request", 400
 
                 if payment_id:
                     metadata = _reserve_pending_transaction_for_cryptobot(
@@ -2708,31 +4136,10 @@ def create_webhook_app(bot_controller_instance):
                     )
                     reserved_payment_id = payment_id
                 else:
-                    parts = payload_string.split(":")
-                    if len(parts) < 9:
-                        logger.error(
-                            f"cryptobot Webhook: Invalid payload format received: {payload_string}"
-                        )
-                        return "Error", 400
-
-                    metadata = {
-                        "user_id": parts[0],
-                        "months": parts[1],
-                        "price": parts[2],
-                        "action": parts[3],
-                        "key_id": parts[4],
-                        "host_name": parts[5],
-                        "plan_id": parts[6],
-                        "customer_email": parts[7] if parts[7] != "None" else None,
-                        "payment_method": "CryptoBot",
-                        "provider_payment_id": str(
-                            external_invoice_id or external_id_fallback or ""
-                        ),
-                        "cryptobot_invoice_id": str(
-                            external_invoice_id or external_id_fallback or ""
-                        ),
-                    }
-                    payload_price = parts[2]
+                    logger.error(
+                        "CryptoBot webhook: paid invoice payload has no known pending transaction id."
+                    )
+                    return "Bad Request", 400
 
                 # Cross-check actual paid amount against payload price
                 if cb_amount:
@@ -2831,10 +4238,15 @@ def create_webhook_app(bot_controller_instance):
     def cryptobot_webhook_handler_with_token(token: str):
         configured_secret = get_setting("cryptobot_webhook_secret")
         if configured_secret and compare_digest(str(token), str(configured_secret)):
+            if get_setting("cryptobot_token"):
+                logger.warning(
+                    "CryptoBot Webhook: path secret accepted only as route compatibility; HMAC signature is still required."
+                )
+                return _cryptobot_webhook_handler_impl(path_secret_valid=False)
             logger.warning(
-                "CryptoBot Webhook: path-based secret is deprecated but temporarily accepted."
+                "CryptoBot Webhook: path-based secret is deprecated but temporarily accepted without HMAC because cryptobot_token is not configured."
             )
-            return _cryptobot_webhook_handler_impl()
+            return _cryptobot_webhook_handler_impl(path_secret_valid=True)
         return "Forbidden", 403
 
     @flask_app.route("/settings/toggle_global_plans", methods=["POST"])

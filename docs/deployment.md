@@ -4,6 +4,8 @@
 
 ```bash
 cp .env.example .env
+# обязательно задайте TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, DOMAIN
+# и сильный FLASK_SECRET_KEY, если .env создаётся вручную
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -31,6 +33,7 @@ docker compose logs -f
 - фактические рабочие настройки дальше живут в таблице `bot_settings`;
 - БД по умолчанию: `users.db` в корне проекта;
 - backup-файлы и `.env` считаются runtime-артефактами, не исходниками.
+- `FLASK_SECRET_KEY` должен быть случайным секретом длиной не меньше 32 символов. `install.sh` генерирует его автоматически; placeholder-значения из шаблона приложение не использует.
 
 ## Backup и restore
 
@@ -52,18 +55,29 @@ git pull
 docker compose up -d --build
 ```
 
+Если образ уже собран отдельно через `docker compose build`, изменения всё равно не попадут в работающий контейнер до `docker compose up -d`.
+
 ### Из админки
 
 Встроенный update-manager:
 
 - проверяет версию по GitHub Raw;
-- делает `git fetch origin main`;
+- по умолчанию отключён в production и требует явного `ENABLE_WEB_UPDATES=true`;
+- делает `git fetch origin main`, если web-update включён;
 - проверяет, что рабочее дерево чистое;
 - только после этого делает `git reset --hard origin/main`;
 - выполняет `pip install -e .`;
 - завершает процесс, чтобы Docker его перезапустил.
 
 Это всё ещё агрессивная схема обновления, но теперь она не запускается при локальных незакоммиченных изменениях.
+
+Для Docker production предпочтителен ручной rebuild/redeploy через `docker compose up -d --build`, потому что зависимости устанавливаются при сборке образа.
+
+## Healthcheck
+
+`/healthz` используется Docker healthcheck-ом. Endpoint публично не требует авторизации, поэтому он должен возвращать только минимальный статус `ok/degraded`, без деталей о БД, event loop и ботах.
+
+После изменения кода `/healthz` старый подробный ответ будет сохраняться до пересоздания контейнера.
 
 ## Проверки перед деплоем
 
@@ -73,6 +87,10 @@ python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
 python3 scripts/check_settings_defaults.py
+bash -n install.sh
+docker compose config --quiet
+git diff --check
+docker compose build
 ```
 
 Для очистки локальных cache-артефактов есть:

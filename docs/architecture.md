@@ -32,9 +32,9 @@
 
 ### Integration layer
 
-- [src/shop_bot/modules/xui_api.py](/root/vless-shopbot/src/shop_bot/modules/xui_api.py) — 3x-ui login, create/update/delete client, connection strings, panel sync.
+- [src/shop_bot/modules/xui_api.py](/root/vless-shopbot/src/shop_bot/modules/xui_api.py) — 3x-ui login/API-token auth, create/update/delete client, connection strings, panel sync.
 - [src/shop_bot/modules/mtg_api.py](/root/vless-shopbot/src/shop_bot/modules/mtg_api.py) — MTG token cache, create/renew/delete/toggle proxy.
-- [src/shop_bot/webhook_server/subscription_api.py](/root/vless-shopbot/src/shop_bot/webhook_server/subscription_api.py) — `/sub/<token>` для глобальной подписки и active global trial.
+- [src/shop_bot/webhook_server/subscription_api.py](/root/vless-shopbot/src/shop_bot/webhook_server/subscription_api.py) — `/sub/<token>` для глобальной подписки и active global trial; `/happ/<token>` для HTTPS-редиректа в Happ deeplink.
 
 ### Admin web layer
 
@@ -49,7 +49,9 @@
 3. После webhook или Telegram payment вызывается `process_successful_payment`.
 4. Выдача происходит через 3x-ui или MTG.
 5. Результат пишется в `vpn_keys` и `transactions`.
-6. Scheduler дальше поддерживает срок, статус и уведомления.
+6. Для глобальной VPN-подписки пользователь получает постоянную `/sub/<token>` ссылку и кнопку `🔌 Подключить в Happ`.
+7. Кнопка ведёт на HTTPS endpoint `/happ/<token>`, который проверяет token и отдаёт `302 Location: happ://add/https://<domain>/sub/<token>`.
+8. Scheduler дальше поддерживает срок, статус и уведомления.
 
 ## Особенности
 
