@@ -29,11 +29,9 @@
 
 ## Под вопросом, оставлено без удаления
 
-- [src/shop_bot/webhook_server/templates/debug_settings.html](/root/vless-shopbot/src/shop_bot/webhook_server/templates/debug_settings.html)
-  Шаблон выглядит устаревшим и не подключён к текущим route, но файл tracked, поэтому автоматически не удалялся.
 - `.env`
 - `users.db`
-- `users.db.bak_20260302_1314`
+- локальные `users.db.backup_*` / `users.*backup*.db`
 - старые callback aliases и compatibility-код в bot handlers
 
 ## Обнаруженные риски и особенности

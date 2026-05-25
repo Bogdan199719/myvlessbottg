@@ -8,7 +8,7 @@ echo "[cleanup] Removing Python cache directories..."
 find . -type d -name '__pycache__' -prune -exec rm -rf {} +
 
 echo "[cleanup] Removing common tool caches..."
-rm -rf .pytest_cache .mypy_cache .ruff_cache
+rm -rf .pytest_cache .mypy_cache .ruff_cache .cache
 
 echo "[cleanup] Removing Python bytecode files..."
 find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
