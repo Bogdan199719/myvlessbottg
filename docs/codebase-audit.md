@@ -66,7 +66,7 @@
 
 ### Production-наблюдение
 
-На момент проверки контейнер был `healthy`, scheduler выполнял циклы, shop/support bot были активны. В логах замечен не связанный с этим аудитом runtime error `Unsupported protocol: hysteria` при обработке одного из XUI-хостов; это нужно разбирать отдельно как поддержку протокола или настройку конкретного хоста.
+На момент проверки контейнер был `healthy`, scheduler выполнял циклы, shop/support bot были активны. В логах замечен не связанный с этим аудитом runtime error `Unsupported protocol: hysteria` при обработке одного из XUI-хостов; позже интеграция 3x-ui была доработана для Hysteria/Hysteria2 через raw JSON API.
 
 ## Что обновлено в документации
 
@@ -100,3 +100,32 @@
 - Проверить `host_url`, `host_inbound_id`, логин/пароль или `api_token` в админке.
 - Убедиться, что API 3x-ui доступен по настроенному пути и inbound существует.
 - После включения проверить логи scheduler и `/sub/<token>` на успешную довыдачу ключей.
+
+## Аудит 2026-05-25
+
+### Проверено
+
+- `python3 -m compileall -q src scripts`
+- `scripts/check_callbacks.py`
+- `scripts/check_fsm_transitions.py`
+- `scripts/check_host_cleanup.py`
+- `scripts/check_settings_defaults.py`
+- `bash -n install.sh`
+- `docker compose config --quiet`
+- `git diff --check`
+- Flask route map и `url_for(...)` в шаблонах внутри контейнера
+- `PRAGMA integrity_check` для `users.db`
+- Docker healthcheck `/healthz`
+- последние runtime-логи контейнера на `ERROR`, `WARNING`, `Traceback`
+
+### Исправлено
+
+- Убраны устаревшие абсолютные ссылки из документации. Документация теперь использует относительные пути и не зависит от имени директории на сервере.
+
+### Итог
+
+- На момент аудита контейнер `myvlessbottg-bot-1` был `healthy`.
+- `/healthz` возвращал `{"status": "ok"}`.
+- База прошла `PRAGMA integrity_check`.
+- В последних проверенных логах не было `ERROR`, `WARNING` или traceback.
+- Явных runtime-багов, требующих правки кода и перезапуска, не найдено.

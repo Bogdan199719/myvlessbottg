@@ -12,7 +12,7 @@ docker compose logs -f
 
 Сервис:
 
-- собирает образ из [Dockerfile](/root/vless-shopbot/Dockerfile);
+- собирает образ из `Dockerfile`;
 - монтирует проект в контейнер как `/app/project`;
 - запускает `python3 -m shop_bot`;
 - слушает `1488`.
