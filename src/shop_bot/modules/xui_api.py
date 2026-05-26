@@ -569,6 +569,15 @@ def _protocol_prefers_panel_links(protocol: str | None) -> bool:
     }
 
 
+def _inbound_prefers_panel_links(inbound: Inbound) -> bool:
+    protocol = (getattr(inbound, "protocol", "") or "").lower()
+    if _protocol_prefers_panel_links(protocol):
+        return True
+
+    network, _ = _get_stream_network_security(inbound)
+    return protocol == "vless" and network in {"xhttp", "splithttp", "httpupgrade"}
+
+
 def _connection_string_for_client(
     api: Api,
     inbound: Inbound,
@@ -585,7 +594,7 @@ def _connection_string_for_client(
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
-    elif _protocol_prefers_panel_links(protocol):
+    elif _inbound_prefers_panel_links(inbound):
         panel_links = _get_client_links_from_panel(api, inbound, email)
         connection_string = panel_links[0] if panel_links else None
         if not connection_string and client_identifier:
@@ -620,6 +629,161 @@ def _raw_api_request(
     if isinstance(result, dict) and result.get("success") is False:
         raise RuntimeError(result.get("msg") or f"3x-ui API request failed: {endpoint}")
     return result
+
+
+def _is_endpoint_not_found_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "404" in message and "not found" in message
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _client_payload_for_clients_api(client: Client, client_identifier: str) -> dict:
+    return {
+        "email": getattr(client, "email", "") or "",
+        "subId": getattr(client, "sub_id", None) or uuid.uuid4().hex[:16],
+        "id": client_identifier,
+        "password": getattr(client, "password", None) or client_identifier,
+        "auth": getattr(client, "auth", None) or client_identifier,
+        "flow": getattr(client, "flow", None) or "",
+        "totalGB": _safe_int(getattr(client, "total_gb", 0)),
+        "expiryTime": _safe_int(getattr(client, "expiry_time", 0)),
+        "limitIp": _safe_int(getattr(client, "limit_ip", 0)),
+        "tgId": _safe_int(getattr(client, "tg_id", 0)),
+        "comment": getattr(client, "comment", None) or "",
+        "enable": bool(getattr(client, "enable", True)),
+    }
+
+
+def _raw_client_payload_for_clients_api(client: dict) -> dict:
+    identifier = (
+        client.get("auth")
+        or client.get("id")
+        or client.get("password")
+        or client.get("email")
+        or str(uuid.uuid4())
+    )
+    return {
+        "email": client.get("email") or "",
+        "subId": client.get("subId") or uuid.uuid4().hex[:16],
+        "id": client.get("id") or identifier,
+        "password": client.get("password") or identifier,
+        "auth": client.get("auth") or identifier,
+        "flow": client.get("flow") or "",
+        "security": client.get("security") or "",
+        "totalGB": _safe_int(client.get("totalGB")),
+        "expiryTime": _safe_int(client.get("expiryTime")),
+        "limitIp": _safe_int(client.get("limitIp")),
+        "tgId": _safe_int(client.get("tgId")),
+        "comment": client.get("comment") or "",
+        "enable": bool(client.get("enable", True)),
+        "reset": _safe_int(client.get("reset")),
+    }
+
+
+def _add_client_compat(
+    api: Api, inbound_id: int, client: Client, client_identifier: str
+) -> None:
+    try:
+        api.client.add(inbound_id, [client])
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    payload = {
+        "client": _client_payload_for_clients_api(client, client_identifier),
+        "inboundIds": [inbound_id],
+    }
+    try:
+        _raw_api_request(api, requests.post, "panel/api/clients/add", payload)
+    except Exception as e:
+        message = str(e).lower()
+        if (
+            "already" not in message
+            and "exist" not in message
+            and "duplicate" not in message
+        ):
+            raise
+        email = getattr(client, "email", "") or client_identifier
+        _update_client_compat(api, client_identifier, client)
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/{quote(email, safe='')}/attach",
+            {"inboundIds": [inbound_id]},
+        )
+
+
+def _update_client_compat(api: Api, client_identifier: str, client: Client) -> None:
+    try:
+        api.client.update(client_identifier, client)
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    email = getattr(client, "email", "") or client_identifier
+    _raw_api_request(
+        api,
+        requests.post,
+        f"panel/api/clients/update/{quote(email, safe='')}",
+        _client_payload_for_clients_api(client, client_identifier),
+    )
+
+
+def _delete_client_compat(
+    api: Api, inbound_id: int, client_identifier: str, email: str
+) -> None:
+    try:
+        api.client.delete(inbound_id, client_identifier)
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    _raw_api_request(
+        api,
+        requests.post,
+        f"panel/api/clients/del/{quote(email or client_identifier, safe='')}",
+    )
+
+
+def _reset_client_traffic_compat(api: Api, inbound_id: int, email: str) -> None:
+    try:
+        api.client.reset_stats(inbound_id, email)
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    _raw_api_request(
+        api,
+        requests.post,
+        f"panel/api/clients/resetTraffic/{quote(email, safe='')}",
+    )
+
+
+def _get_client_traffic_compat(api: Api, email: str):
+    try:
+        return api.client.get_by_email(email)
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    payload = _raw_api_request(
+        api,
+        requests.get,
+        f"panel/api/clients/traffic/{quote(email, safe='')}",
+    )
+    return payload.get("obj")
 
 
 def _get_raw_inbound_obj(api: Api, inbound_id: int) -> dict:
@@ -678,33 +842,84 @@ def _build_raw_client_for_protocol(
 
 
 def _add_raw_client(api: Api, inbound_id: int, client: dict) -> None:
+    try:
+        _raw_api_request(
+            api,
+            requests.post,
+            "panel/api/inbounds/addClient",
+            {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+        )
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
     _raw_api_request(
         api,
         requests.post,
-        "panel/api/inbounds/addClient",
-        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+        "panel/api/clients/add",
+        {
+            "client": _raw_client_payload_for_clients_api(client),
+            "inboundIds": [inbound_id],
+        },
     )
 
 
 def _update_raw_client(
     api: Api, inbound_id: int, client_identifier: str, client: dict
 ) -> None:
+    try:
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
+            {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+        )
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    email = client.get("email") or client_identifier
     _raw_api_request(
         api,
         requests.post,
-        f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
-        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+        f"panel/api/clients/update/{quote(email, safe='')}",
+        _raw_client_payload_for_clients_api(client),
     )
 
 
 def _delete_raw_client(api: Api, inbound_id: int, client_identifier: str) -> None:
+    try:
+        _raw_api_request(
+            api,
+            requests.post,
+            (
+                f"panel/api/inbounds/{inbound_id}/delClient/"
+                f"{quote(client_identifier, safe='')}"
+            ),
+        )
+        return
+    except Exception as e:
+        if not _is_endpoint_not_found_error(e):
+            raise
+
+    delete_key = client_identifier
+    for raw_client in _get_raw_clients(api, inbound_id):
+        raw_identifier = (
+            raw_client.get("auth")
+            or raw_client.get("id")
+            or raw_client.get("password")
+            or raw_client.get("email")
+        )
+        if str(raw_identifier) == str(client_identifier):
+            delete_key = raw_client.get("email") or client_identifier
+            break
+
     _raw_api_request(
         api,
         requests.post,
-        (
-            f"panel/api/inbounds/{inbound_id}/delClient/"
-            f"{quote(client_identifier, safe='')}"
-        ),
+        f"panel/api/clients/del/{quote(delete_key, safe='')}",
     )
 
 
@@ -716,7 +931,7 @@ def _update_client_direct(api: Api, inbound_id: int, client: Client) -> bool:
 
     try:
         client.inbound_id = inbound_id
-        api.client.update(str(client_uuid), client)
+        _update_client_compat(api, str(client_uuid), client)
         return True
     except Exception as e:
         logger.warning(
@@ -794,7 +1009,7 @@ def _refresh_reactivated_client_visual_state(
 def _normalize_client_traffic_state(api: Api, inbound_id: int, email: str) -> bool:
     """Clear stale 3x-ui clientTraffics state for one client."""
     try:
-        api.client.reset_stats(inbound_id, email)
+        _reset_client_traffic_compat(api, inbound_id, email)
         logger.debug(
             "Traffic state reset for client '%s' on inbound %s", email, inbound_id
         )
@@ -812,9 +1027,11 @@ def _normalize_client_traffic_state(api: Api, inbound_id: int, email: str) -> bo
 def _client_traffic_is_disabled(api: Api, email: str) -> bool:
     """Return True when clientTraffics says the client is disabled/exhausted."""
     try:
-        traffic_client = api.client.get_by_email(email)
+        traffic_client = _get_client_traffic_compat(api, email)
         if not traffic_client:
             return False
+        if isinstance(traffic_client, dict):
+            return not bool(traffic_client.get("enable", True))
         return not bool(getattr(traffic_client, "enable", True))
     except Exception as e:
         logger.debug("Could not inspect clientTraffics for '%s': %s", email, e)
@@ -866,7 +1083,7 @@ def validate_host_write_access(
         if _protocol_uses_raw_client_api(protocol):
             _add_raw_client(api, inbound.id, probe_client)
         else:
-            api.client.add(inbound.id, [probe_client])
+            _add_client_compat(api, inbound.id, probe_client, probe_identifier)
     except Exception as e:
         return False, f"панель не разрешила создать тестового клиента: {e}"
 
@@ -874,7 +1091,7 @@ def validate_host_write_access(
         if _protocol_uses_raw_client_api(protocol):
             _delete_raw_client(api, inbound.id, probe_identifier)
         else:
-            api.client.delete(inbound.id, probe_identifier)
+            _delete_client_compat(api, inbound.id, probe_identifier, probe_email)
     except Exception as e:
         logger.warning(
             "Host write preflight created test client '%s' but could not delete it from inbound %s: %s",
@@ -1285,7 +1502,7 @@ def update_or_create_client_on_panel(
                     "Trying client.update fallback."
                 )
                 try:
-                    api.client.update(client_uuid, client_to_update)
+                    _update_client_compat(api, client_uuid, client_to_update)
                     logger.info(
                         f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id} "
                         "via client.update fallback."
@@ -1307,7 +1524,9 @@ def update_or_create_client_on_panel(
                         expiry_time=new_expiry_ms,
                         telegram_id=telegram_id,
                     )
-                    api.client.add(inbound_id, [recreated_client])
+                    _add_client_compat(
+                        api, inbound_id, recreated_client, client_uuid
+                    )
                     logger.info(
                         f"Recreated client '{email}' (identifier: {client_uuid}) on inbound {inbound_id}"
                     )
@@ -1331,7 +1550,7 @@ def update_or_create_client_on_panel(
                 telegram_id=telegram_id,
             )
 
-            api.client.add(inbound_id, [new_client])
+            _add_client_compat(api, inbound_id, new_client, client_uuid)
             logger.info(f"Added new client '{email}' (identifier: {client_uuid})")
 
         return client_uuid, new_expiry_ms
@@ -2144,7 +2363,12 @@ def _delete_client_on_host_sync(host_name: str, client_email: str) -> bool:
             )
             return True
 
-        api.client.delete(inbound.id, client_to_delete["xui_client_uuid"])
+        _delete_client_compat(
+            api,
+            inbound.id,
+            client_to_delete["xui_client_uuid"],
+            client_email,
+        )
         logger.info(
             f"Successfully deleted client '{client_to_delete['xui_client_uuid']}' from host '{host_name}'."
         )

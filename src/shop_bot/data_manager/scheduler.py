@@ -776,9 +776,8 @@ async def auto_provision_new_hosts_for_global_users():
 
     if not global_plan_ids:
         logger.debug(
-            "Scheduler: No global plan IDs configured. Skipping auto-provision."
+            "Scheduler: No global plan IDs configured. Paid auto-provision will be skipped; active trials can still be checked."
         )
-        return
 
     # Get all keys and group by user
     all_keys = await asyncio.to_thread(database.get_all_keys)
@@ -802,46 +801,48 @@ async def auto_provision_new_hosts_for_global_users():
 
     for user_id, user_keys in keys_by_user.items():
         try:
-            # Filter to active paid keys (global subscription)
+            # Filter active global access keys. Paid global keys and trial keys
+            # both represent access to all enabled XUI hosts.
             now = time_utils.get_msk_now()
-            active_paid_keys = []
+            active_paid_global_keys = []
+            active_trial_keys = []
+            active_xui_keys = []
             for k in user_keys:
                 try:
                     expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
-                    if expiry and expiry > now:
-                        if database.is_global_xui_key(k, global_plan_ids):
-                            active_paid_keys.append(k)
+                    if not expiry or expiry <= now:
+                        continue
+                    if k.get("service_type", "xui") != "xui":
+                        continue
+                    active_xui_keys.append(k)
+                    plan_id = int(k.get("plan_id") or 0)
+                    if plan_id == 0:
+                        active_trial_keys.append(k)
+                    elif database.is_global_xui_key(k, global_plan_ids):
+                        active_paid_global_keys.append(k)
                 except (ValueError, TypeError):
                     continue
 
-            if not active_paid_keys:
-                continue  # No active global subscription for this user
+            provisioning_source_keys = active_paid_global_keys or active_trial_keys
+            if not provisioning_source_keys:
+                continue  # No active global access for this user
 
-            # Get hosts where user already has ANY active paid key (not just global-plan ones).
-            # This prevents auto-provision from creating a second client on 3x-ui for a host
-            # that already has a paid key with a non-standard email (e.g. "key1-" instead of "global-").
-            existing_hosts = set()
-            for k in user_keys:
-                h = k.get("host_name")
-                if not h or k.get("plan_id", 0) == 0:
-                    continue
-                try:
-                    exp = time_utils.parse_iso_to_msk(k.get("expiry_date"))
-                    if exp and exp > now:
-                        existing_hosts.add(h)
-                except Exception:
-                    pass
+            # Count any active XUI key on the host as existing access. This
+            # avoids duplicate panel clients and also lets trial self-heal.
+            existing_hosts = {
+                k.get("host_name") for k in active_xui_keys if k.get("host_name")
+            }
 
             # Find missing hosts
             missing_hosts = enabled_host_names - existing_hosts
             if not missing_hosts:
                 continue  # User has keys on all hosts
 
-            # Calculate target expiry from the soonest-expiring global key
+            # Calculate target expiry from the soonest-expiring source key.
             try:
                 min_expiry_dt = min(
                     time_utils.parse_iso_to_msk(k["expiry_date"])
-                    for k in active_paid_keys
+                    for k in provisioning_source_keys
                     if time_utils.parse_iso_to_msk(k.get("expiry_date"))
                 )
                 remaining_seconds = int((min_expiry_dt - now).total_seconds())
@@ -857,11 +858,27 @@ async def auto_provision_new_hosts_for_global_users():
 
             target_expiry_ms = time_utils.get_timestamp_ms(min_expiry_dt)
 
-            # Pick deterministic global plan id to avoid inconsistent plan assignment across cycles.
-            first_global_plan_id = int(min(global_plan_ids))
+            # Pick deterministic global plan id for paid users. Trial keys stay
+            # plan_id=0 so later paid conversion still recognizes them as trial.
+            if active_paid_global_keys and global_plan_ids:
+                first_global_plan_id = int(min(global_plan_ids))
+            elif active_paid_global_keys:
+                legacy_plan_ids = set()
+                for key in active_paid_global_keys:
+                    try:
+                        candidate_plan_id = int(key.get("plan_id") or 0)
+                    except (TypeError, ValueError):
+                        candidate_plan_id = 0
+                    if candidate_plan_id > 0:
+                        legacy_plan_ids.add(candidate_plan_id)
+                first_global_plan_id = (
+                    int(min(legacy_plan_ids)) if legacy_plan_ids else 0
+                )
+            else:
+                first_global_plan_id = 0
 
             logger.info(
-                f"Scheduler: User {user_id} has global subscription. Missing hosts: {missing_hosts}. Auto-provisioning..."
+                f"Scheduler: User {user_id} has global access. Missing hosts: {missing_hosts}. Auto-provisioning..."
             )
             total_users_processed += 1
 

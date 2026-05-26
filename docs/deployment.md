@@ -86,12 +86,28 @@ python3 -m compileall -q src scripts
 python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
+python3 scripts/check_subscription_consistency.py
 python3 scripts/check_settings_defaults.py
 bash -n install.sh
 docker compose config --quiet
 git diff --check
 docker compose build
 ```
+
+`scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа.
+
+## Проверка 3x-ui хостов после обновления панели
+
+При добавлении или обновлении 3x-ui хоста админка выполняет write-preflight: логинится, находит inbound, создаёт отключённого тестового клиента и удаляет его. Это важно, потому что новая 3x-ui ветка может читать inbounds через старый API, но создавать клиентов только через новый `/panel/api/clients/*`.
+
+Если после обновления 3x-ui пользователи видят меньше серверов, проверьте:
+
+```bash
+python3 scripts/check_subscription_consistency.py
+docker compose logs --tail=300 bot
+```
+
+В норме все active global записи должны быть `OK ... 4/4` или с другим числом, равным количеству включённых XUI-хостов.
 
 Для очистки локальных cache-артефактов есть:
 

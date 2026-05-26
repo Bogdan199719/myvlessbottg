@@ -8,7 +8,7 @@ Telegram-бот для продажи VPN и Telegram Proxy с веб-админ
 - отдельный support-бот с forum topics в группе поддержки;
 - Flask-админка с авторизацией, статистикой, управлением пользователями, хостами, тарифами и платежами;
 - подписки VPN по отдельным хостам и глобальная подписка `ALL`;
-- trial-период для VPN в логике глобальной подписки с общей `/sub/...` ссылкой;
+- trial-период для VPN в логике глобальной подписки с общей `/sub/...` ссылкой и самовосстановлением недостающих хостов;
 - Telegram Proxy через MTG-хосты;
 - оплаты через YooKassa, Telegram Stars, CryptoBot и ручной P2P;
 - фоновые проверки: уведомления об истечении, синхронизация с панелями, обслуживание ключей, авто-провижининг глобальных подписок.
@@ -60,6 +60,7 @@ python3 -m compileall -q src scripts
 python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
+python3 scripts/check_subscription_consistency.py
 python3 scripts/check_settings_defaults.py
 ```
 
@@ -78,3 +79,4 @@ python3 scripts/check_settings_defaults.py
 - `users.db`, `.env` и локальные backup-файлы считаются runtime-данными и не должны удаляться автоматически.
 - Backup/import из админки работает с `.env` только по явному выбору в форме, а не автоматически.
 - Встроенное обновление из админки теперь отказывается работать при dirty git worktree, чтобы не потерять локальные изменения.
+- Интеграция 3x-ui поддерживает legacy `/panel/api/inbounds/*` endpoints и новые `/panel/api/clients/*` endpoints, которые появились в актуальных версиях панели.

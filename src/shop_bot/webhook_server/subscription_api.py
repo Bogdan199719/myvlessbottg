@@ -144,6 +144,22 @@ def _is_global_key(key: dict, global_plan_ids: set[int]) -> bool:
     return is_global_xui_key(key, global_plan_ids)
 
 
+def _is_trial_key(key: dict) -> bool:
+    try:
+        return int(key.get("plan_id") or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _min_active_expiry(keys: list[dict]) -> datetime | None:
+    expiries = []
+    for key in keys:
+        parsed = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        if parsed:
+            expiries.append(parsed)
+    return min(expiries) if expiries else None
+
+
 def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
     if not host_names:
         return
@@ -292,35 +308,40 @@ def get_subscription(token):
 
         provision_timeout = _provision_timeout_seconds()
 
-        # Auto-provision missing hosts for active global subscriptions
+        # Auto-provision missing hosts for active global subscriptions.
+        # Trial is intentionally handled like global access too: if initial
+        # issuance partially failed, the subscription endpoint can self-heal
+        # missing hosts while the trial is still active.
         active_global_keys = [
             k for k in active_paid_keys if _is_global_key(k, global_plan_ids)
         ]
+        active_trial_keys = [k for k in active_paid_keys if _is_trial_key(k)]
+        provisioning_source_keys = active_global_keys or active_trial_keys
+        provisioning_plan_id = 0
 
-        if active_global_keys:
+        if provisioning_source_keys:
             # Deterministic plan selection for stable writes across workers/restarts.
             # If the current global plans were recreated, legacy global keys may
             # only be detectable by their email; fall back to their stored plan_id.
-            if global_plan_ids:
-                first_global_plan_id = int(min(global_plan_ids))
-            else:
-                legacy_plan_ids = set()
-                for key in active_global_keys:
-                    try:
-                        candidate_plan_id = int(key.get("plan_id") or 0)
-                    except (TypeError, ValueError):
-                        candidate_plan_id = 0
-                    if candidate_plan_id > 0:
-                        legacy_plan_ids.add(candidate_plan_id)
-                first_global_plan_id = int(min(legacy_plan_ids)) if legacy_plan_ids else 0
+            if active_global_keys:
+                if global_plan_ids:
+                    provisioning_plan_id = int(min(global_plan_ids))
+                else:
+                    legacy_plan_ids = set()
+                    for key in active_global_keys:
+                        try:
+                            candidate_plan_id = int(key.get("plan_id") or 0)
+                        except (TypeError, ValueError):
+                            candidate_plan_id = 0
+                        if candidate_plan_id > 0:
+                            legacy_plan_ids.add(candidate_plan_id)
+                    provisioning_plan_id = (
+                        int(min(legacy_plan_ids)) if legacy_plan_ids else 0
+                    )
+
             # Target expiry based on the soonest-expiring global key
             try:
-                global_expiries = []
-                for key in active_global_keys:
-                    parsed = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-                    if parsed:
-                        global_expiries.append(parsed)
-                min_expiry_dt = min(global_expiries) if global_expiries else None
+                min_expiry_dt = _min_active_expiry(provisioning_source_keys)
                 remaining_seconds = (
                     int((min_expiry_dt - now).total_seconds()) if min_expiry_dt else 0
                 )
@@ -332,7 +353,7 @@ def get_subscription(token):
                 target_expiry_ms = time_utils.get_timestamp_ms(min_expiry_dt)
                 existing_hosts = {k.get("host_name") for k in available_paid_keys}
                 logger.info(
-                    f"Global subscription detected. Existing hosts: {existing_hosts}. Remaining seconds: {remaining_seconds}"
+                    f"Global access detected. Existing hosts: {existing_hosts}. Remaining seconds: {remaining_seconds}"
                 )
 
                 for host in get_all_hosts(only_enabled=True):
@@ -379,7 +400,7 @@ def get_subscription(token):
                                     xui_client_uuid=res["client_uuid"],
                                     expiry_timestamp_ms=res["expiry_timestamp_ms"],
                                     connection_string=res.get("connection_string"),
-                                    plan_id=first_global_plan_id,
+                                    plan_id=provisioning_plan_id,
                                 )
                             else:
                                 add_new_key(
@@ -389,7 +410,7 @@ def get_subscription(token):
                                     key_email=res["email"],
                                     expiry_timestamp_ms=res["expiry_timestamp_ms"],
                                     connection_string=res.get("connection_string"),
-                                    plan_id=first_global_plan_id,
+                                    plan_id=provisioning_plan_id,
                                 )
                             # Update local cache so that newly created keys appear in the same response
                             new_key = {
@@ -399,7 +420,7 @@ def get_subscription(token):
                                     res["expiry_timestamp_ms"]
                                 ).isoformat(),
                                 "connection_string": res.get("connection_string"),
-                                "plan_id": first_global_plan_id,
+                                "plan_id": provisioning_plan_id,
                             }
                             active_paid_keys.append(new_key)
                             available_paid_keys.append(new_key)

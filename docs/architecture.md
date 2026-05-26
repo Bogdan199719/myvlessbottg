@@ -36,6 +36,12 @@
 - `src/shop_bot/modules/mtg_api.py` — MTG token cache, create/renew/delete/toggle proxy.
 - `src/shop_bot/webhook_server/subscription_api.py` — `/sub/<token>` для глобальной подписки и active global trial; `/happ/<token>` для HTTPS-редиректа в Happ deeplink.
 
+3x-ui API compatibility:
+
+- legacy panels use `/panel/api/inbounds/addClient`, `/updateClient`, `/:id/delClient` and traffic endpoints through the py3xui client;
+- current 3x-ui panels also expose `/panel/api/clients/add`, `/update/:email`, `/del/:email`, `/:email/attach`, `/resetTraffic/:email` and `/traffic/:email`;
+- integration code tries the legacy path first and falls back to the new clients API when the legacy endpoint is missing. Payloads are normalised so numeric fields such as `tgId`, `expiryTime`, `totalGB` and `limitIp` are sent as numbers for newer Go validators.
+
 ### Admin web layer
 
 - `src/shop_bot/webhook_server/app.py` — login, dashboard, users, keys, settings, host management, payment webhooks, update routes.
@@ -51,7 +57,7 @@
 5. Результат пишется в `vpn_keys` и `transactions`.
 6. Для глобальной VPN-подписки пользователь получает постоянную `/sub/<token>` ссылку и кнопку `🔌 Подключить в Happ`.
 7. Кнопка ведёт на HTTPS endpoint `/happ/<token>`, который проверяет token и отдаёт `302 Location: happ://add/https://<domain>/sub/<token>`.
-8. Scheduler дальше поддерживает срок, статус и уведомления.
+8. Scheduler дальше поддерживает срок, статус, уведомления и довыдачу недостающих включённых XUI-хостов для active global paid и active global trial.
 
 ## Особенности
 
