@@ -4,7 +4,7 @@ import json
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
-from urllib.parse import quote, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
 import requests
@@ -134,6 +134,42 @@ def _replace_link_remark(connection_string: str, remark: str) -> str:
             quote(remark, safe=""),
         )
     )
+
+
+def connection_strings_equivalent(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return left == right
+
+    try:
+        left_parts = urlsplit(left.strip())
+        right_parts = urlsplit(right.strip())
+    except Exception:
+        return left == right
+
+    if (
+        left_parts.scheme,
+        left_parts.netloc,
+        left_parts.path,
+    ) != (
+        right_parts.scheme,
+        right_parts.netloc,
+        right_parts.path,
+    ):
+        return False
+
+    volatile_params = {"sid", "spx"}
+
+    def _stable_query(query: str) -> dict[str, str]:
+        result = {}
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            if key in volatile_params:
+                continue
+            if key == "encryption" and value == "none":
+                continue
+            result[key] = value
+        return result
+
+    return _stable_query(left_parts.query) == _stable_query(right_parts.query)
 
 
 def _log_host_error(host_url: str, error: Exception) -> None:
@@ -274,6 +310,53 @@ def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> b
     return False
 
 
+def _json_string_to_dict(value):
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else value
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _normalize_inbound_payload(data: dict) -> dict:
+    normalized = dict(data)
+    for field_name in ("settings", "streamSettings", "sniffing"):
+        if field_name in normalized:
+            normalized[field_name] = _json_string_to_dict(normalized[field_name])
+    return normalized
+
+
+def _get_inbound_list_compat(api: Api) -> list[Inbound]:
+    endpoint = "panel/api/inbounds/list"
+    url = api.inbound._url(endpoint)
+    response = api.inbound._request_with_retry(
+        requests.get,
+        url,
+        {"Accept": "application/json"},
+    )
+    inbounds_json = response.json().get("obj") or []
+    return [
+        Inbound.model_validate(_normalize_inbound_payload(data))
+        for data in inbounds_json
+    ]
+
+
+def _get_inbound_by_id_compat(api: Api, inbound_id: int) -> Inbound | None:
+    endpoint = f"panel/api/inbounds/get/{inbound_id}"
+    url = api.inbound._url(endpoint)
+    response = api.inbound._request_with_retry(
+        requests.get,
+        url,
+        {"Accept": "application/json"},
+    )
+    inbound_json = response.json().get("obj")
+    if not inbound_json:
+        return None
+    return Inbound.model_validate(_normalize_inbound_payload(inbound_json))
+
+
 def login_to_host(
     host_url: str,
     username: str,
@@ -293,7 +376,7 @@ def login_to_host(
                 pass
             else:
                 api.login()
-            inbounds: List[Inbound] = api.inbound.get_list()
+            inbounds: List[Inbound] = _get_inbound_list_compat(api)
             target_inbound = next(
                 (inbound for inbound in inbounds if inbound.id == inbound_id), None
             )
@@ -590,24 +673,17 @@ def _connection_string_for_client(
     protocol_lower = protocol.lower()
     connection_string = None
 
-    if protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
+    panel_links = _get_client_links_from_panel(api, inbound, email)
+    if panel_links:
+        connection_string = panel_links[0]
+    elif protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
-    elif _inbound_prefers_panel_links(inbound):
-        panel_links = _get_client_links_from_panel(api, inbound, email)
-        connection_string = panel_links[0] if panel_links else None
-        if not connection_string and client_identifier:
-            connection_string = get_connection_string(
-                inbound, client_identifier, host_url, remark=remark
-            )
     elif client_identifier:
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
-        if not connection_string:
-            panel_links = _get_client_links_from_panel(api, inbound, email)
-            connection_string = panel_links[0] if panel_links else None
 
     return _replace_link_remark(connection_string, remark)
 
@@ -948,7 +1024,7 @@ def _set_client_enabled_state(
 ) -> bool:
     """Best-effort single-client enable toggle, preferring client.update."""
     try:
-        inbound_fresh = api.inbound.get_by_id(inbound_id)
+        inbound_fresh = _get_inbound_by_id_compat(api, inbound_id)
         if not inbound_fresh:
             return False
         if inbound_fresh.settings.clients is None:
@@ -1338,7 +1414,7 @@ def update_or_create_client_on_panel(
         return "record not found" in str(exc).lower()
 
     try:
-        inbound_to_modify = api.inbound.get_by_id(inbound_id)
+        inbound_to_modify = _get_inbound_by_id_compat(api, inbound_id)
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound_id}")
 
@@ -1779,7 +1855,7 @@ def _get_connection_strings_for_host_sync(host_name: str) -> dict[str, str]:
     if not api or not inbound:
         return {}
 
-    inbound_fresh = api.inbound.get_by_id(inbound.id)
+    inbound_fresh = _get_inbound_by_id_compat(api, inbound.id)
     if not inbound_fresh or not inbound_fresh.settings.clients:
         return {}
 
@@ -1856,7 +1932,7 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         return False
 
     try:
-        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        inbound_to_modify = _get_inbound_by_id_compat(api, inbound.id)
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound.id}")
 
@@ -1941,7 +2017,7 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
         now = time_utils.get_msk_now()
 
         # Fetch inbound once to detect missing clients
-        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        inbound_to_modify = _get_inbound_by_id_compat(api, inbound.id)
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound.id}")
 
@@ -2008,7 +2084,7 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
                 )
 
         # Refresh inbound after potential additions and fix parameters in bulk
-        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        inbound_to_modify = _get_inbound_by_id_compat(api, inbound.id)
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound.id}")
 
@@ -2165,7 +2241,7 @@ def _sync_clients_state_on_host_sync(
         return result
 
     try:
-        inbound_to_modify = api.inbound.get_by_id(inbound.id)
+        inbound_to_modify = _get_inbound_by_id_compat(api, inbound.id)
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound.id}")
 
@@ -2435,7 +2511,7 @@ def _sync_xtls_for_host(host_info: dict) -> dict:
             return {"status": "connection_failed", "fixed": 0}
 
         # Get fresh inbound data
-        inbound_fresh = api.inbound.get_by_id(inbound.id)
+        inbound_fresh = _get_inbound_by_id_compat(api, inbound.id)
         if not inbound_fresh or not inbound_fresh.settings.clients:
             logger.warning(f"No clients found on host '{host_name}'")
             return {"status": "no_clients", "fixed": 0}

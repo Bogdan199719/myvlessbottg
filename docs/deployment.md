@@ -87,6 +87,7 @@ python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
 python3 scripts/check_subscription_consistency.py
+python3 scripts/check_xui_connection_equivalence.py
 python3 scripts/check_settings_defaults.py
 bash -n install.sh
 docker compose config --quiet
@@ -95,6 +96,8 @@ docker compose build
 ```
 
 `scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа.
+
+`scripts/check_xui_connection_equivalence.py` фиксирует правила сравнения ссылок 3x-ui. Панель может каждый раз отдавать новые `sid`/`spx` для Reality-ссылок, поэтому scheduler не должен считать такие ссылки рассинхроном, если стабильные параметры подключения не изменились.
 
 ## Проверка 3x-ui хостов после обновления панели
 

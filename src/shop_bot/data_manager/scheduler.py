@@ -649,6 +649,12 @@ async def sync_keys_with_panels():
 
                     # Update if expiry changed OR connection string needs update (e.g. flag changed)
                     current_db_string = db_key.get("connection_string")
+                    connection_string_changed = (
+                        new_connection_string
+                        and not xui_api.connection_strings_equivalent(
+                            new_connection_string, current_db_string
+                        )
+                    )
                     if server_expiry_ms <= 0:
                         # Defensive guard: some panels can transiently return invalid expiry=0.
                         # Never overwrite DB expiry with epoch-like values.
@@ -659,10 +665,7 @@ async def sync_keys_with_panels():
                             host_name,
                             server_expiry_ms,
                         )
-                        if (
-                            new_connection_string
-                            and new_connection_string != current_db_string
-                        ):
+                        if connection_string_changed:
                             await asyncio.to_thread(
                                 database.update_key_connection_string,
                                 db_key["key_id"],
@@ -671,20 +674,24 @@ async def sync_keys_with_panels():
                             total_affected_records += 1
                         continue
 
-                    if (abs(server_expiry_ms - local_expiry_ms) > 1000) or (
-                        new_connection_string
-                        and new_connection_string != current_db_string
-                    ):
+                    if (
+                        abs(server_expiry_ms - local_expiry_ms) > 1000
+                    ) or connection_string_changed:
                         # Use update_key_info to update both expiry and string if needed
                         # Convert server expiry to datetime
                         new_expiry_date_dt = time_utils.from_timestamp_ms(
                             server_expiry_ms
                         )
+                        connection_string_to_store = (
+                            new_connection_string
+                            if connection_string_changed
+                            else current_db_string
+                        )
                         await asyncio.to_thread(
                             database.update_key_info,
                             db_key["key_id"],
                             new_expiry_date_dt,
-                            new_connection_string,
+                            connection_string_to_store,
                         )
 
                         # Also sync UUID if changed (rare but possible)
