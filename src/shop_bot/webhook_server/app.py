@@ -579,6 +579,21 @@ def _set_webhook_processed(provider: str, external_id: str) -> None:
         )
 
 
+def _get_transaction_status(payment_id: str) -> str | None:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status FROM transactions WHERE payment_id = ?",
+                (payment_id,),
+            )
+            row = cursor.fetchone()
+            return str(row[0]) if row else None
+    except sqlite3.Error as e:
+        logger.error(f"Failed to get transaction status for {payment_id}: {e}")
+        return None
+
+
 def _sanitize_csv_cell(value) -> str:
     text = str(value or "")
     if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
@@ -3957,6 +3972,13 @@ def create_webhook_app(bot_controller_instance):
                     currency_name=api_currency,
                 )
                 if reserved_metadata is None:
+                    if _get_transaction_status(payment_id) == "paid":
+                        _set_webhook_processed("yookassa", payment_id)
+                        logger.info(
+                            "YooKassa webhook: payment %s is already paid locally; marked webhook as processed.",
+                            payment_id,
+                        )
+                        return "OK", 200
                     logger.warning(
                         "YooKassa webhook: payment %s is missing, already reserved, or no longer pending.",
                         payment_id,
@@ -4123,6 +4145,20 @@ def create_webhook_app(bot_controller_instance):
                         currency_name=currency_name,
                     )
                     if metadata is None:
+                        if _get_transaction_status(payment_id) == "paid":
+                            if external_invoice_id:
+                                _set_webhook_processed(
+                                    "cryptobot", str(external_invoice_id)
+                                )
+                            elif external_id_fallback:
+                                _set_webhook_processed(
+                                    "cryptobot", external_id_fallback
+                                )
+                            logger.info(
+                                "CryptoBot webhook: transaction %s is already paid locally; marked webhook as processed.",
+                                payment_id,
+                            )
+                            return "OK", 200
                         logger.warning(
                             "CryptoBot webhook: pending transaction %s not found or already reserved.",
                             payment_id,

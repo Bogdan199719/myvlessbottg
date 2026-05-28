@@ -2143,7 +2143,7 @@ def finalize_reserved_transaction(
         return False
 
 
-def get_pending_yookassa_transactions(limit: int = 20) -> list[dict]:
+def get_pending_yookassa_transactions(limit: int = 100) -> list[dict]:
     transactions: list[dict] = []
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -2156,10 +2156,13 @@ def get_pending_yookassa_transactions(limit: int = 20) -> list[dict]:
                 WHERE status = 'pending'
                   AND metadata IS NOT NULL
                   AND metadata != ''
+                  AND (
+                    payment_method = 'YooKassa'
+                    OR metadata LIKE '%"payment_method": "YooKassa"%'
+                    OR metadata LIKE '%"payment_method":"YooKassa"%'
+                  )
                 ORDER BY created_date DESC
-                LIMIT ?
                 """,
-                (limit,),
             )
             for row in cursor.fetchall():
                 item = dict(row)
@@ -2171,12 +2174,14 @@ def get_pending_yookassa_transactions(limit: int = 20) -> list[dict]:
                     continue
                 item["metadata_dict"] = metadata
                 transactions.append(item)
+                if len(transactions) >= limit:
+                    break
     except sqlite3.Error as e:
         logging.error(f"Failed to get pending YooKassa transactions: {e}")
     return transactions
 
 
-def get_pending_paid_retry_transactions(limit: int = 20) -> list[dict]:
+def get_pending_paid_retry_transactions(limit: int = 100) -> list[dict]:
     """Return paid provider transactions that are pending only because fulfillment failed."""
     transactions: list[dict] = []
     try:
@@ -2190,10 +2195,12 @@ def get_pending_paid_retry_transactions(limit: int = 20) -> list[dict]:
                 WHERE status = 'pending'
                   AND metadata IS NOT NULL
                   AND metadata != ''
+                  AND (
+                    metadata LIKE '%"provider_payment_id":%'
+                    OR metadata LIKE '%"provider_payment_id"%'
+                  )
                 ORDER BY created_date DESC
-                LIMIT ?
                 """,
-                (limit,),
             )
             for row in cursor.fetchall():
                 item = dict(row)
@@ -2208,6 +2215,8 @@ def get_pending_paid_retry_transactions(limit: int = 20) -> list[dict]:
                     continue
                 item["metadata_dict"] = metadata
                 transactions.append(item)
+                if len(transactions) >= limit:
+                    break
     except sqlite3.Error as e:
         logging.error(f"Failed to get pending paid retry transactions: {e}")
     return transactions

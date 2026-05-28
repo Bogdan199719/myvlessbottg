@@ -173,9 +173,20 @@ async def get_user_summary(user_id: int, username: str) -> str:
         price = transaction.get("amount_rub", "N/A")
         method = transaction.get("payment_method") or metadata.get("payment_method")
         method_text = f", {html.escape(str(method))}" if method else ""
+        status = str(transaction.get("status") or "").lower()
+        status_labels = {
+            "pending": "ожидает оплаты/подтверждения",
+            "processing": "обрабатывается",
+            "paid": "оплачено",
+            "failed": "ошибка",
+            "canceled": "отменено",
+            "cancelled": "отменено",
+        }
+        status_text = status_labels.get(status, status)
+        status_suffix = f", {html.escape(status_text)}" if status_text else ""
         tx_date = time_utils.parse_iso_to_msk(transaction.get("created_date"))
         date = time_utils.format_msk(tx_date, "%d.%m.%Y") if tx_date else "N/A"
-        return f"- {html.escape(str(plan_name))} за {price} RUB ({date}{method_text})"
+        return f"- {html.escape(str(plan_name))} за {price} RUB ({date}{method_text}{status_suffix})"
 
     if latest_paid_transaction:
         summary_parts.append("\n<b>💸 Последняя оплата:</b>")
@@ -188,7 +199,7 @@ async def get_user_summary(user_id: int, username: str) -> str:
             summary_parts.append("<b>🎟 Последняя служебная/промо операция:</b>")
             summary_parts.append(_format_transaction(latest_transaction))
     elif latest_transaction:
-        summary_parts.append("\n<b>💸 Последняя транзакция:</b>")
+        summary_parts.append("\n<b>💸 Последний счет/транзакция:</b>")
         summary_parts.append(_format_transaction(latest_transaction))
     else:
         summary_parts.append("\n<b>💸 Последняя транзакция:</b> Нет")

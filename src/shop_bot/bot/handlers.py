@@ -3016,6 +3016,14 @@ def get_user_router() -> Router:
             metadata["chat_id"] = user_id
             metadata["message_id"] = invoice_message.message_id
             create_pending_transaction(payment_id, user_id, float(price_rub), metadata)
+            logger.info(
+                "Stars: Created invoice payment_id=%s user_id=%s amount=%s XTR price=%s RUB plan_id=%s",
+                payment_id,
+                user_id,
+                stars_amount,
+                price_rub,
+                plan_id,
+            )
 
             await state.clear()
         except Exception as e:
@@ -3033,6 +3041,11 @@ def get_user_router() -> Router:
     ):
         payment_id = pre_checkout_query.invoice_payload
         if not payment_id or not _stars_is_pending_transaction(payment_id):
+            logger.warning(
+                "Stars: Rejected pre-checkout for payload=%s user_id=%s",
+                payment_id,
+                pre_checkout_query.from_user.id if pre_checkout_query.from_user else None,
+            )
             await bot.answer_pre_checkout_query(
                 pre_checkout_query_id=pre_checkout_query.id,
                 ok=False,
@@ -3040,6 +3053,11 @@ def get_user_router() -> Router:
             )
             return
 
+        logger.info(
+            "Stars: Accepted pre-checkout for payload=%s user_id=%s",
+            payment_id,
+            pre_checkout_query.from_user.id if pre_checkout_query.from_user else None,
+        )
         await bot.answer_pre_checkout_query(
             pre_checkout_query_id=pre_checkout_query.id, ok=True
         )
@@ -3048,6 +3066,13 @@ def get_user_router() -> Router:
     async def stars_successful_payment_handler(message: types.Message, bot: Bot):
         sp = message.successful_payment
         payment_id = sp.invoice_payload
+        logger.info(
+            "Stars: Received successful_payment payload=%s user_id=%s currency=%s amount=%s",
+            payment_id,
+            message.from_user.id if message.from_user else None,
+            sp.currency,
+            sp.total_amount,
+        )
         if sp.currency != "XTR":
             logger.error(
                 "Stars: Unexpected currency=%s for payload=%s",
@@ -3090,6 +3115,12 @@ def get_user_router() -> Router:
         if not finalized:
             logger.error(
                 "Stars: Failed to finalize reserved transaction %s after processing=%s",
+                payment_id,
+                processed_ok,
+            )
+        else:
+            logger.info(
+                "Stars: Finalized transaction %s after processing=%s",
                 payment_id,
                 processed_ok,
             )
@@ -3433,7 +3464,12 @@ def get_user_router() -> Router:
             return
 
         # Delete BEFORE processing to prevent double-approve race condition
-        delete_p2p_request(request_id)
+        if not delete_p2p_request(request_id):
+            await callback.answer(
+                "Заявка уже обрабатывается другим подтверждением.", show_alert=True
+            )
+            await callback.message.edit_text("⚠️ Заявка уже обрабатывается.")
+            return
 
         await callback.answer("Платеж подтвержден.")
         await callback.message.edit_text(
