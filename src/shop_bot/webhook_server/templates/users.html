@@ -16,8 +16,16 @@
 			<strong>{{ user_metrics.paid_users }}</strong>
 		</div>
 		<div class="admin-summary-card">
+			<span>Платные истекли</span>
+			<strong>{{ user_metrics.paid_expired_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
 			<span>Пробные</span>
 			<strong>{{ user_metrics.trial_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Пробные истекли</span>
+			<strong>{{ user_metrics.trial_expired_users }}</strong>
 		</div>
 		<div class="admin-summary-card">
 			<span>Без подписки</span>
@@ -31,7 +39,9 @@
 			<div class="filter-group">
 				<button type="button" class="filter-chip is-active" data-user-filter="all">Все</button>
 				<button type="button" class="filter-chip" data-user-filter="paid">Платные</button>
+				<button type="button" class="filter-chip" data-user-filter="paid_expired">Платные истекли</button>
 				<button type="button" class="filter-chip" data-user-filter="trial">Пробные</button>
+				<button type="button" class="filter-chip" data-user-filter="trial_expired">Пробные истекли</button>
 				<button type="button" class="filter-chip" data-user-filter="no_subscription">Без подписки</button>
 				<button type="button" class="filter-chip" data-user-filter="banned">Забаненные</button>
 			</div>
@@ -69,6 +79,11 @@
 							{% if subscription.status == 'paid' %}
 							<strong>Активная</strong>
 							<small>платная подписка</small>
+							{% elif subscription.status == 'paid_expired' %}
+							<strong>Истекла</strong>
+							<small>
+								платная подписка{% if subscription.latest_paid_expiry %}: {{ subscription.latest_paid_expiry.strftime('%d.%m.%Y %H:%M') }}{% endif %}
+							</small>
 							{% elif subscription.status == 'trial' %}
 							<strong>Активная</strong>
 							<small>пробная подписка</small>

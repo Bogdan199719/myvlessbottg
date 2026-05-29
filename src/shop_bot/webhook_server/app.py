@@ -179,11 +179,7 @@ def _user_has_paid_subscription(user: dict) -> bool:
 def _key_is_trial_for_user(key: dict, user: dict | None = None) -> bool:
     if not _is_xui_key(key):
         return False
-    if _is_trial_key(key):
-        return True
-
-    owner = user or key
-    return bool(owner.get("trial_used")) and not _user_has_paid_subscription(owner)
+    return _is_trial_key(key)
 
 
 def _key_is_trial_for_owner(key: dict) -> bool:
@@ -194,7 +190,9 @@ def _build_user_metrics(users: list[dict]) -> dict:
     metrics = {
         "total_users": len(users),
         "paid_users": 0,
+        "paid_expired_users": 0,
         "trial_users": 0,
+        "trial_expired_users": 0,
         "no_subscription_users": 0,
         "banned_users": 0,
     }
@@ -203,8 +201,12 @@ def _build_user_metrics(users: list[dict]) -> dict:
         status = summary.get("status")
         if status == "paid":
             metrics["paid_users"] += 1
+        elif status == "paid_expired":
+            metrics["paid_expired_users"] += 1
         elif status == "trial":
             metrics["trial_users"] += 1
+        elif status == "trial_expired":
+            metrics["trial_expired_users"] += 1
         elif status == "banned":
             metrics["banned_users"] += 1
         else:
@@ -219,21 +221,31 @@ def _summarize_user_subscription(
     paid_active = 0
     trial_active = 0
     active_total = 0
+    paid_keys_total = 0
+    latest_paid_expiry = None
 
     for key in keys:
         if not _is_xui_key(key):
             continue
 
         expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        is_trial_key = _key_is_trial_for_user(key, user)
+        if not is_trial_key:
+            paid_keys_total += 1
+            if expiry and (latest_paid_expiry is None or expiry > latest_paid_expiry):
+                latest_paid_expiry = expiry
+
         if not expiry or expiry <= now:
             continue
 
         active_total += 1
 
-        if _key_is_trial_for_user(key, user):
+        if is_trial_key:
             trial_active += 1
         else:
             paid_active += 1
+
+    has_paid_history = _user_has_paid_subscription(user) or paid_keys_total > 0
 
     if user.get("is_banned"):
         status = "banned"
@@ -247,6 +259,10 @@ def _summarize_user_subscription(
         status = "trial"
         label = "Пробная подписка"
         css_class = "status-trial"
+    elif has_paid_history:
+        status = "paid_expired"
+        label = "Платная истекла"
+        css_class = "status-warning"
     elif user.get("trial_used"):
         status = "trial_expired"
         label = "Пробник истек"
@@ -263,6 +279,8 @@ def _summarize_user_subscription(
         "active_total": active_total,
         "paid_active": paid_active,
         "trial_active": trial_active,
+        "paid_keys_total": paid_keys_total,
+        "latest_paid_expiry": latest_paid_expiry,
         "is_active": active_total > 0,
     }
 
@@ -2335,6 +2353,12 @@ def create_webhook_app(bot_controller_instance):
                     "keys_total": len(keys),
                     "keys_active": summary["active_total"],
                     "paid_keys_active": summary["paid_active"],
+                    "paid_keys_total": summary["paid_keys_total"],
+                    "latest_paid_expiry": (
+                        time_utils.format_msk(summary["latest_paid_expiry"])
+                        if summary["latest_paid_expiry"]
+                        else ""
+                    ),
                     "trial_keys_active": summary["trial_active"],
                 }
             )
@@ -2355,6 +2379,8 @@ def create_webhook_app(bot_controller_instance):
                 "keys_total",
                 "keys_active",
                 "paid_keys_active",
+                "paid_keys_total",
+                "latest_paid_expiry",
                 "trial_keys_active",
             ],
         )

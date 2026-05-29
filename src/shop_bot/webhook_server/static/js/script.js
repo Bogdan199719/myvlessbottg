@@ -468,8 +468,7 @@ document.addEventListener('DOMContentLoaded', function () {
 				const haystack = normalize(row.dataset.search || row.textContent)
 				const matchesFilter =
 					activeFilter === 'all' ||
-					status === activeFilter ||
-					(activeFilter === 'no_subscription' && status === 'trial_expired')
+					status === activeFilter
 				const matchesQuery = !query || haystack.includes(query)
 				const show = matchesFilter && matchesQuery
 				row.style.display = show ? '' : 'none'
