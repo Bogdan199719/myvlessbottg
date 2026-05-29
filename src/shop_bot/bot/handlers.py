@@ -1811,6 +1811,7 @@ def get_user_router() -> Router:
             return
 
         promo = None
+        promo_applied = False
         processing_message = None
         try:
             status, promo = claim_promo_code(code, user_id)
@@ -1902,7 +1903,13 @@ def get_user_router() -> Router:
                 )
                 return
 
-            mark_promo_code_applied(int(promo["promo_id"]), user_id)
+            if not mark_promo_code_applied(int(promo["promo_id"]), user_id):
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await processing_message.edit_text(
+                    "❌ Не удалось зафиксировать применение промокода."
+                )
+                return
+            promo_applied = True
             update_user_stats(user_id, 0, 0)
 
             user_info = get_user(user_id)
@@ -1927,7 +1934,10 @@ def get_user_router() -> Router:
                 ),
             )
 
-            await processing_message.delete()
+            try:
+                await processing_message.delete()
+            except Exception as e:
+                logger.warning("Could not delete promo processing message: %s", e)
 
             domain = get_setting("domain")
             user_token = get_or_create_subscription_token(user_id)
@@ -1962,29 +1972,40 @@ def get_user_router() -> Router:
                     + "\n- ".join(failed_hosts)
                 )
 
-            await message.answer(
-                final_text,
-                reply_markup=(
-                    keyboards.create_global_sub_keyboard(user_token)
-                    if user_token
-                    else keyboards.create_back_to_menu_keyboard()
-                ),
-            )
+            try:
+                await message.answer(
+                    final_text,
+                    reply_markup=(
+                        keyboards.create_global_sub_keyboard(user_token)
+                        if user_token
+                        else keyboards.create_back_to_menu_keyboard()
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "Promo VPN access was issued but success message failed for user %s: %s",
+                    user_id,
+                    e,
+                    exc_info=True,
+                )
 
-            await notify_admin_of_purchase(
-                message.bot,
-                {
-                    "user_id": user_id,
-                    "months": 0,
-                    "price": 0,
-                    "host_name": "ALL",
-                    "plan_id": plan_id,
-                    "payment_method": f"Promo {promo['code']}",
-                },
-            )
+            try:
+                await notify_admin_of_purchase(
+                    message.bot,
+                    {
+                        "user_id": user_id,
+                        "months": 0,
+                        "price": 0,
+                        "host_name": "ALL",
+                        "plan_id": plan_id,
+                        "payment_method": f"Promo {promo['code']}",
+                    },
+                )
+            except Exception as e:
+                logger.warning("Promo admin purchase notification failed: %s", e)
 
         except Exception as e:
-            if promo:
+            if promo and not promo_applied:
                 release_promo_code_claim(int(promo["promo_id"]), user_id)
             logger.error(
                 f"Error applying promo code {code} for user {user_id}: {e}",
@@ -3396,14 +3417,16 @@ def get_user_router() -> Router:
         )
 
     @user_router.message(Command(commands=["approve_p2p"]))
-    async def admin_approve_p2p_handler(message: types.Message, bot: Bot):
+    async def admin_approve_p2p_handler(
+        message: types.Message, bot: Bot, command: CommandObject
+    ):
         admin_id = int(get_setting("admin_telegram_id"))
         if message.from_user.id != admin_id:
             return
-        parts = message.text.split("_")
-        if len(parts) < 3:
+        request_id = _p2p_request_id_from_command(message, command)
+        if not request_id:
+            await message.answer("Укажите ID заявки: /approve_p2p <request_id>")
             return
-        request_id = "_".join(parts[2:])
 
         pending = get_p2p_request(request_id)
         if not pending:
@@ -3426,14 +3449,16 @@ def get_user_router() -> Router:
             )
 
     @user_router.message(Command(commands=["decline_p2p"]))
-    async def admin_decline_p2p_handler(message: types.Message):
+    async def admin_decline_p2p_handler(
+        message: types.Message, command: CommandObject
+    ):
         admin_id = int(get_setting("admin_telegram_id"))
         if message.from_user.id != admin_id:
             return
-        parts = message.text.split("_")
-        if len(parts) < 3:
+        request_id = _p2p_request_id_from_command(message, command)
+        if not request_id:
+            await message.answer("Укажите ID заявки: /decline_p2p <request_id>")
             return
-        request_id = "_".join(parts[2:])
 
         pending = get_p2p_request(request_id)
         if not pending:
@@ -3902,6 +3927,15 @@ def _build_hosts_for_payment(
     return normalized_action, key_number, [], "❌ Неверное действие оплаты."
 
 
+def _p2p_request_id_from_command(message: types.Message, command: CommandObject) -> str:
+    if command and command.args:
+        return command.args.strip()
+
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
 async def _execute_payment_for_hosts(
     user_id: int,
     purchase_host_name: str,
@@ -3933,7 +3967,6 @@ async def _execute_payment_for_hosts(
             if not res:
                 continue
 
-            results.append(res)
             if existing_key_db:
                 expiry_datetime = time_utils.from_timestamp_ms(
                     res["expiry_timestamp_ms"]
@@ -3946,6 +3979,15 @@ async def _execute_payment_for_hosts(
                 )
                 if action == "new":
                     update_key_plan_id(existing_key_db["key_id"], int(plan_id))
+                saved_key = get_key_by_id(existing_key_db["key_id"])
+                if not saved_key:
+                    logger.error(
+                        "XUI key was updated on host %s but DB key_id=%s is missing.",
+                        h_name,
+                        existing_key_db["key_id"],
+                    )
+                    continue
+                results.append(res)
                 if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(existing_key_db["key_id"])
             elif action == "new":
@@ -3958,10 +4000,17 @@ async def _execute_payment_for_hosts(
                     res["connection_string"],
                     int(plan_id),
                 )
+                if new_key_id is None:
+                    logger.error(
+                        "XUI key was created on host %s but DB insert/upsert failed for email %s.",
+                        h_name,
+                        res.get("email"),
+                    )
+                    continue
+                results.append(res)
                 if (
                     purchase_host_name != "ALL"
                     and primary_key_id is None
-                    and new_key_id is not None
                 ):
                     primary_key_id = int(new_key_id)
             elif action == "extend" and purchase_host_name != "ALL":
@@ -3970,6 +4019,15 @@ async def _execute_payment_for_hosts(
                 )
                 update_key_info(key_id, expiry_datetime, res["connection_string"])
                 update_key_plan_id(key_id, int(plan_id))
+                saved_key = get_key_by_id(key_id)
+                if not saved_key:
+                    logger.error(
+                        "XUI key was extended on host %s but DB key_id=%s is missing.",
+                        h_name,
+                        key_id,
+                    )
+                    continue
+                results.append(res)
                 if primary_key_id is None:
                     primary_key_id = int(key_id)
         except Exception as e:
@@ -4062,13 +4120,26 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             await bot.delete_message(
                 chat_id=chat_id_to_delete, message_id=message_id_to_delete
             )
-        except TelegramBadRequest as e:
+        except Exception as e:
             logger.warning(f"Could not delete payment message: {e}")
 
-    processing_message = await bot.send_message(
-        chat_id=user_id,
-        text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
-    )
+    try:
+        processing_message = await bot.send_message(
+            chat_id=user_id,
+            text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
+        )
+    except Exception as e:
+        logger.error(
+            "Payment for user %s could not start fulfillment because the processing message failed: %s",
+            user_id,
+            e,
+            exc_info=True,
+        )
+        if pending_flag_set:
+            set_pending_payment(user_id, False)
+            pending_flag_set = False
+        return False
+
     try:
         # ── MTG Proxy branch ──────────────────────────────────────────────
         if service_type == "mtg":
@@ -4185,7 +4256,10 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 metadata=log_metadata,
             )
 
-        await processing_message.delete()
+        try:
+            await processing_message.delete()
+        except Exception as e:
+            logger.warning("Could not delete payment processing message: %s", e)
 
         # Prepare success message
         # If multiple results (ALL hosts), show generic success or first key.
@@ -4325,7 +4399,14 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             f"Error processing payment for user {user_id} on host {host_name}: {e}",
             exc_info=True,
         )
-        await processing_message.edit_text("❌ Ошибка при выдаче ключа.")
+        try:
+            await processing_message.edit_text("❌ Ошибка при выдаче ключа.")
+        except Exception as edit_error:
+            logger.warning(
+                "Could not edit failed payment processing message for user %s: %s",
+                user_id,
+                edit_error,
+            )
         return False
     finally:
         if pending_flag_set:

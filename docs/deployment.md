@@ -83,6 +83,7 @@ docker compose up -d --build
 
 ```bash
 python3 -m compileall -q src scripts
+python3 scripts/check_payment_safety.py
 python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py

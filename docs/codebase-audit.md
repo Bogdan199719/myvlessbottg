@@ -129,3 +129,61 @@
 - База прошла `PRAGMA integrity_check`.
 - В последних проверенных логах не было `ERROR`, `WARNING` или traceback.
 - Явных runtime-багов, требующих правки кода и перезапуска, не найдено.
+
+## Аудит 2026-05-29
+
+### Инвентаризация production
+
+- Проект находится в `/root/myvlessbottg`.
+- Запущен один контейнер `myvlessbottg-bot-1`, статус `healthy`, порт опубликован только на `127.0.0.1:1488`.
+- Наружу открыты `22/tcp`, `80/tcp`, `443/tcp`; nginx проксирует `panel.stopurban.ru` на локальный Flask/Waitress.
+- SSL Let's Encrypt для `panel.stopurban.ru` действителен до `2026-07-23`.
+- Основная БД: `users.db`, права `600`; `.env` не tracked в git и также имеет права `600`.
+- В БД на момент аудита: 309 пользователей, 555 VPN-ключей, 3 XUI-хоста, 4 тарифа, 128 paid transaction и 43 pending transaction.
+- Активные global/trial подписки покрывают все 3 включённых XUI-хоста.
+- SSH по требованию владельца должен оставаться открытым с парольным входом. Это осознанный эксплуатационный риск; автоматические изменения SSH, firewall, паролей и ключей не выполнялись.
+
+### Исправлено
+
+- `process_successful_payment()` теперь сбрасывает `users.pending_payment`, если отправка processing-сообщения в Telegram падает до основного блока fulfillment.
+- Удаление processing-сообщения после успешной выдачи VPN стало best-effort и больше не переводит уже выполненную выдачу в ошибку webhook/retry.
+- Ошибка редактирования processing-сообщения при failed fulfillment больше не маскирует исходную ошибку и не мешает сбросу `pending_payment`.
+- `_execute_payment_for_hosts()` добавляет host в успешные результаты только после записи или проверки записи в SQLite. Если 3x-ui создал/обновил клиента, но локальная БД не подтвердила запись, host считается failed.
+- Slash-команды P2P теперь используют обычный формат `/approve_p2p <request_id>` и `/decline_p2p <request_id>`.
+- Промокод после успешного `applied` больше не освобождается из-за нефатальной ошибки удаления processing-сообщения, отправки success-сообщения или admin-уведомления.
+- Добавлен `scripts/check_payment_safety.py` — статическая проверка критичных инвариантов fulfillment-логики, `pending_payment`, P2P-команд и промокодов.
+
+### Найденные риски без автоматического исправления
+
+- SSH открыт в интернет и разрешает password/root login. Fail2Ban активен и уже банит brute-force, но риск остаётся по бизнес-требованию владельца.
+- `/login` в nginx использует общую зону rate-limit, хотя отдельная зона `login` уже объявлена. Безопасное исправление требует reload nginx.
+- `/sub/<token>` является публичной bearer-ссылкой и при активной global/trial подписке может довыдавать missing hosts. Это удобно для self-healing, но GET endpoint имеет side effects.
+- Секреты XUI/YooKassa/Telegram хранятся в SQLite в открытом виде. Права файла строгие, но бэкапы и доступ к серверу надо защищать как доступ к секретам.
+- Часть старых DB-бэкапов в `/root/myvlessbottg-db-backups` имеет права `0644`. Каталог находится под `/root`, но права лучше привести к `600`.
+- Админка `/users` и `/keys` загружает данные целиком и фильтрует на клиенте; при росте базы нужна серверная пагинация.
+- CSP админки ослаблен inline handlers, а Google Fonts конфликтует с текущим CSP.
+
+### Проверено после исправлений
+
+```bash
+python3 -m compileall -q src scripts
+python3 scripts/check_payment_safety.py
+python3 scripts/check_callbacks.py
+python3 scripts/check_fsm_transitions.py
+python3 scripts/check_settings_defaults.py
+python3 scripts/check_host_cleanup.py --db users.db
+python3 scripts/check_subscription_consistency.py --db users.db
+docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.py
+```
+
+`check_xui_connection_equivalence.py` на host Python не запускается без установленного `py3xui`, поэтому проверка выполнена внутри уже запущенного контейнера.
+
+### Бэкап перед исправлениями
+
+Перед правками создан локальный бэкап runtime-файлов:
+
+- `/root/myvlessbottg-audit-backups/20260529T084843Z/users.db`
+- `/root/myvlessbottg-audit-backups/20260529T084843Z/.env`
+- `/root/myvlessbottg-audit-backups/20260529T084843Z/docker-compose.yml`
+- `/root/myvlessbottg-audit-backups/20260529T084843Z/panel.stopurban.ru.conf`
+- `/root/myvlessbottg-audit-backups/20260529T084843Z/rate-limits.conf`
