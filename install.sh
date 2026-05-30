@@ -143,6 +143,8 @@ setup_nginx_ssl() {
         
         sudo certbot --nginx -d "$DOMAIN" --email "$CERT_EMAIL" --agree-tos --non-interactive --redirect
     fi
+
+    sudo ufw allow 18443/tcp
     
     # Create Nginx Config (Reverse Proxy to Docker)
     echo -e "${YELLOW}Configuring Nginx Reverse Proxy...${NC}"
@@ -150,6 +152,8 @@ setup_nginx_ssl() {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
+    listen 18443 ssl http2;
+    listen [::]:18443 ssl http2;
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -185,6 +189,7 @@ finalize_installation() {
         echo -e "${GREEN}      🎉 Installation Successful! 🎉      ${NC}"
         echo -e "${GREEN}==============================================${NC}"
         echo -e "\nWeb Panel available at: https://$DOMAIN"
+        echo -e "Fallback panel port: https://$DOMAIN:18443"
         echo -e "Panel Login: $PANEL_LOGIN"
         echo -e "${YELLOW}Use the panel password you entered during setup.${NC}"
         echo -e "Running in Docker."
