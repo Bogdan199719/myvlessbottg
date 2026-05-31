@@ -161,7 +161,7 @@
 - Секреты XUI/YooKassa/Telegram хранятся в SQLite в открытом виде. Права файла строгие, но бэкапы и доступ к серверу надо защищать как доступ к секретам.
 - Часть старых DB-бэкапов в `/root/myvlessbottg-db-backups` имеет права `0644`. Каталог находится под `/root`, но права лучше привести к `600`.
 - Админка `/users` и `/keys` загружает данные целиком и фильтрует на клиенте; при росте базы нужна серверная пагинация.
-- CSP админки ослаблен inline handlers, а Google Fonts конфликтует с текущим CSP.
+- CSP админки всё ещё допускает inline handlers для совместимости с текущими шаблонами.
 
 ### Проверено после исправлений
 
@@ -187,3 +187,35 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - `/root/myvlessbottg-audit-backups/20260529T084843Z/docker-compose.yml`
 - `/root/myvlessbottg-audit-backups/20260529T084843Z/panel.stopurban.ru.conf`
 - `/root/myvlessbottg-audit-backups/20260529T084843Z/rate-limits.conf`
+
+## Аудит 2026-05-31
+
+### Проверено
+
+- Рендер админки через Flask test client: `/dashboard`, `/dashboard?period=1`, `/dashboard?period=7`, `/dashboard?period=30`, `/dashboard?period=all`, `/users`, `/keys`, `/settings`, `/updates`, `/users/diagnostics/<user_id>`.
+- Браузерный визуальный проход Playwright в desktop `1440x1000` и mobile `390x844`: dashboard, users, keys, settings, updates.
+- Проверка переполнений/выездов элементов за viewport вне таблиц со штатным horizontal scroll.
+- Проверка console errors в браузере.
+- `python3 -m compileall -q src scripts`.
+- `scripts/check_callbacks.py`.
+- `scripts/check_fsm_transitions.py`.
+- `scripts/check_host_cleanup.py`.
+- `scripts/check_subscription_consistency.py`.
+- `scripts/check_xui_connection_equivalence.py`.
+- `scripts/check_settings_defaults.py`.
+- `scripts/check_payment_safety.py`.
+
+### Исправлено
+
+- Dashboard больше не считает истекшие платные подписки отдельной формулой по paid-транзакциям. Метрики активных/истекших платных и trial-подписок теперь берутся из того же классификатора, что и `/users`.
+- Блок оплаченных покупок на Dashboard показывает все paid-транзакции за всю историю, с полной датой и временем, последние платежи сверху.
+- Блок оплаченных покупок оформлен как полноширинная таблица, чтобы сумма, метод, тариф и пользователь читались без случайного обрезания.
+- Блок промокодов в Settings переразмечен в отдельную адаптивную карточку: статус функции, форма добавления, карточки промокодов, счётчик применений и действия сохранения/паузы/запуска/удаления.
+- Длинные URL хостов в Settings теперь переносятся и не ломают mobile layout.
+- CSP разрешает `fonts.googleapis.com` и `fonts.gstatic.com`, поэтому подключённые Google Fonts больше не блокируются политикой самой админки.
+
+### Итог
+
+- На момент проверки `/healthz` возвращал `{"status": "ok"}`.
+- Браузерный проход не показал console errors и layout-overflow проблем на проверенных desktop/mobile viewport.
+- По текущей БД истекших платных подписок нет: нет пользователей с paid XUI-ключами `plan_id > 0`, у которых отсутствует активный paid-ключ.

@@ -861,9 +861,9 @@ def create_webhook_app(bot_controller_instance):
             "default-src 'self'; "
             f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
             "script-src-attr 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "img-src 'self' data:; "
-            "font-src 'self' data:; "
+            "font-src 'self' data: https://fonts.gstatic.com; "
             "connect-src 'self'; "
             "frame-ancestors 'none'; "
             "base-uri 'self'; "
@@ -1139,6 +1139,19 @@ def create_webhook_app(bot_controller_instance):
             return datetime.fromisoformat(day).strftime("%d.%m")
         except ValueError:
             return day
+
+    def _format_transaction_dt(value: str | None) -> str:
+        if not value:
+            return "—"
+        parsed = time_utils.parse_iso_to_msk(str(value))
+        if parsed:
+            return parsed.strftime("%d.%m.%Y %H:%M:%S")
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+        except (TypeError, ValueError):
+            return str(value)
 
     def _dashboard_period_options(selected_period: str) -> list[dict]:
         return [
@@ -1519,7 +1532,7 @@ def create_webhook_app(bot_controller_instance):
             "payment_methods": [],
             "plan_revenue": [],
             "top_days": [],
-            "recent_paid": [],
+            "paid_transactions": [],
             "transaction_statuses": [],
         }
 
@@ -1534,6 +1547,21 @@ def create_webhook_app(bot_controller_instance):
                 cursor.execute("SELECT COUNT(*) FROM users")
                 total_users = int(cursor.fetchone()[0] or 0)
                 analytics["summary"]["total_users"] = total_users
+
+                users_for_status = get_all_users()
+                user_status_counts = _build_user_metrics(
+                    [
+                        {
+                            **user,
+                            "subscription_summary": _summarize_user_subscription(
+                                user,
+                                get_user_keys(int(user["telegram_id"])),
+                                now,
+                            ),
+                        }
+                        for user in users_for_status
+                    ]
+                )
 
                 cursor.execute(
                     """
@@ -1703,7 +1731,7 @@ def create_webhook_app(bot_controller_instance):
                     }
                     for day in dates
                 }
-                recent_paid: list[dict] = []
+                paid_transactions: list[dict] = []
 
                 for row in cursor.fetchall():
                     status = str(row["status"] or "unknown")
@@ -1748,25 +1776,23 @@ def create_webhook_app(bot_controller_instance):
                     plan_bucket["revenue"] += amount
                     plan_bucket["orders"] += 1
 
-                    if len(recent_paid) < 8:
-                        recent_paid.append(
-                            {
-                                "user_id": row["user_id"],
-                                "username": row["username"] or "N/A",
-                                "amount": amount,
-                                "method": method,
-                                "plan": plan_name,
-                                "date": row["created_date"],
-                            }
-                        )
+                    paid_transactions.append(
+                        {
+                            "payment_id": row["payment_id"],
+                            "user_id": row["user_id"],
+                            "username": row["username"] or "N/A",
+                            "amount": amount,
+                            "method": method,
+                            "plan": plan_name,
+                            "date": row["created_date"],
+                            "date_label": _format_transaction_dt(row["created_date"]),
+                        }
+                    )
 
                 period_revenue = sum(analytics["series"]["revenue"].values())
                 period_orders = sum(analytics["series"]["orders"].values())
                 period_users = sum(analytics["series"]["users"].values())
                 paying_users.update(paid_transaction_users)
-                expired_paid_users_count = len(
-                    paid_transaction_users - active_paid_users
-                )
                 analytics["summary"].update(
                     {
                         "today_users": analytics["series"]["users"].get(today_key, 0),
@@ -1782,11 +1808,15 @@ def create_webhook_app(bot_controller_instance):
                         "period_paid_transaction_users": len(
                             period_paid_transaction_users
                         ),
-                        "active_subscriptions": len(active_paid_users),
-                        "active_paid_subscriptions": len(active_paid_users),
-                        "active_access_subscriptions": len(active_paid_users),
-                        "expired_paid_subscriptions": expired_paid_users_count,
-                        "expired_subscriptions": expired_paid_users_count,
+                        "active_subscriptions": user_status_counts["paid_users"],
+                        "active_paid_subscriptions": user_status_counts["paid_users"],
+                        "active_access_subscriptions": user_status_counts["paid_users"],
+                        "expired_paid_subscriptions": user_status_counts[
+                            "paid_expired_users"
+                        ],
+                        "expired_subscriptions": user_status_counts[
+                            "paid_expired_users"
+                        ],
                         "active_trial_subscriptions": len(active_trial_users),
                         "active_paid_users_with_payment": len(
                             active_paid_users & paid_transaction_users
@@ -1794,12 +1824,14 @@ def create_webhook_app(bot_controller_instance):
                         "active_paid_users_without_payment": len(
                             active_paid_users - paid_transaction_users
                         ),
-                        "expired_paid_users": expired_paid_users_count,
-                        "trial_users": len(trial_used_users),
+                        "expired_paid_users": user_status_counts[
+                            "paid_expired_users"
+                        ],
+                        "trial_users": user_status_counts["trial_users"],
                         "trial_used_users": len(trial_used_users),
-                        "expired_trial_users": len(
-                            trial_used_users - active_trial_users
-                        ),
+                        "expired_trial_users": user_status_counts[
+                            "trial_expired_users"
+                        ],
                         "conversion_percent": (
                             round(len(paid_transaction_users) / total_users * 100, 1)
                             if total_users
@@ -1828,7 +1860,11 @@ def create_webhook_app(bot_controller_instance):
                     key=lambda item: item["revenue"],
                     reverse=True,
                 )[:5]
-                analytics["recent_paid"] = recent_paid
+                analytics["paid_transactions"] = sorted(
+                    paid_transactions,
+                    key=lambda item: str(item.get("date") or ""),
+                    reverse=True,
+                )
                 analytics["transaction_statuses"] = [
                     {"status": status, "count": count}
                     for status, count in sorted(status_counts.items())

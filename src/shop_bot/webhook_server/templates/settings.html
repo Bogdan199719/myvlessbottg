@@ -136,64 +136,96 @@
 				</div>
 			</div>
 
-			<div class="host-card" id="promo-codes">
-				<h3>🎟 Промокоды на глобальную подписку</h3>
-				<p>Промокод выдаёт пользователю VPN-подписку на все активные серверы. Дни подписки добавляются к текущей платной подписке или trial. Один пользователь может применить один и тот же промокод только один раз.</p>
+			<div class="host-card promo-card" id="promo-codes">
+				<div class="promo-card-head">
+					<div>
+						<h3>Промокоды на глобальную подписку</h3>
+						<p class="promo-card-note">Промокод выдаёт VPN-подписку на все активные серверы. Срок добавляется к текущей платной подписке или trial; один пользователь применяет один код только один раз.</p>
+					</div>
+					<form action="{{ url_for('toggle_promo_codes_feature_route') }}" method="post" class="promo-toggle-form">
+						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+						<input type="hidden" name="enable_promo_codes" value="{{ 'false' if settings.enable_promo_codes == 'true' else 'true' }}">
+						<span class="status-badge {% if settings.enable_promo_codes == 'true' %}status-active{% else %}status-stopped{% endif %}">
+							{% if settings.enable_promo_codes == 'true' %}Включены{% else %}Отключены{% endif %}
+						</span>
+						<button type="submit" class="button {% if settings.enable_promo_codes == 'true' %}button-warning{% else %}button-success{% endif %} button-small">
+							{% if settings.enable_promo_codes == 'true' %}Отключить{% else %}Включить{% endif %}
+						</button>
+					</form>
+				</div>
 
-				<form action="{{ url_for('toggle_promo_codes_feature_route') }}" method="post" class="form-inline">
+				<form action="{{ url_for('add_promo_code_route') }}" method="post" class="promo-create-form">
 					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-					<input type="hidden" name="enable_promo_codes" value="{{ 'false' if settings.enable_promo_codes == 'true' else 'true' }}">
-					<span class="status-badge host-status-badge {% if settings.enable_promo_codes == 'true' %}status-active{% else %}status-stopped{% endif %}">
-						{% if settings.enable_promo_codes == 'true' %}Функция включена{% else %}Функция отключена{% endif %}
-					</span>
-					<button type="submit" class="button {% if settings.enable_promo_codes == 'true' %}button-warning{% else %}button-success{% endif %} button-small">
-						{% if settings.enable_promo_codes == 'true' %}Отключить промокоды{% else %}Включить промокоды{% endif %}
-					</button>
-				</form>
-
-				<form action="{{ url_for('add_promo_code_route') }}" method="post" class="form-inline">
-					<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-					<input type="text" name="code" placeholder="STOPURBAN11" maxlength="64" required />
-					<input type="number" name="duration_days" placeholder="Дней подписки пользователю" min="1" required />
-					<input type="date" name="expires_on" title="Срок жизни промокода: до какой даты его можно вводить" required />
-					<input type="number" name="max_uses" placeholder="Лимит применений" min="1" required />
-					<button type="submit" class="button button-primary button-small">+</button>
+					<label>
+						<span>Код</span>
+						<input type="text" name="code" placeholder="STOPURBAN11" maxlength="64" required />
+					</label>
+					<label>
+						<span>Дней</span>
+						<input type="number" name="duration_days" placeholder="30" min="1" required />
+					</label>
+					<label>
+						<span>Действует до</span>
+						<input type="date" name="expires_on" title="Срок жизни промокода: до какой даты его можно вводить" required />
+					</label>
+					<label>
+						<span>Лимит</span>
+						<input type="number" name="max_uses" placeholder="100" min="1" required />
+					</label>
+					<button type="submit" class="button button-primary button-small">Добавить</button>
 				</form>
 
 				{% if promo_codes %}
-				<ul class="plan-list">
+				<div class="promo-list">
 					{% for promo in promo_codes %}
-					<li>
-						<form action="{{ url_for('update_promo_code_route', promo_id=promo.promo_id) }}" method="post" class="form-inline">
+					<div class="promo-item">
+						<form action="{{ url_for('update_promo_code_route', promo_id=promo.promo_id) }}" method="post" class="promo-edit-form">
 							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-							<input type="text" name="code" value="{{ promo.code }}" maxlength="64" required />
-							<input type="number" name="duration_days" value="{{ promo.duration_days }}" min="1" title="Дней подписки пользователю" required />
-							<input type="date" name="expires_on" value="{{ promo.expires_at[:10] if promo.expires_at else '' }}" title="Срок жизни промокода" required />
-							<input type="number" name="max_uses" value="{{ promo.max_uses }}" min="1" title="Лимит применений" required />
-							<label class="toggle-row">
+							<label class="promo-code-field">
+								<span>Код</span>
+								<input type="text" name="code" value="{{ promo.code }}" maxlength="64" required />
+							</label>
+							<label>
+								<span>Дней</span>
+								<input type="number" name="duration_days" value="{{ promo.duration_days }}" min="1" title="Дней подписки пользователю" required />
+							</label>
+							<label>
+								<span>До</span>
+								<input type="date" name="expires_on" value="{{ promo.expires_at[:10] if promo.expires_at else '' }}" title="Срок жизни промокода" required />
+							</label>
+							<label>
+								<span>Лимит</span>
+								<input type="number" name="max_uses" value="{{ promo.max_uses }}" min="1" title="Лимит применений" required />
+							</label>
+							<label class="promo-active-toggle">
 								<input type="checkbox" name="is_active" value="true" {% if promo.is_active %}checked{% endif %} />
 								<span>Активен</span>
 							</label>
-							<span class="count-pill">{{ promo.used_count }}/{{ promo.max_uses }}</span>
-							<button type="submit" class="button button-primary button-tiny">Сохранить</button>
+							<div class="promo-usage">
+								<span>Использовано</span>
+								<strong>{{ promo.used_count }}/{{ promo.max_uses }}</strong>
+							</div>
+							<button type="submit" class="button button-primary button-small">Сохранить</button>
 						</form>
-						<form action="{{ url_for('toggle_promo_code_route', promo_id=promo.promo_id) }}" method="post">
-							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-							<input type="hidden" name="is_active" value="{{ 'false' if promo.is_active else 'true' }}">
-							<button type="submit" class="button {% if promo.is_active %}button-warning{% else %}button-success{% endif %} button-tiny">
-								{% if promo.is_active %}⏸️{% else %}▶️{% endif %}
-							</button>
-						</form>
-						<form action="{{ url_for('delete_promo_code_route', promo_id=promo.promo_id) }}" method="post"
-							data-confirm="Удалить промокод '{{ promo.code }}' и историю его применений?">
-							<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-							<button type="submit" class="button button-danger button-tiny">×</button>
-						</form>
-					</li>
+						<div class="promo-item-actions">
+							<form action="{{ url_for('toggle_promo_code_route', promo_id=promo.promo_id) }}" method="post">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<input type="hidden" name="is_active" value="{{ 'false' if promo.is_active else 'true' }}">
+								<button type="submit" class="button {% if promo.is_active %}button-warning{% else %}button-success{% endif %} button-small">
+									{% if promo.is_active %}Пауза{% else %}Запуск{% endif %}
+								</button>
+							</form>
+							<form action="{{ url_for('delete_promo_code_route', promo_id=promo.promo_id) }}" method="post"
+								data-confirm="Удалить промокод '{{ promo.code }}' и историю его применений?">
+								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+								<button type="submit" class="button button-danger button-small">Удалить</button>
+							</form>
+						</div>
+					</div>
 					{% endfor %}
-				</ul>
+				</div>
 				{% else %}
-				<p>Промокоды не добавлены.</p>
+				<p class="empty-state">Промокоды не добавлены.</p>
 				{% endif %}
 			</div>
 
@@ -286,7 +318,7 @@
 						</form>
 					</div>
 				</div>
-				<p><strong>URL:</strong> {{ host.host_url }}
+				<p class="host-url"><strong>URL:</strong> {{ host.host_url }}
 					{% if not host.is_enabled %} <span class="host-disabled-label">(ОТКЛЮЧЕН)</span>{% endif
 					%}
 				</p>
@@ -409,7 +441,7 @@
 						</form>
 					</div>
 				</div>
-				<p><strong>URL:</strong> {{ host.host_url }}
+				<p class="host-url"><strong>URL:</strong> {{ host.host_url }}
 					{% if not host.is_enabled %}<span class="host-disabled-label">(ОТКЛЮЧЕН)</span>{% endif %}
 				</p>
 

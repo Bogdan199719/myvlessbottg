@@ -42,7 +42,7 @@
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Пользователи</span>
 		<strong>{{ summary.total_users }}</strong>
-		<small>новых за 30 дней: {{ summary.period_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
+		<small>новых {{ analytics.period_label }}: {{ summary.period_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
 	</a>
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Оплатившие клиенты</span>
@@ -356,31 +356,39 @@
 		{% endif %}
 	</section>
 
-	<section class="analytics-panel analytics-panel-wide">
+	<section class="analytics-panel analytics-panel-wide paid-transactions-panel">
 		<div class="section-head">
-			<h2>Последние оплаченные покупки</h2>
+			<div>
+				<h2>Все оплаченные покупки</h2>
+				<span class="panel-note">последние платежи сверху, всего {{ analytics.paid_transactions|length }}</span>
+			</div>
 			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
 		</div>
-		{% if analytics.recent_paid %}
-		<div class="table-scroll">
+		{% if analytics.paid_transactions %}
+		<div class="table-scroll paid-transactions-scroll">
 			<table class="transactions-table analytics-table">
 				<thead>
 					<tr>
+						<th>Дата и время</th>
 						<th>Пользователь</th>
 						<th>Тариф</th>
 						<th>Метод</th>
 						<th>Сумма</th>
-						<th>Дата</th>
 					</tr>
 				</thead>
 				<tbody>
-					{% for tx in analytics.recent_paid %}
+					{% for tx in analytics.paid_transactions %}
 					<tr>
-						<td>{{ tx.username }}<br><small>{{ tx.user_id }}</small></td>
-						<td>{{ tx.plan }}</td>
-						<td>{{ tx.method }}</td>
-						<td><strong>{{ "%.2f"|format(tx.amount) }} ₽</strong></td>
-						<td>{{ tx.date.split(' ')[0] if tx.date else '—' }}</td>
+						<td class="tx-date">{{ tx.date_label }}</td>
+						<td>
+							<div class="tx-user">
+								<strong>{{ tx.username }}</strong>
+								<small>{{ tx.user_id }}</small>
+							</div>
+						</td>
+						<td><span class="tx-plan">{{ tx.plan }}</span></td>
+						<td><span class="tx-method">{{ tx.method }}</span></td>
+						<td class="tx-amount"><strong>{{ "%.2f"|format(tx.amount) }} ₽</strong></td>
 					</tr>
 					{% endfor %}
 				</tbody>
