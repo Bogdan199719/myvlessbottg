@@ -344,17 +344,7 @@
 					{% else %}
 					<p>Тарифы не добавлены.</p>
 					{% endif %}
-					<h5>Добавить новый тариф:</h5>
-					<form action="{{ url_for('add_plan_route') }}" method="post" class="form-inline">
-						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-						<input type="hidden" name="host_name" value="{{ host.host_name }}" />
-						<input type="text" name="plan_name" placeholder="Название" required />
-						<input type="number" name="months" placeholder="Мес." required />
-						<input type="number" step="0.01" name="price" placeholder="Цена" required />
-						<button type="submit" class="button button-primary button-small">
-							+
-						</button>
-					</form>
+					<p class="section-description">VPN-тарифы добавляются только в блоке глобальной подписки.</p>
 				{{ pay_rules_section('xui:' ~ host.host_name, host.plans, payment_rules) }}
 				</div>
 			</div>

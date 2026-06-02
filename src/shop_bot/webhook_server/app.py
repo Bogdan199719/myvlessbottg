@@ -3191,6 +3191,12 @@ def create_webhook_app(bot_controller_instance):
             if not plan:
                 flash("Ошибка: Тариф не найден.", "danger")
                 return redirect(url_for("users_page"))
+            if plan.get("service_type", "xui") == "xui" and plan.get("host_name") != "ALL":
+                flash(
+                    "VPN можно выдать только как единую глобальную подписку.",
+                    "warning",
+                )
+                return redirect(url_for("users_page"))
 
             user = get_user(user_id)
             if not user:
@@ -3709,16 +3715,22 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def add_plan_route():
         service_type = request.form.get("service_type", "xui")
+        host_name = request.form["host_name"]
+        if service_type == "xui" and host_name != "ALL":
+            flash(
+                "VPN продается только как единая подписка. Добавляйте XUI-тарифы в блоке глобальных тарифов.",
+                "warning",
+            )
+            return redirect(url_for("settings_page"))
+
         create_plan(
-            host_name=request.form["host_name"],
+            host_name=host_name,
             plan_name=request.form["plan_name"],
             months=int(request.form["months"]),
             price=float(request.form["price"]),
             service_type=service_type,
         )
-        flash(
-            f"Новый тариф для хоста '{request.form['host_name']}' добавлен.", "success"
-        )
+        flash(f"Новый тариф для хоста '{host_name}' добавлен.", "success")
         return redirect(url_for("settings_page"))
 
     @flask_app.route("/delete-plan/<int:plan_id>", methods=["POST"])

@@ -82,7 +82,6 @@ from shop_bot.config import (
     get_vpn_active_text,
     VPN_INACTIVE_TEXT,
     VPN_NO_DATA_TEXT,
-    get_key_info_text,
     CHOOSE_PAYMENT_METHOD_MESSAGE,
     get_purchase_success_text,
     get_proxy_purchase_success_text,
@@ -179,23 +178,9 @@ def _get_vpn_purchase_plans() -> list[dict]:
             )
             plans_for_display.append(plan_copy)
 
-    for host in get_all_hosts(only_enabled=True):
-        host_name = host.get("host_name")
-        if not host_name:
-            continue
-        for plan in get_plans_for_host(host_name, service_type="xui"):
-            plan_copy = dict(plan)
-            plan_copy["host_name"] = host_name
-            plan_copy["display_name"] = (
-                f"📍 {host_name} · {plan_copy['plan_name']} — {plan_copy['price']:.0f} ₽"
-            )
-            plans_for_display.append(plan_copy)
-
     plans_for_display.sort(
         key=lambda item: (
-            0 if item.get("host_name") == "ALL" else 1,
             int(item.get("months") or 0),
-            str(item.get("host_name") or ""),
             str(item.get("plan_name") or ""),
         )
     )
@@ -2065,55 +2050,7 @@ def get_user_router() -> Router:
                 )
             return
 
-        await callback.message.edit_text(
-            "🌍 VPN доступ управляется единой подпиской.\n\n"
-            "Отдельные серверные ключи скрыты: используйте ссылку VPN подписки, чтобы приложение само получало актуальный список серверов.",
-            reply_markup=keyboards.create_back_to_menu_keyboard(),
-        )
-        return
-
-        try:
-            details = await xui_api.get_key_details_from_host(key_data)
-            if not details or not details["connection_string"]:
-                await callback.message.edit_text(
-                    "❌ Ошибка на сервере. Не удалось получить данные ключа."
-                )
-                return
-
-            connection_string = details["connection_string"]
-            expiry_date = time_utils.parse_iso_to_msk(key_data["expiry_date"])
-            created_date = time_utils.parse_iso_to_msk(key_data["created_date"])
-
-            all_user_xui_keys = [
-                k
-                for k in get_user_keys(user_id)
-                if k.get("service_type", "xui") != "mtg"
-            ]
-            key_number = next(
-                (
-                    i + 1
-                    for i, key in enumerate(all_user_xui_keys)
-                    if key["key_id"] == key_id_to_show
-                ),
-                1,
-            )
-
-            final_text = get_key_info_text(
-                key_number, expiry_date, created_date, connection_string
-            )
-            final_text += "\n\n<blockquote>📋 Скопируйте ключ → откройте Happ → нажмите <b>+</b> → вставьте ссылку из буфера обмена.</blockquote>"
-
-            await callback.message.edit_text(
-                text=final_text,
-                reply_markup=keyboards.create_key_info_keyboard(
-                    key_id_to_show, connection_string
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Error showing key {key_id_to_show}: {e}")
-            await callback.message.edit_text(
-                "❌ Произошла ошибка при получении данных ключа."
-            )
+        await show_global_info_handler(callback)
 
     @user_router.callback_query(F.data.startswith("show_qr_"))
     @registration_required
@@ -2131,14 +2068,13 @@ def get_user_router() -> Router:
             return
 
         try:
-            details = await xui_api.get_key_details_from_host(key_data)
-            if not details or not details["connection_string"]:
+            connection_string = key_data.get("connection_string")
+            if not connection_string:
                 await callback.answer(
                     "Ошибка: Не удалось сгенерировать QR-код.", show_alert=True
                 )
                 return
 
-            connection_string = details["connection_string"]
             qr_img = qrcode.make(connection_string)
             bio = BytesIO()
             qr_img.save(bio, "PNG")
@@ -2155,6 +2091,10 @@ def get_user_router() -> Router:
     async def show_instruction_handler(callback: types.CallbackQuery):
         await callback.answer()
         key_id = int(callback.data.split("_")[2])
+        key_data = get_key_by_id(key_id)
+        if key_data and key_data.get("service_type", "xui") == "xui":
+            await howto_vless_global_handler(callback)
+            return
 
         await callback.message.edit_text(
             "Выберите вашу платформу для инструкции по подключению VLESS:",
@@ -2280,7 +2220,7 @@ def get_user_router() -> Router:
         try:
             await callback.answer()
             await state.update_data(purchase_back_callback="back_to_main_menu")
-            await _show_vpn_purchase_plans(callback, action="new", key_id=0)
+            await _show_global_purchase_plans(callback)
         except Exception as e:
             logger.error(f"Error in buy_new_key_handler: {e}", exc_info=True)
             await callback.message.edit_text("❌ Произошла ошибка. Попробуйте позже.")
@@ -2291,7 +2231,7 @@ def get_user_router() -> Router:
         callback: types.CallbackQuery, state: FSMContext
     ):
         await callback.answer()
-        await _show_vpn_purchase_plans(callback, action="new", key_id=0)
+        await _show_global_purchase_plans(callback)
 
     # ── MTG Proxy purchase flow ───────────────────────────────────────────────
 
@@ -2388,21 +2328,6 @@ def get_user_router() -> Router:
     @registration_required
     async def select_host_for_purchase_handler(callback: types.CallbackQuery):
         await callback.answer()
-        host_name = callback.data[len("select_host_new_") :]
-        if host_name and host_name != "ALL":
-            plans = get_plans_for_host(host_name, service_type="xui")
-            if not plans:
-                await callback.message.edit_text(
-                    f'❌ Для сервера "{host_name}" сейчас не настроены тарифы.'
-                )
-                return
-            await callback.message.edit_text(
-                f'Выберите тариф для сервера "{host_name}":',
-                reply_markup=keyboards.create_plans_keyboard(
-                    plans=plans, action="new", host_name=host_name, key_id=0
-                ),
-            )
-            return
         await _show_global_purchase_plans(
             callback,
             keep_source_message=_is_subscription_reminder_message(callback.message),
@@ -2438,29 +2363,10 @@ def get_user_router() -> Router:
 
         service_type = key_data.get("service_type", "xui")
         if service_type == "xui":
-            try:
-                is_global_key = is_global_xui_key(key_data, get_global_plan_ids())
-            except Exception:
-                is_global_key = False
-            if is_global_key:
-                await _show_global_purchase_plans(
-                    callback,
-                    keep_source_message=_is_subscription_reminder_message(
-                        callback.message
-                    ),
-                )
-                return
-
-            plans = get_plans_for_host(host_name, service_type="xui")
-            if not plans:
-                await callback.message.edit_text(
-                    f'❌ Для сервера "{host_name}" сейчас не настроены тарифы для продления.'
-                )
-                return
-            await callback.message.edit_text(
-                f'Выберите тариф для продления подписки на сервере "{host_name}":',
-                reply_markup=keyboards.create_plans_keyboard(
-                    plans=plans, action="extend", host_name=host_name, key_id=key_id
+            await _show_global_purchase_plans(
+                callback,
+                keep_source_message=_is_subscription_reminder_message(
+                    callback.message
                 ),
             )
             return
@@ -2593,7 +2499,7 @@ def get_user_router() -> Router:
                         ),
                     )
             else:
-                await _show_vpn_purchase_plans(callback, action="new", key_id=0)
+                await _show_global_purchase_plans(callback)
         elif action == "extend":
             await extend_key_handler(callback)
         else:

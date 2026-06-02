@@ -113,31 +113,31 @@ async def send_subscription_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
-                f"Срок действия вашей подписки истекает через <b>{time_text}</b>.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                f"Продлите подписку, чтобы не остаться без доступа!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка закончится через <b>{time_text}</b>! "
+                f"Продли её, чтобы всё было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
-            btn_text = "➕ Продлить ключ"
-            # If trial, direct to new purchase flow as requested
-            callback_data = "buy_new_key" if is_trial else f"extend_key_{key_id}"
+            btn_text = "➕ Продлить подписку"
+            callback_data = "select_host_new_ALL"
         elif time_left_hours == 0:
             message = (
-                f"❌ <b>Срок действия вашей подписки истек!</b>\n\n"
-                f"Ваш доступ к серверу временно ограничен.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                "Продлите подписку прямо сейчас, чтобы восстановить соединение!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка уже закончилась. "
+                f"Продли её, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Восстановить доступ"
-            callback_data = "buy_new_key" if is_trial else f"extend_key_{key_id}"
+            callback_data = "select_host_new_ALL"
         else:  # -24 follow-up
             message = (
-                f"👋 <b>Мы скучаем!</b>\n\n"
-                f"Заметили, что вы не продлили подписку, которая истекла вчера ({expiry_str}).\n\n"
-                f"Если у вас возникли трудности с оплатой или настройкой — напишите в нашу поддержку, мы обязательно поможем!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка закончилась вчера. "
+                f"Продли её, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Купить подписку"
-            callback_data = "buy_new_key"
+            callback_data = "select_host_new_ALL"
 
         builder = InlineKeyboardBuilder()
         builder.button(text=btn_text, callback_data=callback_data)
@@ -176,25 +176,26 @@ async def send_global_subscription_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
-                f"Срок действия вашей <b>глобальной подписки</b> (на {hosts_count} сервер(ов)) истекает через <b>{time_text}</b>.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                f"Продлите подписку, чтобы не остаться без доступа!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка закончится через <b>{time_text}</b>! "
+                f"Продли её, чтобы всё было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Продлить подписку"
         elif time_left_hours == 0:
             message = (
-                f"❌ <b>Ваша глобальная подписка истекла!</b>\n\n"
-                f"Ваш доступ ко всем серверам ({hosts_count} шт.) ограничен.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                "Продлите подписку, чтобы вернуть доступ сразу ко всем серверам!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка уже закончилась. "
+                f"Продли её, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Восстановить доступ"
         else:  # -24 follow-up
             message = (
-                f"👋 <b>Мы скучаем!</b>\n\n"
-                f"Заметили, что вы не продлили вашу глобальную подписку, которая истекла вчера ({expiry_str}).\n\n"
-                f"Если у вас возникли трудности — наша поддержка всегда на связи!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твоя подписка закончилась вчера. "
+                f"Продли её, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "💳 Купить подписку"
 
@@ -233,27 +234,28 @@ async def send_proxy_expiry_notification(
         if time_left_hours > 0:
             time_text = format_time_left(time_left_hours)
             message = (
-                f"⚠️ <b>Внимание!</b> ⚠️\n\n"
-                f"Срок действия вашего <b>Telegram-прокси</b> истекает через <b>{time_text}</b>.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                f"Продлите прокси, чтобы не остаться без доступа к Telegram!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твой Telegram-прокси закончится через <b>{time_text}</b>! "
+                f"Продли его, чтобы всё было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Продлить прокси"
             callback_data = f"extend_key_{key_id}"
         elif time_left_hours == 0:
             message = (
-                f"❌ <b>Срок действия вашего Telegram-прокси истёк!</b>\n\n"
-                f"Прокси временно отключён.\n"
-                f"Дата окончания: <b>{expiry_str}</b>\n\n"
-                "Продлите прокси, чтобы восстановить доступ!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твой Telegram-прокси уже закончился. "
+                f"Продли его, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Активировать прокси"
             callback_data = f"extend_key_{key_id}"
         else:  # -24 follow-up
             message = (
-                f"👋 <b>Мы скучаем!</b>\n\n"
-                f"Заметили, что вы не продлили прокси, который истёк вчера ({expiry_str}).\n\n"
-                f"Если у вас возникли трудности — напишите в нашу поддержку, мы поможем!"
+                f"✨ <b>Внимание!</b> ✨\n\n"
+                f"☀️ Солнышко, твой Telegram-прокси закончился вчера. "
+                f"Продли его, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Купить прокси"
             callback_data = "buy_proxy"
@@ -378,23 +380,37 @@ async def check_expiring_subscriptions(bot: Bot):
     except Exception:
         global_plan_ids = set()
 
-    # Build per-user buckets for global subscription keys
-    global_keys_by_user: dict[int, list[dict]] = {}
+    # Build per-user buckets for global subscription keys. Trial XUI access is
+    # also a global subscription in the product flow, even though its DB keys
+    # have plan_id=0 on each technical host.
+    paid_global_keys_by_user: dict[int, list[dict]] = {}
+    trial_global_keys_by_user: dict[int, list[dict]] = {}
     remaining_keys: list[dict] = []
 
     for key in all_keys:
         try:
-            if database.is_global_xui_key(key, global_plan_ids):
-                global_keys_by_user.setdefault(int(key["user_id"]), []).append(key)
+            service_type = key.get("service_type", "xui")
+            plan_id = int(key.get("plan_id", 0) or 0)
+            if service_type == "xui" and plan_id == 0:
+                trial_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
+                    key
+                )
+            elif database.is_global_xui_key(key, global_plan_ids):
+                paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
+                    key
+                )
             else:
                 remaining_keys.append(key)
         except Exception:
             remaining_keys.append(key)
 
-    # 1. Process GLOBAL notifications
+    # 1. Process GLOBAL paid and trial notifications
     processed_global_users: set[int] = set()
     active_global_users: set[int] = set()
-    for user_id, keys in global_keys_by_user.items():
+
+    async def _process_global_bucket(
+        user_id: int, keys: list[dict], *, is_trial: bool
+    ) -> None:
         try:
             expiry_dates: list[datetime] = []
             for k in keys:
@@ -407,22 +423,81 @@ async def check_expiring_subscriptions(bot: Bot):
                         active_global_users.add(user_id)
 
             if not expiry_dates:
-                continue
+                return
 
             earliest_expiry = min(expiry_dates)
+            if is_trial:
+                time_left = earliest_expiry - current_time
+                total_hours_left = math.ceil(time_left.total_seconds() / 3600)
+                for hours_mark in TRIAL_NOTIFY_HOURS:
+                    if hours_mark - 1 < total_hours_left <= hours_mark:
+                        old_type = _notification_type_for_expiry_cycle(
+                            "expiry", earliest_expiry
+                        )
+                        already_handled_by_old_per_host_flow = False
+                        for key in keys:
+                            key_id = key.get("key_id")
+                            if key_id is None:
+                                continue
+                            already_sent = await asyncio.to_thread(
+                                database.is_notification_sent,
+                                user_id,
+                                int(key_id),
+                                old_type,
+                                hours_mark,
+                            )
+                            if already_sent:
+                                already_handled_by_old_per_host_flow = True
+                                break
+
+                            legacy_sent = await asyncio.to_thread(
+                                database.is_legacy_notification_sent_for_expiry_window,
+                                user_id,
+                                int(key_id),
+                                "expiry",
+                                hours_mark,
+                                earliest_expiry,
+                            )
+                            if legacy_sent:
+                                already_handled_by_old_per_host_flow = True
+                                break
+
+                        if already_handled_by_old_per_host_flow:
+                            new_type = _notification_type_for_expiry_cycle(
+                                "global_expiry", earliest_expiry
+                            )
+                            await asyncio.to_thread(
+                                database.mark_notification_sent,
+                                user_id,
+                                None,
+                                new_type,
+                                hours_mark,
+                            )
+                            processed_global_users.add(user_id)
+                            return
+
             global_window_processed = await _process_notification(
                 bot,
                 user_id,
                 None,
                 earliest_expiry,
-                is_trial=False,
+                is_trial=is_trial,
                 hosts_count=len(keys),
             )
             if global_window_processed:
                 processed_global_users.add(user_id)
 
         except Exception as e:
-            logger.error(f"Error processing GLOBAL expiry for user {user_id}: {e}")
+            label = "TRIAL GLOBAL" if is_trial else "GLOBAL"
+            logger.error(f"Error processing {label} expiry for user {user_id}: {e}")
+
+    for user_id, keys in paid_global_keys_by_user.items():
+        await _process_global_bucket(user_id, keys, is_trial=False)
+
+    for user_id, keys in trial_global_keys_by_user.items():
+        if user_id in active_global_users or user_id in processed_global_users:
+            continue
+        await _process_global_bucket(user_id, keys, is_trial=True)
 
     # 2. Process Regular, Trial and MTG keys.
     # If the user has an active global VPN subscription, skip other XUI
