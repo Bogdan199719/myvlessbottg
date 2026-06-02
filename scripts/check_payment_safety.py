@@ -78,6 +78,43 @@ def _execute_results_are_db_gated(source: str, fn: ast.AsyncFunctionDef) -> bool
     return all(fragment in text for fragment in required_fragments)
 
 
+def _global_fulfillment_is_complete_and_idempotent(
+    source: str, functions: dict[str, ast.AST]
+) -> bool:
+    process_fn = functions.get("process_successful_payment")
+    execute_fn = functions.get("_execute_payment_for_hosts")
+    target_fn = functions.get("_target_expiry_ms_for_global_payment")
+    if not (
+        isinstance(process_fn, ast.AsyncFunctionDef)
+        and isinstance(execute_fn, ast.AsyncFunctionDef)
+        and isinstance(target_fn, ast.FunctionDef)
+    ):
+        return False
+
+    process_text = _source_segment(source, process_fn)
+    execute_text = _source_segment(source, execute_fn)
+    target_text = _source_segment(source, target_fn)
+    required_process_fragments = (
+        "host_name == \"ALL\"",
+        "_target_expiry_ms_for_global_payment(",
+        "len(results) != len(hosts_to_process)",
+        "return False",
+    )
+    required_execute_fragments = (
+        "target_expiry_ms",
+        "create_or_update_key_on_host_absolute_expiry",
+    )
+    required_target_fragments = (
+        "fulfillment_target_expiry_ms",
+        "metadata[\"fulfillment_target_expiry_ms\"]",
+    )
+    return (
+        all(fragment in process_text for fragment in required_process_fragments)
+        and all(fragment in execute_text for fragment in required_execute_fragments)
+        and all(fragment in target_text for fragment in required_target_fragments)
+    )
+
+
 def main() -> int:
     source, tree = _load_tree()
     functions = _functions(tree)
@@ -103,6 +140,11 @@ def main() -> int:
         failures.append("_execute_payment_for_hosts is missing")
     elif not _execute_results_are_db_gated(source, execute_fn):
         failures.append("_execute_payment_for_hosts results must be gated by DB persistence")
+
+    if not _global_fulfillment_is_complete_and_idempotent(source, functions):
+        failures.append(
+            "ALL fulfillment must require every host and use a persisted absolute target expiry"
+        )
 
     if not _p2p_handlers_parse_command_args(source, functions):
         failures.append("P2P slash commands must parse CommandObject args")

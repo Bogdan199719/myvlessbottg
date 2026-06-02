@@ -1871,6 +1871,10 @@ def get_user_router() -> Router:
                 await processing_message.edit_text(prep_error)
                 return
 
+            promo_metadata: dict = {}
+            target_expiry_ms = _target_expiry_ms_for_global_payment(
+                user_id, duration_days, hosts_to_process, promo_metadata
+            )
             results, _primary_key_id = await _execute_payment_for_hosts(
                 user_id=user_id,
                 purchase_host_name="ALL",
@@ -1879,12 +1883,32 @@ def get_user_router() -> Router:
                 days_to_add=duration_days,
                 hosts_to_process=hosts_to_process,
                 key_id=0,
+                target_expiry_ms=target_expiry_ms,
             )
 
             if not results:
                 release_promo_code_claim(int(promo["promo_id"]), user_id)
                 await processing_message.edit_text(
                     "❌ Не удалось активировать подписку по промокоду."
+                )
+                return
+            if len(results) != len(hosts_to_process):
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                successful_hosts = {r.get("host_name") for r in results}
+                failed_hosts = [
+                    host
+                    for host, _email in hosts_to_process
+                    if host not in successful_hosts
+                ]
+                logger.error(
+                    "Promo global fulfillment incomplete for user %s: %s/%s hosts, failed=%s",
+                    user_id,
+                    len(results),
+                    len(hosts_to_process),
+                    failed_hosts,
+                )
+                await processing_message.edit_text(
+                    "❌ Не удалось активировать подписку на всех серверах. Попробуйте позже."
                 )
                 return
 
@@ -3864,6 +3888,40 @@ def _p2p_request_id_from_command(message: types.Message, command: CommandObject)
     return parts[1].strip() if len(parts) == 2 else ""
 
 
+def _target_expiry_ms_for_global_payment(
+    user_id: int,
+    days_to_add: int,
+    hosts_to_process: list[tuple[str, str]],
+    metadata: dict | None = None,
+) -> int:
+    """Return the stable absolute expiry used for idempotent ALL fulfillment."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    existing_target = metadata.get("fulfillment_target_expiry_ms")
+    try:
+        existing_target_int = int(existing_target or 0)
+        if existing_target_int > 0:
+            return existing_target_int
+    except (TypeError, ValueError):
+        pass
+
+    now = time_utils.get_msk_now()
+    base_expiry = now
+    target_hosts = {host_name for host_name, _email in hosts_to_process}
+    for key in get_user_keys(user_id):
+        if key.get("service_type", "xui") != "xui":
+            continue
+        if target_hosts and key.get("host_name") not in target_hosts:
+            continue
+        expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        if expiry and expiry > base_expiry:
+            base_expiry = expiry
+
+    target_dt = base_expiry + timedelta(days=int(days_to_add))
+    target_ms = time_utils.get_timestamp_ms(target_dt)
+    metadata["fulfillment_target_expiry_ms"] = target_ms
+    return target_ms
+
+
 async def _execute_payment_for_hosts(
     user_id: int,
     purchase_host_name: str,
@@ -3872,6 +3930,7 @@ async def _execute_payment_for_hosts(
     days_to_add: int,
     hosts_to_process: list[tuple[str, str]],
     key_id: int,
+    target_expiry_ms: int | None = None,
 ) -> tuple[list[dict], int | None]:
     """Create/extend keys on all target hosts and update DB."""
     results: list[dict] = []
@@ -3886,12 +3945,20 @@ async def _execute_payment_for_hosts(
                 if existing_key_db:
                     h_email = existing_key_db["key_email"]
 
-            res = await xui_api.create_or_update_key_on_host(
-                host_name=h_name,
-                email=h_email,
-                days_to_add=days_to_add,
-                telegram_id=str(user_id),
-            )
+            if purchase_host_name == "ALL" and target_expiry_ms:
+                res = await xui_api.create_or_update_key_on_host_absolute_expiry(
+                    host_name=h_name,
+                    email=h_email,
+                    target_expiry_ms=int(target_expiry_ms),
+                    telegram_id=str(user_id),
+                )
+            else:
+                res = await xui_api.create_or_update_key_on_host(
+                    host_name=h_name,
+                    email=h_email,
+                    days_to_add=days_to_add,
+                    telegram_id=str(user_id),
+                )
             if not res:
                 continue
 
@@ -3905,7 +3972,7 @@ async def _execute_payment_for_hosts(
                     res["connection_string"],
                     xui_client_uuid=res.get("client_uuid"),
                 )
-                if action == "new":
+                if action == "new" or purchase_host_name == "ALL":
                     update_key_plan_id(existing_key_db["key_id"], int(plan_id))
                 saved_key = get_key_by_id(existing_key_db["key_id"])
                 if not saved_key:
@@ -4094,6 +4161,11 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             return False
 
         days_to_add = months * 30
+        target_expiry_ms = None
+        if host_name == "ALL":
+            target_expiry_ms = _target_expiry_ms_for_global_payment(
+                user_id, days_to_add, hosts_to_process, metadata
+            )
         results, primary_key_id = await _execute_payment_for_hosts(
             user_id=user_id,
             purchase_host_name=host_name,
@@ -4102,11 +4174,29 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             days_to_add=days_to_add,
             hosts_to_process=hosts_to_process,
             key_id=key_id,
+            target_expiry_ms=target_expiry_ms,
         )
 
         if not results:
             await processing_message.edit_text(
                 "❌ Не удалось создать/обновить ни одного ключа."
+            )
+            return False
+        if host_name == "ALL" and len(results) != len(hosts_to_process):
+            successful_hosts = {r.get("host_name") for r in results}
+            failed_hosts = [
+                host for host, _email in hosts_to_process if host not in successful_hosts
+            ]
+            logger.error(
+                "Global payment fulfillment incomplete for user %s: %s/%s hosts, failed=%s",
+                user_id,
+                len(results),
+                len(hosts_to_process),
+                failed_hosts,
+            )
+            await processing_message.edit_text(
+                "✅ Оплата получена, но не все серверы выданы. "
+                "Я повторю выдачу автоматически; если доступ не появится в ближайшее время, обратитесь в поддержку."
             )
             return False
 
