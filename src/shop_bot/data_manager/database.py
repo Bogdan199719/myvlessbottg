@@ -376,10 +376,6 @@ def run_migration():
                 )
             else:
                 logging.info(" -> The column 'subscription_token' already exists.")
-                # Ensure unique index exists even if column was created earlier
-                cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users (subscription_token)"
-                )
                 # Backfill missing tokens if any users have NULL/empty values
                 cursor.execute(
                     "SELECT telegram_id FROM users WHERE subscription_token IS NULL OR subscription_token = ''"
@@ -395,6 +391,38 @@ def run_migration():
                     logging.info(
                         f" -> Backfilled subscription tokens for {len(users_without_token)} users."
                     )
+                cursor.execute(
+                    """
+                    SELECT subscription_token, GROUP_CONCAT(telegram_id) AS user_ids
+                    FROM users
+                    WHERE subscription_token IS NOT NULL AND subscription_token != ''
+                    GROUP BY subscription_token
+                    HAVING COUNT(*) > 1
+                    """
+                )
+                duplicate_token_groups = cursor.fetchall()
+                duplicate_tokens_fixed = 0
+                for _token, user_ids_raw in duplicate_token_groups:
+                    user_ids = [
+                        int(uid)
+                        for uid in str(user_ids_raw or "").split(",")
+                        if str(uid).strip()
+                    ]
+                    for uid in user_ids[1:]:
+                        cursor.execute(
+                            "UPDATE users SET subscription_token = ? WHERE telegram_id = ?",
+                            (str(uuid.uuid4()), uid),
+                        )
+                        duplicate_tokens_fixed += 1
+                if duplicate_tokens_fixed:
+                    logging.warning(
+                        " -> Replaced %s duplicate subscription_token value(s) before creating unique index.",
+                        duplicate_tokens_fixed,
+                    )
+                # Ensure unique index exists after missing/duplicate tokens are fixed.
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users (subscription_token)"
+                )
 
             # Check for is_enabled column in xui_hosts
             cursor.execute("PRAGMA table_info(xui_hosts)")

@@ -65,6 +65,8 @@ python3 scripts/check_xui_connection_equivalence.py
 python3 scripts/check_settings_defaults.py
 ```
 
+`scripts/check_subscription_consistency.py` по умолчанию маскирует Telegram ID и usernames в выводе. Для ручного локального разбора конкретных пользователей используйте `--show-identities`.
+
 ## Документация
 
 - `docs/architecture.md` — карта модулей и связей
@@ -78,6 +80,7 @@ python3 scripts/check_settings_defaults.py
 
 - В проекте нет отдельной очереди и внешнего брокера: фоновые задачи работают в одном процессе через `asyncio`.
 - `users.db`, `.env` и локальные backup-файлы считаются runtime-данными и не должны удаляться автоматически.
+- `install.sh` создаёт `.env` с правами `600`; при ручном создании файла выставляйте такие же права.
 - Backup/import из админки работает с `.env` только по явному выбору в форме, а не автоматически.
 - Встроенное обновление из админки теперь отказывается работать при dirty git worktree, чтобы не потерять локальные изменения.
 - Интеграция 3x-ui поддерживает legacy `/panel/api/inbounds/*` endpoints и новые `/panel/api/clients/*` endpoints, которые появились в актуальных версиях панели.

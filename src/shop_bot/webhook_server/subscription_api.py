@@ -91,6 +91,13 @@ def redirect_to_happ(token):
     if not user:
         logger.info(f"Happ deeplink token not found (prefix: {_token_prefix(token)})")
         abort(404, "Subscription not found")
+    if user.get("is_banned"):
+        logger.warning(
+            "Blocked Happ deeplink for banned user %s (token prefix: %s)",
+            user.get("telegram_id"),
+            _token_prefix(token),
+        )
+        abort(403, "Subscription is disabled")
 
     subscription_url = _build_subscription_link(get_setting("domain"), token)
     if not subscription_url:
@@ -258,6 +265,13 @@ def get_subscription(token):
                 f"Subscription token not found (prefix: {_token_prefix(token)})"
             )
             abort(404, "Subscription not found")
+        if user.get("is_banned"):
+            logger.warning(
+                "Blocked subscription fetch for banned user %s (token prefix: %s)",
+                user.get("telegram_id"),
+                _token_prefix(token),
+            )
+            abort(403, "Subscription is disabled")
 
         logger.info(
             f"Serving subscription for user {user['telegram_id']} (token prefix: {_token_prefix(token)})"

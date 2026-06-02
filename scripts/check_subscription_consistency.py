@@ -4,6 +4,7 @@
 Usage:
   python3 scripts/check_subscription_consistency.py
   python3 scripts/check_subscription_consistency.py --db ./users.db
+  python3 scripts/check_subscription_consistency.py --show-identities
 """
 
 from __future__ import annotations
@@ -71,9 +72,20 @@ def _active_key_rows(conn: sqlite3.Connection) -> list[dict]:
     )
 
 
+def _format_user(user_id: int, username: str | None, show_identities: bool) -> str:
+    if show_identities:
+        return f"user={user_id} @{username or '-'}"
+    return f"user_hash={user_id % 100000:05d}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="users.db", help="Path to SQLite DB")
+    parser.add_argument(
+        "--show-identities",
+        action="store_true",
+        help="Print Telegram IDs and usernames. Off by default to avoid leaking personal data in logs.",
+    )
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -133,28 +145,30 @@ def main() -> int:
         print("  no active trial users")
     for (user_id, username), hosts in sorted(trial_by_user.items()):
         missing = enabled_hosts - hosts
+        user_label = _format_user(user_id, username, args.show_identities)
         if missing:
             issues += 1
             print(
-                f"  MISSING user={user_id} @{username or '-'} "
+                f"  MISSING {user_label} "
                 f"{len(hosts)}/{len(enabled_hosts)} missing={sorted(missing)}"
             )
         else:
-            print(f"  OK user={user_id} @{username or '-'} {len(hosts)}/{len(enabled_hosts)}")
+            print(f"  OK {user_label} {len(hosts)}/{len(enabled_hosts)}")
 
     print("\nActive paid global coverage:")
     if not paid_global_by_user:
         print("  no active paid global users")
     for (user_id, username), hosts in sorted(paid_global_by_user.items()):
         missing = enabled_hosts - hosts
+        user_label = _format_user(user_id, username, args.show_identities)
         if missing:
             issues += 1
             print(
-                f"  MISSING user={user_id} @{username or '-'} "
+                f"  MISSING {user_label} "
                 f"{len(hosts)}/{len(enabled_hosts)} missing={sorted(missing)}"
             )
         else:
-            print(f"  OK user={user_id} @{username or '-'} {len(hosts)}/{len(enabled_hosts)}")
+            print(f"  OK {user_label} {len(hosts)}/{len(enabled_hosts)}")
 
     if issues:
         print(f"\nFAIL: {issues} incomplete global access record(s).")

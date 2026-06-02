@@ -219,3 +219,20 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - На момент проверки `/healthz` возвращал `{"status": "ok"}`.
 - Браузерный проход не показал console errors и layout-overflow проблем на проверенных desktop/mobile viewport.
 - По текущей БД истекших платных подписок нет: нет пользователей с paid XUI-ключами `plan_id > 0`, у которых отсутствует активный paid-ключ.
+
+## Аудит 2026-06-02
+
+### Исправлено
+
+- `/sub/<token>` и `/happ/<token>` теперь возвращают `403` для banned users, чтобы уже выданная bearer-ссылка не обходила блокировку пользователя.
+- Миграция `users.subscription_token` сначала backfill-ит пустые значения и устраняет дубликаты, и только потом создаёт unique index.
+- CryptoBot webhook больше не подтверждает `200 OK` оплаченный invoice, если локальная pending-транзакция отсутствует или не находится в ожидаемом финальном/processing состоянии; вместо этого возвращается `503` для повторной доставки.
+- Telegram Stars flow проверяет, что pending transaction сохранена после создания invoice; если запись не создана, invoice удаляется best-effort и пользователь получает просьбу создать оплату заново.
+- `install.sh` скрывает ввод Telegram bot token и создаёт `.env` с правами `600`.
+- `scripts/check_subscription_consistency.py` по умолчанию маскирует Telegram ID и usernames в выводе; для ручной диагностики добавлен `--show-identities`.
+
+### Требует решения владельца
+
+- Для `ALL`-подписок нужен per-payment/per-host fulfillment ledger с target expiry. Сейчас частичная выдача может стать финальной paid-транзакцией, а retry после частичной внешней мутации может повторно продлить уже обработанный host.
+- Нужно решить, оставлять ли write side effects в публичном `GET /sub/<token>` или переносить auto-provision в scheduler/admin-only flow с явной настройкой.
+- Production Docker всё ещё использует bind mount всего репозитория. Безопасная смена на immutable image и отдельный data volume требует отдельного deploy-плана и проверки backup/restore `.env`.

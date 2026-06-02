@@ -4219,7 +4219,8 @@ def create_webhook_app(bot_controller_instance):
                         currency_name=currency_name,
                     )
                     if metadata is None:
-                        if _get_transaction_status(payment_id) == "paid":
+                        local_status = _get_transaction_status(payment_id)
+                        if local_status == "paid":
                             if external_invoice_id:
                                 _set_webhook_processed(
                                     "cryptobot", str(external_invoice_id)
@@ -4233,11 +4234,18 @@ def create_webhook_app(bot_controller_instance):
                                 payment_id,
                             )
                             return "OK", 200
+                        if local_status == "processing":
+                            logger.info(
+                                "CryptoBot webhook: transaction %s is already being processed locally.",
+                                payment_id,
+                            )
+                            return "OK", 200
                         logger.warning(
-                            "CryptoBot webhook: pending transaction %s not found or already reserved.",
+                            "CryptoBot webhook: paid invoice %s has no reservable local pending transaction (status=%s). Requesting retry.",
                             payment_id,
+                            local_status,
                         )
-                        return "OK", 200
+                        return "Service Unavailable", 503
                     payload_price = metadata.get("price")
                     metadata["payment_method"] = "CryptoBot"
                     metadata["provider_payment_id"] = payment_id

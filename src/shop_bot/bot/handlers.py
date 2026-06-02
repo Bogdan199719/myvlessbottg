@@ -2942,7 +2942,29 @@ def get_user_router() -> Router:
 
             metadata["chat_id"] = user_id
             metadata["message_id"] = invoice_message.message_id
-            create_pending_transaction(payment_id, user_id, float(price_rub), metadata)
+            pending_id = create_pending_transaction(
+                payment_id, user_id, float(price_rub), metadata
+            )
+            if not pending_id:
+                logger.error(
+                    "Stars: Failed to persist pending transaction after invoice creation payment_id=%s user_id=%s",
+                    payment_id,
+                    user_id,
+                )
+                try:
+                    await callback.bot.delete_message(
+                        chat_id=user_id, message_id=invoice_message.message_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "Stars: Could not delete invoice message after pending transaction failure for user %s",
+                        user_id,
+                    )
+                await callback.message.edit_text(
+                    "❌ Не удалось сохранить счет Telegram Stars. Попробуйте создать оплату заново."
+                )
+                await state.clear()
+                return
             logger.info(
                 "Stars: Created invoice payment_id=%s user_id=%s amount=%s XTR price=%s RUB plan_id=%s",
                 payment_id,
