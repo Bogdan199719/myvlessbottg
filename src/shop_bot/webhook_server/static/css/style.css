@@ -1081,9 +1081,13 @@ a.analytics-kpi-card:hover {
 .status-trial   { background: rgba(77, 163, 255, 0.18); color: #b8dcff; border: 1px solid rgba(77, 163, 255, 0.4); }
 .status-banned  { background: rgba(255, 107, 107, 0.18); color: #ffcece; border: 1px solid rgba(255, 107, 107, 0.4); }
 .status-warning { background: rgba(245, 165, 74, 0.18); color: #ffd8a0; border: 1px solid rgba(245, 165, 74, 0.4); }
+.status-pending { background: rgba(245, 165, 74, 0.18); color: #ffd8a0; border: 1px solid rgba(245, 165, 74, 0.4); }
+.status-info    { background: rgba(77, 163, 255, 0.16); color: #b8dcff; border: 1px solid rgba(77, 163, 255, 0.35); }
 .status-stopped { background: rgba(108, 117, 125, 0.18); color: #c8cdd5; border: 1px solid rgba(108, 117, 125, 0.4); }
 
 .status-badge.status-warning { color: #2f2112; background-color: var(--warning); border: none; }
+.status-badge.status-pending { color: #2f2112; background-color: var(--warning); border: none; }
+.status-badge.status-info { color: #fff; background-color: #386fa4; border: none; }
 .status-badge.status-stopped { color: #fff; background-color: #6c757d; border: none; }
 
 /* ─── TABLE TOOLBAR ─────────────────────────────────────────── */

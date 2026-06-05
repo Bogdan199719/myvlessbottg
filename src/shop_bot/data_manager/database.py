@@ -3335,7 +3335,47 @@ def get_all_users() -> list[dict]:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users ORDER BY registration_date DESC")
+            cursor.execute("""
+                SELECT
+                    u.*,
+                    (
+                        SELECT COUNT(*)
+                        FROM transactions t
+                        WHERE t.user_id = u.telegram_id
+                    ) AS transaction_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM transactions t
+                        WHERE t.user_id = u.telegram_id
+                          AND t.status = 'pending'
+                    ) AS pending_transaction_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM transactions t
+                        WHERE t.user_id = u.telegram_id
+                          AND t.status = 'paid'
+                          AND COALESCE(t.amount_rub, 0) > 0
+                    ) AS paid_transaction_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM transactions t
+                        WHERE t.user_id = u.telegram_id
+                          AND t.status = 'paid'
+                          AND COALESCE(t.amount_rub, 0) = 0
+                    ) AS free_transaction_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM support_tickets st
+                        WHERE st.user_id = u.telegram_id
+                    ) AS support_ticket_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM support_messages sm
+                        WHERE sm.user_id = u.telegram_id
+                    ) AS support_message_count
+                FROM users u
+                ORDER BY u.registration_date DESC
+            """)
             return [dict(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
         logging.error(f"Failed to get all users: {e}")

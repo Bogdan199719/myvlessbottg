@@ -28,6 +28,18 @@
 			<strong>{{ user_metrics.trial_expired_users }}</strong>
 		</div>
 		<div class="admin-summary-card">
+			<span>Счёт не оплачен</span>
+			<strong>{{ user_metrics.payment_pending_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Бесплатный доступ истёк</span>
+			<strong>{{ user_metrics.free_expired_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
+			<span>Поддержка без подписки</span>
+			<strong>{{ user_metrics.support_only_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
 			<span>Без подписки</span>
 			<strong>{{ user_metrics.no_subscription_users }}</strong>
 		</div>
@@ -42,6 +54,9 @@
 				<button type="button" class="filter-chip" data-user-filter="paid_expired">Платные истекли</button>
 				<button type="button" class="filter-chip" data-user-filter="trial">Пробные</button>
 				<button type="button" class="filter-chip" data-user-filter="trial_expired">Пробные истекли</button>
+				<button type="button" class="filter-chip" data-user-filter="payment_pending">Счёт не оплачен</button>
+				<button type="button" class="filter-chip" data-user-filter="free_expired">Бесплатный доступ истёк</button>
+				<button type="button" class="filter-chip" data-user-filter="support_only">Поддержка без подписки</button>
 				<button type="button" class="filter-chip" data-user-filter="no_subscription">Без подписки</button>
 				<button type="button" class="filter-chip" data-user-filter="banned">Забаненные</button>
 			</div>
@@ -90,6 +105,15 @@
 							{% elif subscription.status == 'trial_expired' %}
 							<strong>Истекла</strong>
 							<small>пробная подписка</small>
+							{% elif subscription.status == 'payment_pending' %}
+							<strong>Нет</strong>
+							<small>есть неоплаченный счёт: {{ subscription.pending_transaction_count }}</small>
+							{% elif subscription.status == 'free_expired' %}
+							<strong>Истекла</strong>
+							<small>бесплатная выдача или промокод</small>
+							{% elif subscription.status == 'support_only' %}
+							<strong>Нет</strong>
+							<small>есть обращение в поддержку</small>
 							{% elif subscription.status == 'banned' %}
 							<strong>Недоступна</strong>
 							<small>пользователь забанен</small>

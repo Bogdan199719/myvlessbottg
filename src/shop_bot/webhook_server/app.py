@@ -176,6 +176,13 @@ def _user_has_paid_subscription(user: dict) -> bool:
     return total_spent > 0 or total_months > 0
 
 
+def _user_int_field(user: dict, key: str) -> int:
+    try:
+        return int(user.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _key_is_trial_for_user(key: dict, user: dict | None = None) -> bool:
     if not _is_xui_key(key):
         return False
@@ -193,6 +200,9 @@ def _build_user_metrics(users: list[dict]) -> dict:
         "paid_expired_users": 0,
         "trial_users": 0,
         "trial_expired_users": 0,
+        "payment_pending_users": 0,
+        "free_expired_users": 0,
+        "support_only_users": 0,
         "no_subscription_users": 0,
         "banned_users": 0,
     }
@@ -207,6 +217,12 @@ def _build_user_metrics(users: list[dict]) -> dict:
             metrics["trial_users"] += 1
         elif status == "trial_expired":
             metrics["trial_expired_users"] += 1
+        elif status == "payment_pending":
+            metrics["payment_pending_users"] += 1
+        elif status == "free_expired":
+            metrics["free_expired_users"] += 1
+        elif status == "support_only":
+            metrics["support_only_users"] += 1
         elif status == "banned":
             metrics["banned_users"] += 1
         else:
@@ -246,6 +262,12 @@ def _summarize_user_subscription(
             paid_active += 1
 
     has_paid_history = _user_has_paid_subscription(user) or paid_keys_total > 0
+    has_pending_payment = _user_int_field(user, "pending_transaction_count") > 0
+    has_free_access_history = _user_int_field(user, "free_transaction_count") > 0
+    has_support_history = (
+        _user_int_field(user, "support_ticket_count") > 0
+        or _user_int_field(user, "support_message_count") > 0
+    )
 
     if user.get("is_banned"):
         status = "banned"
@@ -267,6 +289,18 @@ def _summarize_user_subscription(
         status = "trial_expired"
         label = "Пробник истек"
         css_class = "status-warning"
+    elif has_pending_payment:
+        status = "payment_pending"
+        label = "Счёт не оплачен"
+        css_class = "status-pending"
+    elif has_free_access_history:
+        status = "free_expired"
+        label = "Бесплатный доступ истёк"
+        css_class = "status-info"
+    elif has_support_history:
+        status = "support_only"
+        label = "Обращался без подписки"
+        css_class = "status-info"
     else:
         status = "no_subscription"
         label = "Без подписки"
@@ -281,6 +315,12 @@ def _summarize_user_subscription(
         "trial_active": trial_active,
         "paid_keys_total": paid_keys_total,
         "latest_paid_expiry": latest_paid_expiry,
+        "pending_transaction_count": _user_int_field(
+            user, "pending_transaction_count"
+        ),
+        "free_transaction_count": _user_int_field(user, "free_transaction_count"),
+        "support_ticket_count": _user_int_field(user, "support_ticket_count"),
+        "support_message_count": _user_int_field(user, "support_message_count"),
         "is_active": active_total > 0,
     }
 
@@ -2404,6 +2444,10 @@ def create_webhook_app(bot_controller_instance):
                         else ""
                     ),
                     "trial_keys_active": summary["trial_active"],
+                    "pending_transactions": summary["pending_transaction_count"],
+                    "free_transactions": summary["free_transaction_count"],
+                    "support_tickets": summary["support_ticket_count"],
+                    "support_messages": summary["support_message_count"],
                 }
             )
 
