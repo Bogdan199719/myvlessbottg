@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Error rate limiting: track last error per host to avoid log spam
 _host_error_cache: dict[str, tuple[str, float]] = {}
+_host_bearer_failure_cache: dict[str, float] = {}
 _ERROR_LOG_INTERVAL = 300  # Log same error once per 5 minutes
+_BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
@@ -42,13 +44,42 @@ _TRANSIENT_NETWORK_ERROR_MARKERS = (
 
 COUNTRY_FLAGS = {
     "🇱🇻": ["latvia", "latvija", "riga", "рига", "latvian"],
-    "🇺🇸": ["usa", "united states", "america"],
-    "🇨🇦": ["canada"],
-    "🇲🇽": ["mexico"],
-    "🇩🇪": ["germany", "deutschland"],
-    "🇳🇱": ["netherlands", "nederland", "niderland", "niderlands", "holland"],
-    "🇫🇷": ["france", "french"],
-    "🇬🇧": ["uk", "united kingdom", "britain", "england"],
+    "🇺🇸": [
+        "usa",
+        "united states",
+        "america",
+        "сша",
+        "kansas",
+        "new york",
+        "los angeles",
+        "chicago",
+        "miami",
+        "dallas",
+    ],
+    "🇨🇦": ["canada", "канада", "toronto", "montreal", "vancouver"],
+    "🇲🇽": ["mexico", "мексика", "mexico city"],
+    "🇩🇪": ["germany", "deutschland", "германия", "berlin", "frankfurt"],
+    "🇳🇱": [
+        "netherlands",
+        "nederland",
+        "niderland",
+        "niderlands",
+        "holland",
+        "нидерланды",
+        "amsterdam",
+    ],
+    "🇫🇷": ["france", "french", "франция", "paris"],
+    "🇬🇧": [
+        "uk",
+        "united kingdom",
+        "great britain",
+        "britain",
+        "england",
+        "англия",
+        "великобритания",
+        "london",
+        "лондон",
+    ],
     "🇮🇹": ["italy", "italia"],
     "🇪🇸": ["spain", "españa"],
     "🇸🇪": ["sweden", "sverige"],
@@ -103,8 +134,11 @@ def get_country_flag_by_host(host_name: str) -> str:
             if alias in host_lower:
                 return flag
 
-    logger.warning(f"No flag detected for host '{host_name}', defaulting to USA.")
-    return "🇺🇸"  # Default to USA
+    logger.warning(
+        "No country flag detected for host '%s'. Add a country, city, or flag to the host name.",
+        host_name,
+    )
+    return "🌐"
 
 
 def _build_server_remark(host_name: str) -> str:
@@ -239,6 +273,15 @@ def _attach_bearer_auth(api: Api, api_token: str) -> None:
     api.cookie_name = None
 
 
+def _bearer_recently_failed(host_url: str) -> bool:
+    failed_at = _host_bearer_failure_cache.get(host_url)
+    return bool(failed_at and time.time() - failed_at < _BEARER_FAILURE_CACHE_SECONDS)
+
+
+def _remember_bearer_failure(host_url: str) -> None:
+    _host_bearer_failure_cache[host_url] = time.time()
+
+
 def _set_cookie_auth(
     api: Api, cookie_name: str, cookie_value: str, csrf_token: str | None = None
 ) -> None:
@@ -367,19 +410,36 @@ def login_to_host(
     host_url = host_url.rstrip("/")
     token = (api_token or "").strip()
 
+    def _load_target_inbound(api: Api) -> Inbound | None:
+        inbounds: List[Inbound] = _get_inbound_list_compat(api)
+        return next((inbound for inbound in inbounds if inbound.id == inbound_id), None)
+
+    def _cookie_login_api() -> Api:
+        api = Api(host=host_url, username=username, password=password)
+        if _login_with_csrf(api, host_url, username, password):
+            return api
+        api.login()
+        return api
+
     for attempt in range(1, _XUI_LOGIN_ATTEMPTS + 1):
         try:
-            api = Api(host=host_url, username=username, password=password)
-            if token:
+            if token and not _bearer_recently_failed(host_url):
+                api = Api(host=host_url, username=username, password=password)
                 _attach_bearer_auth(api, token)
-            elif _login_with_csrf(api, host_url, username, password):
-                pass
+                try:
+                    target_inbound = _load_target_inbound(api)
+                except Exception as token_error:
+                    _remember_bearer_failure(host_url)
+                    logger.warning(
+                        "XUI Bearer API auth failed for '%s': %s. Falling back to CSRF/cookie login.",
+                        host_url,
+                        str(token_error)[:150],
+                    )
+                    api = _cookie_login_api()
+                    target_inbound = _load_target_inbound(api)
             else:
-                api.login()
-            inbounds: List[Inbound] = _get_inbound_list_compat(api)
-            target_inbound = next(
-                (inbound for inbound in inbounds if inbound.id == inbound_id), None
-            )
+                api = _cookie_login_api()
+                target_inbound = _load_target_inbound(api)
 
             if target_inbound is None:
                 logger.error(
@@ -453,6 +513,8 @@ def _find_client_by_email(inbound: Inbound, email: str) -> Client | None:
 
 def _get_client_identifier_for_protocol(protocol: str, client: Client) -> str | None:
     protocol = (protocol or "").lower()
+    if protocol == "vless":
+        return getattr(client, "password", None) or getattr(client, "id", None)
     if protocol == "trojan":
         return getattr(client, "password", None)
     if protocol == "shadowsocks":
@@ -675,12 +737,31 @@ def _connection_string_for_client(
 
     panel_links = _get_client_links_from_panel(api, inbound, email)
     if panel_links:
-        connection_string = panel_links[0]
-    elif protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
+        candidate = panel_links[0]
+        if protocol_lower in {"vless", "trojan"} and client_identifier:
+            try:
+                candidate_identifier = urlsplit(candidate).username
+            except Exception:
+                candidate_identifier = None
+            if candidate_identifier and candidate_identifier != client_identifier:
+                logger.warning(
+                    "Panel-generated link for '%s' on inbound %s has identifier '%s', "
+                    "expected '%s'; using panel link because it matches the panel-side email.",
+                    email,
+                    getattr(inbound, "id", ""),
+                    candidate_identifier,
+                    client_identifier,
+                )
+                connection_string = candidate
+            else:
+                connection_string = candidate
+        else:
+            connection_string = candidate
+    if connection_string is None and protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
-    elif client_identifier:
+    elif connection_string is None and client_identifier:
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
@@ -701,7 +782,13 @@ def _raw_api_request(
         {"Accept": "application/json"},
         **kwargs,
     )
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError as e:
+        body_preview = (getattr(response, "text", "") or "").strip()[:200]
+        raise RuntimeError(
+            f"3x-ui returned non-JSON response from {endpoint}: {body_preview or 'empty response'}"
+        ) from e
     if isinstance(result, dict) and result.get("success") is False:
         raise RuntimeError(result.get("msg") or f"3x-ui API request failed: {endpoint}")
     return result
@@ -710,6 +797,28 @@ def _raw_api_request(
 def _is_endpoint_not_found_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "404" in message and "not found" in message
+
+
+def _is_legacy_client_write_fallback_error(exc: Exception) -> bool:
+    """Legacy 3x-ui client writes can fail with 404 or empty/non-JSON bodies."""
+    if _is_endpoint_not_found_error(exc):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "empty response",
+            "non-json response",
+            "expecting value",
+            "http/0.9",
+            "invalid json",
+        )
+    )
+
+
+def _is_duplicate_client_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in ("already", "exist", "duplicate"))
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -764,6 +873,39 @@ def _raw_client_payload_for_clients_api(client: dict) -> dict:
     }
 
 
+def _add_client_v3(
+    api: Api,
+    inbound_id: int,
+    client_payload: dict,
+    update_payload: dict | None = None,
+) -> None:
+    email = client_payload.get("email") or client_payload.get("id") or ""
+    try:
+        _raw_api_request(
+            api,
+            requests.post,
+            "panel/api/clients/add",
+            {"client": client_payload, "inboundIds": [inbound_id]},
+        )
+    except Exception as e:
+        if not _is_duplicate_client_error(e):
+            raise
+        if not email:
+            raise
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/update/{quote(str(email), safe='')}",
+            update_payload or client_payload,
+        )
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/{quote(str(email), safe='')}/attach",
+            {"inboundIds": [inbound_id]},
+        )
+
+
 def _add_client_compat(
     api: Api, inbound_id: int, client: Client, client_identifier: str
 ) -> None:
@@ -771,31 +913,11 @@ def _add_client_compat(
         api.client.add(inbound_id, [client])
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    payload = {
-        "client": _client_payload_for_clients_api(client, client_identifier),
-        "inboundIds": [inbound_id],
-    }
-    try:
-        _raw_api_request(api, requests.post, "panel/api/clients/add", payload)
-    except Exception as e:
-        message = str(e).lower()
-        if (
-            "already" not in message
-            and "exist" not in message
-            and "duplicate" not in message
-        ):
-            raise
-        email = getattr(client, "email", "") or client_identifier
-        _update_client_compat(api, client_identifier, client)
-        _raw_api_request(
-            api,
-            requests.post,
-            f"panel/api/clients/{quote(email, safe='')}/attach",
-            {"inboundIds": [inbound_id]},
-        )
+    payload = _client_payload_for_clients_api(client, client_identifier)
+    _add_client_v3(api, inbound_id, payload)
 
 
 def _update_client_compat(api: Api, client_identifier: str, client: Client) -> None:
@@ -878,6 +1000,27 @@ def _get_raw_clients(api: Api, inbound_id: int) -> list[dict]:
     return settings.get("clients") or []
 
 
+def _get_raw_client_identifier_by_email(
+    api: Api, inbound_id: int, protocol: str, email: str
+) -> str | None:
+    id_field = _raw_client_id_field_for_protocol(protocol)
+    for raw_client in _get_raw_clients(api, inbound_id):
+        if raw_client.get("email") != email:
+            continue
+        if (protocol or "").lower() == "vless":
+            identifier = raw_client.get("password") or raw_client.get("id")
+        else:
+            identifier = (
+                raw_client.get(id_field)
+                or raw_client.get("id")
+                or raw_client.get("password")
+                or raw_client.get("auth")
+                or raw_client.get("email")
+            )
+        return str(identifier) if identifier else None
+    return None
+
+
 def _build_raw_client_for_protocol(
     protocol: str,
     email: str,
@@ -927,18 +1070,11 @@ def _add_raw_client(api: Api, inbound_id: int, client: dict) -> None:
         )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    _raw_api_request(
-        api,
-        requests.post,
-        "panel/api/clients/add",
-        {
-            "client": _raw_client_payload_for_clients_api(client),
-            "inboundIds": [inbound_id],
-        },
-    )
+    client_payload = _raw_client_payload_for_clients_api(client)
+    _add_client_v3(api, inbound_id, client_payload)
 
 
 def _update_raw_client(
@@ -953,7 +1089,7 @@ def _update_raw_client(
         )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
     email = client.get("email") or client_identifier
@@ -1309,6 +1445,7 @@ def _get_vless_connection_string(
 
         short_id = short_ids[0]
         server_name = server_names[0]
+        pqv = settings.get("mldsa65Verify") or ""
 
         # Determine flow
         # XTLS-Vision flow is only valid for TCP + TLS/Reality
@@ -1335,8 +1472,11 @@ def _get_vless_connection_string(
         connection_string = (
             f"{base_link}"
             f"&security=reality&pbk={public_key}&fp={fp}&sni={server_name}"
-            f"&sid={short_id}&spx=%2F{flow_param}#{remark}"
+            f"&sid={short_id}&spx=%2F"
         )
+        if pqv:
+            connection_string += f"&pqv={quote(str(pqv), safe='')}"
+        connection_string += f"{flow_param}#{remark}"
         logger.debug(
             "Generated Reality connection string for %s on %s", user_uuid, hostname
         )
@@ -1603,6 +1743,17 @@ def update_or_create_client_on_panel(
                     _add_client_compat(
                         api, inbound_id, recreated_client, client_uuid
                     )
+                    actual_uuid = _get_raw_client_identifier_by_email(
+                        api, inbound_id, protocol, email
+                    )
+                    if actual_uuid and actual_uuid != client_uuid:
+                        logger.warning(
+                            "Recreated client '%s' returned identifier '%s', but panel stores '%s'. Using panel identifier.",
+                            email,
+                            client_uuid,
+                            actual_uuid,
+                        )
+                        client_uuid = actual_uuid
                     logger.info(
                         f"Recreated client '{email}' (identifier: {client_uuid}) on inbound {inbound_id}"
                     )
@@ -1627,6 +1778,17 @@ def update_or_create_client_on_panel(
             )
 
             _add_client_compat(api, inbound_id, new_client, client_uuid)
+            actual_uuid = _get_raw_client_identifier_by_email(
+                api, inbound_id, protocol, email
+            )
+            if actual_uuid and actual_uuid != client_uuid:
+                logger.warning(
+                    "Added client '%s' returned identifier '%s', but panel stores '%s'. Using panel identifier.",
+                    email,
+                    client_uuid,
+                    actual_uuid,
+                )
+                client_uuid = actual_uuid
             logger.info(f"Added new client '{email}' (identifier: {client_uuid})")
 
         return client_uuid, new_expiry_ms

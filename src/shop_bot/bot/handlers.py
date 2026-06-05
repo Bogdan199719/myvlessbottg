@@ -1937,7 +1937,7 @@ def get_user_router() -> Router:
                         "promo_code": promo["code"],
                         "duration_days": duration_days,
                         "plan_id": plan_id,
-                        "plan_name": plan.get("plan_name", "Promo"),
+                        "plan_name": f"Промокод {promo['code']} ({duration_days} дн.)",
                         "host_name": "ALL",
                     }
                 ),

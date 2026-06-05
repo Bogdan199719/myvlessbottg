@@ -1765,11 +1765,19 @@ def create_webhook_app(bot_controller_instance):
                     method_bucket["orders"] += 1
 
                     plan_id = str(metadata.get("plan_id") or "")
-                    plan_name = (
-                        metadata.get("plan_name")
-                        or plan_names.get(plan_id)
-                        or (f"Тариф #{plan_id}" if plan_id else "Не указан")
-                    )
+                    if method == "Promo" and metadata.get("promo_code"):
+                        duration_days = metadata.get("duration_days")
+                        plan_name = (
+                            f"Промокод {metadata.get('promo_code')} ({duration_days} дн.)"
+                            if duration_days
+                            else f"Промокод {metadata.get('promo_code')}"
+                        )
+                    else:
+                        plan_name = (
+                            metadata.get("plan_name")
+                            or plan_names.get(plan_id)
+                            or (f"Тариф #{plan_id}" if plan_id else "Не указан")
+                        )
                     plan_bucket = plan_totals.setdefault(
                         plan_name, {"plan": plan_name, "revenue": 0.0, "orders": 0}
                     )
