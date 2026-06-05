@@ -22,6 +22,11 @@ dist/
 logs.txt
 *.log
 
+# Generated exports/backups
+*.csv
+*_backup_*.json
+*backup*.json
+
 # Environment Variables & Secrets
 .env
 .env.*
