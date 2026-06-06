@@ -38,6 +38,12 @@ _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
+_INVALID_TOKEN_WINDOW_SECONDS = 60
+_INVALID_TOKEN_MAX_PER_WINDOW = 30
+_INVALID_TOKEN_LOG_INTERVAL_SECONDS = 60
+_INVALID_TOKEN_MAX_TRACKED_IPS = 2048
+_invalid_token_hits_by_ip: dict[str, list[float]] = {}
+_invalid_token_last_log_by_ip: dict[str, float] = {}
 
 
 def _run_on_event_loop(coro, timeout_seconds: int, operation: str):
@@ -68,6 +74,53 @@ def _token_prefix(token: str, limit: int = 5) -> str:
     return f"{token[:limit]}..."
 
 
+def _client_ip() -> str:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    return forwarded or request.remote_addr or "unknown"
+
+
+def _record_invalid_token_request(route_name: str, token: str) -> bool:
+    """Return True when the caller should be rate limited."""
+    now = time.monotonic()
+    ip = _client_ip()
+    hits = [
+        ts
+        for ts in _invalid_token_hits_by_ip.get(ip, [])
+        if now - ts < _INVALID_TOKEN_WINDOW_SECONDS
+    ]
+    hits.append(now)
+    _invalid_token_hits_by_ip[ip] = hits
+
+    if len(_invalid_token_hits_by_ip) > _INVALID_TOKEN_MAX_TRACKED_IPS:
+        stale_ips = [
+            tracked_ip
+            for tracked_ip, tracked_hits in _invalid_token_hits_by_ip.items()
+            if not tracked_hits
+            or now - max(tracked_hits) >= _INVALID_TOKEN_WINDOW_SECONDS
+        ]
+        if not stale_ips:
+            trim_count = max(
+                1, len(_invalid_token_hits_by_ip) - _INVALID_TOKEN_MAX_TRACKED_IPS
+            )
+            stale_ips = list(_invalid_token_hits_by_ip.keys())[:trim_count]
+        for tracked_ip in stale_ips:
+            _invalid_token_hits_by_ip.pop(tracked_ip, None)
+            _invalid_token_last_log_by_ip.pop(tracked_ip, None)
+
+    last_log = _invalid_token_last_log_by_ip.get(ip, 0.0)
+    if now - last_log >= _INVALID_TOKEN_LOG_INTERVAL_SECONDS:
+        _invalid_token_last_log_by_ip[ip] = now
+        logger.info(
+            "%s token not found from ip=%s prefix=%s recent_invalid=%s",
+            route_name,
+            ip,
+            _token_prefix(token),
+            len(hits),
+        )
+
+    return len(hits) > _INVALID_TOKEN_MAX_PER_WINDOW
+
+
 def _bool_setting(key: str, default: bool = False) -> bool:
     raw = get_setting(key)
     if raw is None:
@@ -89,7 +142,8 @@ def _build_subscription_link(domain: str | None, token: str | None) -> str | Non
 def redirect_to_happ(token):
     user = get_user_by_token(token)
     if not user:
-        logger.info(f"Happ deeplink token not found (prefix: {_token_prefix(token)})")
+        if _record_invalid_token_request("Happ deeplink", token):
+            abort(429, "Too many invalid subscription requests")
         abort(404, "Subscription not found")
     if user.get("is_banned"):
         logger.warning(
@@ -261,9 +315,8 @@ def get_subscription(token):
         user = get_user_by_token(token)
 
         if not user:
-            logger.info(
-                f"Subscription token not found (prefix: {_token_prefix(token)})"
-            )
+            if _record_invalid_token_request("Subscription", token):
+                abort(429, "Too many invalid subscription requests")
             abort(404, "Subscription not found")
         if user.get("is_banned"):
             logger.warning(

@@ -249,3 +249,63 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 ### Остаточный риск
 
 - Полноценный per-payment/per-host ledger всё ещё лучше для наблюдаемости и ручного восстановления, но критичный риск финализации частичной `ALL`-выдачи закрыт.
+
+## Аудит 2026-06-06
+
+### Инвентаризация production
+
+- Проект находится в `/root/myvlessbottg`.
+- Запущен один контейнер `myvlessbottg-bot-1`, статус `healthy`, порт опубликован только на `127.0.0.1:1488`.
+- Docker restart policy: `unless-stopped`; healthcheck обращается к `/healthz`.
+- В контейнере одновременно работают Flask/Waitress, основной Telegram-бот, support-бот и scheduler.
+- На момент проверки в БД: 191 пользователь, 540 VPN-ключей, 225 транзакций, 3 XUI-хоста, 0 MTG-хостов, 4 активных XUI-тарифа `ALL`.
+- Включены YooKassa и Telegram Stars; CryptoBot и P2P выключены настройками.
+- Все активные paid global и trial подписки покрывают все 3 включённых XUI-хоста.
+
+### Исправлено в коде
+
+- YooKassa fallback-check теперь обрабатывает pending-платежи от старых к новым и помечает provider-confirmed `canceled` как локальный `canceled`, не оставляя их вечными pending.
+- Scheduler получил таймаут `120` секунд на синхронизацию состояния клиентов по одному XUI-хосту и backoff при зависании хоста, чтобы один медленный 3x-ui не блокировал весь цикл.
+- `/sub/<token>` и `/happ/<token>` получили ограничение частоты для неверных bearer-токенов и rate-limited логирование, чтобы сканирование токенов не зашумляло логи.
+- Docker compose задаёт `PYTHONPYCACHEPREFIX=/tmp/myvlessbottg-pycache`, чтобы контейнер не писал `__pycache__` в bind-mounted репозиторий.
+
+### Runtime-наблюдения
+
+- В логах был повторяющийся таймаут sync для хоста `USA`; backoff сработал, следующий цикл продолжил работу и контейнер остался `healthy`.
+- Scheduler нашёл 4 отменённых YooKassa-платежа и безопасно перевёл их в `canceled`.
+- В БД осталось 13 старых `pending` Telegram Stars invoice без `provider_payment_id`. Это неоплаченные/незавершённые invoice, часть привязана к уже отсутствующим пользователям. БД не менялась: такие записи требуют отдельного решения владельца, если нужно чистить историю.
+- Орфанных VPN-ключей, дублей `key_email`, плохих дат ключей и записей `vpn_keys_missing` не найдено.
+
+### Мусор
+
+- Найдены только Python cache-артефакты `__pycache__/` и `*.pyc`; это безопасный генерируемый мусор, уже покрытый `.gitignore` и `scripts/cleanup.sh`.
+- Дамп-файлы, архивы, `.sql`, `.bak`, `.old`, `.tmp`, `.zip`, `.tar`, `.tar.gz` внутри проекта не обнаружены.
+
+### Проверено
+
+```bash
+python3 -m compileall -q src scripts
+python3 scripts/check_callbacks.py
+python3 scripts/check_fsm_transitions.py
+python3 scripts/check_payment_safety.py
+python3 scripts/check_host_cleanup.py
+python3 scripts/check_settings_defaults.py
+python3 scripts/check_subscription_consistency.py
+docker exec myvlessbottg-bot-1 python3 -m compileall -q src scripts
+docker exec myvlessbottg-bot-1 python3 scripts/check_callbacks.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_fsm_transitions.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_payment_safety.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_host_cleanup.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_settings_defaults.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_subscription_consistency.py
+docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.py
+```
+
+На host Python `scripts/check_xui_connection_equivalence.py` не запускался без установленного `py3xui`, поэтому эта проверка выполнена внутри контейнера.
+
+### Остаточные риски
+
+- Публичный `/sub/<token>` остаётся bearer-link endpoint и может выполнять self-healing provisioning для активных global/trial подписок.
+- Нет отдельного per-payment/per-host fulfillment ledger; текущая логика защищает от частичной финализации `ALL`, но наблюдаемость host-level retry всё ещё ограничена.
+- Старые неоплаченные Telegram Stars invoice остаются в истории как `pending`; автоматическая чистка требует отдельного согласованного правила хранения.
+- Production по-прежнему использует bind mount всего проекта в контейнер. Это удобно для горячих правок, но менее строго, чем immutable image + отдельный data volume.

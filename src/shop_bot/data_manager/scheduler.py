@@ -24,6 +24,7 @@ TRIAL_NOTIFY_HOURS = {1, 0, -24}
 
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 _HOST_FAILURE_BACKOFF_SECONDS = 15 * 60
+_HOST_STATE_SYNC_TIMEOUT_SECONDS = 120
 _host_failure_backoff: dict[str, float] = {}
 
 
@@ -597,9 +598,20 @@ async def enforce_clients_state_from_db() -> None:
             }
 
         if desired_by_email:
-            host_result = await xui_api.sync_clients_state_on_host(
-                host_name, desired_by_email
-            )
+            try:
+                host_result = await asyncio.wait_for(
+                    xui_api.sync_clients_state_on_host(host_name, desired_by_email),
+                    timeout=_HOST_STATE_SYNC_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _mark_host_failure(host_name, "client state sync timed out")
+                total_errors += 1
+                logger.warning(
+                    "Scheduler: Client state sync timed out for host '%s' after %s seconds.",
+                    host_name,
+                    _HOST_STATE_SYNC_TIMEOUT_SECONDS,
+                )
+                continue
             if int(host_result.get("errors", 0)) and not int(
                 host_result.get("checked", 0)
             ):
@@ -1181,11 +1193,30 @@ async def process_pending_yookassa_payments(bot: Bot) -> None:
             )
             continue
 
-        if not payment or getattr(payment, "status", None) != "succeeded":
+        payment_status = getattr(payment, "status", None)
+        if payment_status == "canceled":
+            metadata = dict(tx.get("metadata_dict") or {})
+            metadata["payment_method"] = "YooKassa"
+            metadata["provider_payment_id"] = payment_id
+            marked = await asyncio.to_thread(
+                database.mark_pending_transaction_status,
+                payment_id,
+                "canceled",
+                metadata=metadata,
+                payment_method="YooKassa",
+            )
+            if marked:
+                logger.info(
+                    "Scheduler: YooKassa payment %s is canceled by provider; marked local transaction as canceled.",
+                    payment_id,
+                )
+            continue
+
+        if not payment or payment_status != "succeeded":
             logger.debug(
                 "Scheduler: YooKassa payment %s is not succeeded yet (status=%s).",
                 payment_id,
-                getattr(payment, "status", None),
+                payment_status,
             )
             continue
 

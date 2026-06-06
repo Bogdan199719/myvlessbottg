@@ -2171,6 +2171,55 @@ def finalize_reserved_transaction(
         return False
 
 
+def mark_pending_transaction_status(
+    payment_id: str,
+    status: str,
+    *,
+    metadata: dict | None = None,
+    payment_method: str | None = None,
+    amount_currency: float | int | None = None,
+    currency_name: str | None = None,
+) -> bool:
+    """Move a still-pending transaction to a terminal provider-confirmed status."""
+    if status not in {"canceled", "failed"}:
+        logging.error(
+            "Refusing to mark pending transaction %s as %s", payment_id, status
+        )
+        return False
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE transactions
+                SET status = ?,
+                    metadata = COALESCE(?, metadata),
+                    payment_method = COALESCE(?, payment_method),
+                    amount_currency = COALESCE(?, amount_currency),
+                    currency_name = COALESCE(?, currency_name)
+                WHERE payment_id = ? AND status = 'pending'
+                """,
+                (
+                    status,
+                    json.dumps(metadata) if metadata is not None else None,
+                    payment_method,
+                    amount_currency,
+                    currency_name,
+                    payment_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to mark pending transaction %s as %s: %s",
+            payment_id,
+            status,
+            e,
+        )
+        return False
+
+
 def get_pending_yookassa_transactions(limit: int = 100) -> list[dict]:
     transactions: list[dict] = []
     try:
@@ -2189,7 +2238,7 @@ def get_pending_yookassa_transactions(limit: int = 100) -> list[dict]:
                     OR metadata LIKE '%"payment_method": "YooKassa"%'
                     OR metadata LIKE '%"payment_method":"YooKassa"%'
                   )
-                ORDER BY created_date DESC
+                ORDER BY created_date ASC
                 """,
             )
             for row in cursor.fetchall():
