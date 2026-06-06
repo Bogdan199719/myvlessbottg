@@ -309,3 +309,18 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - Нет отдельного per-payment/per-host fulfillment ledger; текущая логика защищает от частичной финализации `ALL`, но наблюдаемость host-level retry всё ещё ограничена.
 - Старые неоплаченные Telegram Stars invoice остаются в истории как `pending`; автоматическая чистка требует отдельного согласованного правила хранения.
 - Production по-прежнему использует bind mount всего проекта в контейнер. Это удобно для горячих правок, но менее строго, чем immutable image + отдельный data volume.
+
+## Исправление 2026-06-06: старые неоплаченные Stars invoice
+
+### Исправлено
+
+- Telegram Stars invoice старше 48 часов, которые всё ещё `pending` и не имеют `provider_payment_id` / `telegram_payment_charge_id`, переводятся в статус `expired`.
+- Записи не удаляются: история платежа, сумма, пользователь и metadata сохраняются.
+- Такие invoice больше не считаются активными неоплаченными счетами пользователя и не попадают в статус `payment_pending` в Users.
+- Dashboard показывает статус `expired` как `Истёк без оплаты`, а не как сырое техническое значение.
+
+### Границы правила
+
+- YooKassa, CryptoBot и P2P этим правилом не затрагиваются.
+- Telegram Stars invoice с подтверждённым Telegram charge/provider id не истекают этим механизмом.
+- Правило запускается scheduler-ом и может быть выполнено вручную через `database.expire_stale_unpaid_stars_transactions(48)`.

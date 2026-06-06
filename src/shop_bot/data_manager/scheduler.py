@@ -1393,6 +1393,17 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
             )
 
 
+async def expire_stale_unpaid_stars_payments() -> None:
+    expired_count = await asyncio.to_thread(
+        database.expire_stale_unpaid_stars_transactions, 48
+    )
+    if expired_count:
+        logger.info(
+            "Scheduler: Marked %s stale unpaid Telegram Stars invoice(s) as expired.",
+            expired_count,
+        )
+
+
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
     await asyncio.sleep(10)
@@ -1438,6 +1449,7 @@ async def periodic_subscription_check(bot_controller: BotController):
                 if bot:
                     await process_pending_yookassa_payments(bot)
                     await process_pending_paid_provider_retries(bot)
+                    await expire_stale_unpaid_stars_payments()
                     await check_expiring_subscriptions(bot)
                 else:
                     logger.warning(

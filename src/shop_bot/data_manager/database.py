@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from shop_bot.utils import time_utils
 import logging
 from pathlib import Path
@@ -2181,7 +2181,7 @@ def mark_pending_transaction_status(
     currency_name: str | None = None,
 ) -> bool:
     """Move a still-pending transaction to a terminal provider-confirmed status."""
-    if status not in {"canceled", "failed"}:
+    if status not in {"canceled", "failed", "expired"}:
         logging.error(
             "Refusing to mark pending transaction %s as %s", payment_id, status
         )
@@ -2218,6 +2218,75 @@ def mark_pending_transaction_status(
             e,
         )
         return False
+
+
+def expire_stale_unpaid_stars_transactions(older_than_hours: int = 48) -> int:
+    """Mark old unpaid Telegram Stars invoices as expired while preserving history."""
+    try:
+        cutoff = time_utils.get_msk_now() - timedelta(hours=max(1, older_than_hours))
+        expired_count = 0
+
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT payment_id, metadata, created_date
+                FROM transactions
+                WHERE status = 'pending'
+                  AND metadata IS NOT NULL
+                  AND metadata != ''
+                  AND (
+                    payment_method = 'Telegram Stars'
+                    OR metadata LIKE '%"payment_method": "Telegram Stars"%'
+                    OR metadata LIKE '%"payment_method":"Telegram Stars"%'
+                  )
+                ORDER BY created_date ASC
+                """
+            )
+            candidates = cursor.fetchall()
+
+            for row in candidates:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except json.JSONDecodeError:
+                    continue
+
+                if (
+                    str(metadata.get("payment_method") or "").lower()
+                    != "telegram stars"
+                ):
+                    continue
+                if metadata.get("provider_payment_id") or metadata.get(
+                    "telegram_payment_charge_id"
+                ):
+                    continue
+
+                created_at = time_utils.parse_iso_to_msk(row["created_date"])
+                if not created_at or created_at > cutoff:
+                    continue
+
+                metadata["expired_reason"] = "unpaid_telegram_stars_invoice"
+                metadata["expired_at"] = time_utils.get_msk_now().isoformat()
+                cursor.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'expired',
+                        payment_method = COALESCE(payment_method, 'Telegram Stars'),
+                        metadata = ?
+                    WHERE payment_id = ? AND status = 'pending'
+                    """,
+                    (json.dumps(metadata), row["payment_id"]),
+                )
+                expired_count += cursor.rowcount
+
+            conn.commit()
+            return expired_count
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to expire stale unpaid Telegram Stars transactions: %s", e
+        )
+        return 0
 
 
 def get_pending_yookassa_transactions(limit: int = 100) -> list[dict]:

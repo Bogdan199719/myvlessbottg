@@ -346,7 +346,7 @@
 		<div class="status-summary-grid">
 			{% for item in analytics.transaction_statuses %}
 			<div class="status-summary-item">
-				<span>{{ item.status }}</span>
+				<span>{{ item.status_label }}</span>
 				<strong>{{ item.count }}</strong>
 			</div>
 			{% endfor %}

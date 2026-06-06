@@ -1174,6 +1174,18 @@ def create_webhook_app(bot_controller_instance):
         }
         return labels.get(normalized, str(method or "Не указан"))
 
+    def _format_transaction_status(status: str | None) -> str:
+        normalized = str(status or "unknown").strip().lower()
+        labels = {
+            "paid": "Оплачен",
+            "pending": "Ожидает оплаты",
+            "processing": "Обрабатывается",
+            "canceled": "Отменён",
+            "failed": "Ошибка",
+            "expired": "Истёк без оплаты",
+        }
+        return labels.get(normalized, str(status or "Неизвестно"))
+
     def _format_chart_day(day: str) -> str:
         try:
             return datetime.fromisoformat(day).strftime("%d.%m")
@@ -1914,7 +1926,11 @@ def create_webhook_app(bot_controller_instance):
                     reverse=True,
                 )
                 analytics["transaction_statuses"] = [
-                    {"status": status, "count": count}
+                    {
+                        "status": status,
+                        "status_label": _format_transaction_status(status),
+                        "count": count,
+                    }
                     for status, count in sorted(status_counts.items())
                 ]
         except sqlite3.Error as e:
