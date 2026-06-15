@@ -761,11 +761,24 @@ async def sync_keys_with_panels():
                             total_affected_records += 1
                         continue
 
-                    if (
-                        abs(server_expiry_ms - local_expiry_ms) > 1000
-                    ) or connection_string_changed:
-                        # Use update_key_info to update both expiry and string if needed
-                        # Convert server expiry to datetime
+                    expiry_diff_ms = server_expiry_ms - local_expiry_ms
+                    if expiry_diff_ms < -1000:
+                        logger.warning(
+                            "Scheduler: Panel expiry for key '%s' on host '%s' is earlier than DB "
+                            "(panel=%s, db=%s). Keeping DB expiry as source of truth.",
+                            key_email,
+                            host_name,
+                            server_expiry_ms,
+                            local_expiry_ms,
+                        )
+                        if connection_string_changed:
+                            await asyncio.to_thread(
+                                database.update_key_connection_string,
+                                db_key["key_id"],
+                                new_connection_string,
+                            )
+                            total_affected_records += 1
+                    elif abs(expiry_diff_ms) > 1000 or connection_string_changed:
                         new_expiry_date_dt = time_utils.from_timestamp_ms(
                             server_expiry_ms
                         )
@@ -864,6 +877,9 @@ async def auto_provision_new_hosts_for_global_users():
 
     try:
         global_plan_ids = await asyncio.to_thread(database.get_global_plan_ids)
+        current_global_plan_ids = await asyncio.to_thread(
+            database.get_global_plan_ids, False
+        )
     except Exception as e:
         logger.error(f"Scheduler: Failed to get global plans: {e}")
         return
@@ -954,9 +970,7 @@ async def auto_provision_new_hosts_for_global_users():
 
             # Pick deterministic global plan id for paid users. Trial keys stay
             # plan_id=0 so later paid conversion still recognizes them as trial.
-            if active_paid_global_keys and global_plan_ids:
-                first_global_plan_id = int(min(global_plan_ids))
-            elif active_paid_global_keys:
+            if active_paid_global_keys:
                 legacy_plan_ids = set()
                 for key in active_paid_global_keys:
                     try:
@@ -965,9 +979,15 @@ async def auto_provision_new_hosts_for_global_users():
                         candidate_plan_id = 0
                     if candidate_plan_id > 0:
                         legacy_plan_ids.add(candidate_plan_id)
-                first_global_plan_id = (
-                    int(min(legacy_plan_ids)) if legacy_plan_ids else 0
-                )
+                current_user_plan_ids = legacy_plan_ids & current_global_plan_ids
+                if current_user_plan_ids:
+                    first_global_plan_id = int(min(current_user_plan_ids))
+                elif legacy_plan_ids:
+                    first_global_plan_id = int(min(legacy_plan_ids))
+                elif current_global_plan_ids:
+                    first_global_plan_id = int(min(current_global_plan_ids))
+                else:
+                    first_global_plan_id = 0
             else:
                 first_global_plan_id = 0
 
