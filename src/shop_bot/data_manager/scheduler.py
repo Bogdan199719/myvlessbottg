@@ -1393,6 +1393,17 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
             )
 
 
+async def recover_interrupted_payment_processing() -> None:
+    recovered = await asyncio.to_thread(
+        database.recover_stale_global_processing_transactions, 15
+    )
+    if recovered:
+        logger.warning(
+            "Scheduler: Recovered %s interrupted global payment fulfillment(s).",
+            recovered,
+        )
+
+
 async def expire_stale_unpaid_stars_payments() -> None:
     expired_count = await asyncio.to_thread(
         database.expire_stale_unpaid_stars_transactions, 48
@@ -1447,6 +1458,7 @@ async def periodic_subscription_check(bot_controller: BotController):
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
+                    await recover_interrupted_payment_processing()
                     await process_pending_yookassa_payments(bot)
                     await process_pending_paid_provider_retries(bot)
                     await expire_stale_unpaid_stars_payments()

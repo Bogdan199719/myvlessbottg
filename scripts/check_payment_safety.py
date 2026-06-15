@@ -101,6 +101,7 @@ def _global_fulfillment_is_complete_and_idempotent(
     required_process_fragments = (
         'host_name == "ALL"',
         "_target_expiry_ms_for_global_payment(",
+        "update_reserved_transaction_metadata(",
         "len(results) != len(hosts_to_process)",
         "return False",
     )
@@ -163,6 +164,8 @@ def main() -> int:
     process_fn = functions.get("process_successful_payment")
     execute_fn = functions.get("_execute_payment_for_hosts")
     promo_fn = functions.get("process_promo_code_handler")
+    stars_complete_fn = functions.get("_stars_complete_transaction")
+    stars_checkout_fn = functions.get("stars_pre_checkout_handler")
 
     if not isinstance(process_fn, ast.AsyncFunctionDef):
         failures.append("process_successful_payment is missing")
@@ -183,6 +186,15 @@ def main() -> int:
             failures.append(
                 "payment fulfillment must continue when Telegram status messaging fails"
             )
+        process_text = _source_segment(source, process_fn)
+        if "Could not persist global fulfillment target" not in process_text:
+            failures.append(
+                "global payment target must be persisted before external fulfillment"
+            )
+        if "apply_payment_accounting_once(" not in process_text:
+            failures.append(
+                "provider payment accounting must be applied atomically once"
+            )
 
     if not isinstance(execute_fn, ast.AsyncFunctionDef):
         failures.append("_execute_payment_for_hosts is missing")
@@ -198,6 +210,36 @@ def main() -> int:
 
     if not _p2p_handlers_parse_command_args(source, functions):
         failures.append("P2P slash commands must parse CommandObject args")
+
+    if not isinstance(stars_complete_fn, ast.FunctionDef):
+        failures.append("_stars_complete_transaction is missing")
+    else:
+        stars_complete_text = _source_segment(source, stars_complete_fn)
+        for fragment in (
+            'allowed_statuses=("pending", "expired")',
+            "payer_user_id",
+            "update_reserved_transaction_metadata(",
+        ):
+            if fragment not in stars_complete_text:
+                failures.append(
+                    "Stars successful payment must validate and persist confirmed expired invoices"
+                )
+                break
+
+    if not isinstance(stars_checkout_fn, ast.AsyncFunctionDef):
+        failures.append("stars_pre_checkout_handler is missing")
+    else:
+        stars_checkout_text = _source_segment(source, stars_checkout_fn)
+        for fragment in (
+            "pre_checkout_query.currency == \"XTR\"",
+            "pre_checkout_query.total_amount",
+            "payer_user_id == expected_user_id",
+        ):
+            if fragment not in stars_checkout_text:
+                failures.append(
+                    "Stars pre-checkout must validate payer, currency, and amount"
+                )
+                break
 
     if not isinstance(promo_fn, ast.AsyncFunctionDef):
         failures.append("process_promo_code_handler is missing")

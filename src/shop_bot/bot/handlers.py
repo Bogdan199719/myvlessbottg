@@ -51,6 +51,8 @@ from shop_bot.data_manager.database import (
     add_to_referral_balance,
     create_pending_transaction,
     reserve_pending_transaction,
+    update_reserved_transaction_metadata,
+    apply_payment_accounting_once,
     finalize_reserved_transaction,
     get_all_users,
     set_referral_balance,
@@ -436,18 +438,33 @@ def has_ever_purchased_vpn_subscription(user_id: int) -> bool:
     return False
 
 
-def _stars_is_pending_transaction(payment_id: str) -> bool:
+def _get_stars_transaction(payment_id: str) -> dict | None:
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT status FROM transactions WHERE payment_id = ?", (payment_id,)
+                """
+                SELECT payment_id, user_id, status, metadata
+                FROM transactions
+                WHERE payment_id = ?
+                """,
+                (payment_id,),
             )
             row = cursor.fetchone()
-            return bool(row and row[0] == "pending")
+            if not row:
+                return None
+            transaction = dict(row)
+            try:
+                transaction["metadata_dict"] = json.loads(
+                    transaction.get("metadata") or "{}"
+                )
+            except json.JSONDecodeError:
+                transaction["metadata_dict"] = {}
+            return transaction
     except sqlite3.Error as e:
-        logger.error(f"Stars: Failed to check pending transaction {payment_id}: {e}")
-        return False
+        logger.error(f"Stars: Failed to load transaction {payment_id}: {e}")
+        return None
 
 
 def _get_transaction_status(payment_id: str) -> str | None:
@@ -469,7 +486,10 @@ def _cryptobot_build_payload(payment_id: str) -> str:
 
 
 def _stars_complete_transaction(
-    payment_id: str, paid_stars: int, telegram_payment_charge_id: str | None
+    payment_id: str,
+    paid_stars: int,
+    telegram_payment_charge_id: str | None,
+    payer_user_id: int,
 ) -> dict | None:
     try:
         if paid_stars <= 0:
@@ -483,6 +503,7 @@ def _stars_complete_transaction(
             payment_method="Telegram Stars",
             amount_currency=int(paid_stars),
             currency_name="XTR",
+            allowed_statuses=("pending", "expired"),
         )
         if metadata is None:
             return None
@@ -520,11 +541,38 @@ def _stars_complete_transaction(
             )
             return None
 
+        if int(metadata.get("user_id") or 0) != int(payer_user_id):
+            logger.error(
+                "Stars: Payer mismatch for %s: payer=%s owner=%s",
+                payment_id,
+                payer_user_id,
+                metadata.get("user_id"),
+            )
+            finalize_reserved_transaction(
+                payment_id,
+                success=False,
+                metadata=metadata,
+                payment_method="Telegram Stars",
+                amount_currency=int(paid_stars),
+                currency_name="XTR",
+            )
+            return None
+
         if telegram_payment_charge_id:
             metadata["telegram_payment_charge_id"] = telegram_payment_charge_id
         metadata["paid_stars"] = int(paid_stars)
         metadata["payment_method"] = "Telegram Stars"
         metadata["provider_payment_id"] = payment_id
+        if not update_reserved_transaction_metadata(payment_id, metadata):
+            finalize_reserved_transaction(
+                payment_id,
+                success=False,
+                metadata=metadata,
+                payment_method="Telegram Stars",
+                amount_currency=int(paid_stars),
+                currency_name="XTR",
+            )
+            return None
         return metadata
     except Exception as e:
         logger.error(f"Stars: Failed to complete transaction {payment_id}: {e}")
@@ -1656,6 +1704,9 @@ def get_user_router() -> Router:
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
             hosts_to_process = get_all_hosts(only_enabled=True)
+            target_expiry_ms = time_utils.get_timestamp_ms(
+                time_utils.get_msk_now() + timedelta(days=int(trial_days))
+            )
 
             for host in hosts_to_process:
                 current_host_name = host["host_name"]
@@ -1673,10 +1724,10 @@ def get_user_router() -> Router:
                     if existing_trial_key
                     else f"user{user_id}-global-{current_host_name.replace(' ', '').lower()}"
                 )
-                result = await xui_api.create_or_update_key_on_host(
+                result = await xui_api.create_or_update_key_on_host_absolute_expiry(
                     host_name=current_host_name,
                     email=email,
-                    days_to_add=int(trial_days),
+                    target_expiry_ms=target_expiry_ms,
                     telegram_id=str(user_id),
                 )
                 if not result:
@@ -1761,7 +1812,8 @@ def get_user_router() -> Router:
             ]
             if failed_hosts:
                 final_text += (
-                    "\n\n⚠️ Не удалось выдать пробный доступ на серверы:\n- "
+                    "\n\n⚠️ Часть серверов временно недоступна и будет "
+                    "добавлена автоматически без изменения даты окончания:\n- "
                     + "\n- ".join(failed_hosts)
                 )
 
@@ -3059,7 +3111,29 @@ def get_user_router() -> Router:
         pre_checkout_query: types.PreCheckoutQuery, bot: Bot
     ):
         payment_id = pre_checkout_query.invoice_payload
-        if not payment_id or not _stars_is_pending_transaction(payment_id):
+        transaction = _get_stars_transaction(payment_id) if payment_id else None
+        metadata = transaction.get("metadata_dict", {}) if transaction else {}
+        payer_user_id = (
+            int(pre_checkout_query.from_user.id)
+            if pre_checkout_query.from_user
+            else 0
+        )
+        try:
+            expected_user_id = int(metadata.get("user_id") or 0)
+            expected_amount = int(metadata.get("expected_stars_amount") or 0)
+            actual_amount = int(pre_checkout_query.total_amount)
+        except (TypeError, ValueError):
+            expected_user_id = 0
+            expected_amount = 0
+            actual_amount = -1
+        valid = bool(
+            transaction
+            and transaction.get("status") == "pending"
+            and payer_user_id == expected_user_id
+            and pre_checkout_query.currency == "XTR"
+            and actual_amount == expected_amount
+        )
+        if not valid:
             logger.warning(
                 "Stars: Rejected pre-checkout for payload=%s user_id=%s",
                 payment_id,
@@ -3103,7 +3177,10 @@ def get_user_router() -> Router:
         telegram_payment_charge_id = sp.telegram_payment_charge_id
 
         metadata = _stars_complete_transaction(
-            payment_id, paid_stars, telegram_payment_charge_id
+            payment_id,
+            paid_stars,
+            telegram_payment_charge_id,
+            int(message.from_user.id) if message.from_user else 0,
         )
         if not metadata:
             logger.info(
@@ -4214,6 +4291,19 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             target_expiry_ms = _target_expiry_ms_for_global_payment(
                 user_id, days_to_add, hosts_to_process, metadata
             )
+            provider_payment_id = metadata.get("provider_payment_id")
+            if provider_payment_id and not update_reserved_transaction_metadata(
+                str(provider_payment_id), metadata
+            ):
+                logger.error(
+                    "Could not persist global fulfillment target for payment %s.",
+                    provider_payment_id,
+                )
+                await processing_message.edit_text(
+                    "❌ Не удалось безопасно подготовить выдачу подписки. "
+                    "Я повторю попытку автоматически."
+                )
+                return False
         results, primary_key_id = await _execute_payment_for_hosts(
             user_id=user_id,
             purchase_host_name=host_name,
@@ -4252,32 +4342,49 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
         user_data = get_user(user_id)
         referrer_id = user_data.get("referred_by")
-
+        reward = Decimal("0")
         if referrer_id:
             percentage = Decimal(get_setting("referral_percentage") or "0")
-
             reward = (Decimal(str(price)) * percentage / 100).quantize(Decimal("0.01"))
 
-            if float(reward) > 0:
+        provider_payment_id = metadata.get("provider_payment_id")
+        accounting_applied_now = True
+        if provider_payment_id:
+            accounting_applied_now = apply_payment_accounting_once(
+                str(provider_payment_id),
+                user_id,
+                price,
+                months,
+                int(referrer_id) if referrer_id else None,
+                float(reward),
+                metadata,
+            )
+            if not accounting_applied_now and not metadata.get("accounting_applied"):
+                logger.error(
+                    "Could not atomically apply accounting for payment %s.",
+                    provider_payment_id,
+                )
+                return False
+        else:
+            if referrer_id and float(reward) > 0:
                 add_to_referral_balance(referrer_id, float(reward))
+            update_user_stats(user_id, price, months)
 
-                try:
-                    referrer_username = user_data.get("username", "пользователь")
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 Ваш реферал @{referrer_username} совершил покупку на сумму {price:.2f} RUB!\n"
-                        f"💰 На ваш баланс начислено вознаграждение: {reward:.2f} RUB.",
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Could not send referral reward notification to {referrer_id}: {e}"
-                    )
-
-        update_user_stats(user_id, price, months)
+        if accounting_applied_now and referrer_id and float(reward) > 0:
+            try:
+                referrer_username = user_data.get("username", "пользователь")
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 Ваш реферал @{referrer_username} совершил покупку на сумму {price:.2f} RUB!\n"
+                    f"💰 На ваш баланс начислено вознаграждение: {reward:.2f} RUB.",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not send referral reward notification to {referrer_id}: {e}"
+                )
 
         user_info = get_user(user_id)
 
-        provider_payment_id = metadata.get("provider_payment_id")
         payment_id_for_log = (
             str(provider_payment_id).strip()
             if provider_payment_id

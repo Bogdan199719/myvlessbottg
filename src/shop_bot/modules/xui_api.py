@@ -282,6 +282,23 @@ def _remember_bearer_failure(host_url: str) -> None:
     _host_bearer_failure_cache[host_url] = time.time()
 
 
+def _set_api_request_timeouts(api: Api) -> None:
+    """Bound py3xui HTTP calls so outer asyncio timeouts do not leak threads."""
+    for api_part in (api.client, api.inbound, api.database, api.server):
+        if getattr(api_part, "_shop_bot_timeout_wrapped", False):
+            continue
+        original_request = api_part._request_with_retry
+
+        def _request_with_timeout(
+            method, url, headers, _original=original_request, **kwargs
+        ):
+            kwargs.setdefault("timeout", (5, 15))
+            return _original(method, url, headers, **kwargs)
+
+        api_part._request_with_retry = _request_with_timeout
+        api_part._shop_bot_timeout_wrapped = True
+
+
 def _set_cookie_auth(
     api: Api, cookie_name: str, cookie_value: str, csrf_token: str | None = None
 ) -> None:
@@ -416,6 +433,7 @@ def login_to_host(
 
     def _cookie_login_api() -> Api:
         api = Api(host=host_url, username=username, password=password)
+        _set_api_request_timeouts(api)
         if _login_with_csrf(api, host_url, username, password):
             return api
         api.login()
@@ -425,6 +443,7 @@ def login_to_host(
         try:
             if token and not _bearer_recently_failed(host_url):
                 api = Api(host=host_url, username=username, password=password)
+                _set_api_request_timeouts(api)
                 _attach_bearer_auth(api, token)
                 try:
                     target_inbound = _load_target_inbound(api)
@@ -2469,6 +2488,11 @@ def _sync_clients_state_on_host_sync(
             for c in inbound_to_modify.settings.clients
             if getattr(c, "email", None)
         }
+        traffic_by_email = {
+            getattr(client, "email", None): client
+            for client in (getattr(inbound_to_modify, "client_stats", None) or [])
+            if getattr(client, "email", None)
+        }
 
         any_changed = False
         # Track clients whose clientTraffics row must be normalized after the
@@ -2526,15 +2550,19 @@ def _sync_clients_state_on_host_sync(
                     emails_to_reset_stats.add(email)
                     if current_expiry_ms <= now_ms or not was_enabled:
                         reactivated_emails.add(email)
-                elif _client_traffic_is_disabled(api, email):
-                    logger.info(
-                        "Client '%s' on host '%s' is active in DB but disabled/exhausted in clientTraffics; refreshing.",
-                        email,
-                        host_name,
-                    )
-                    emails_to_reset_stats.add(email)
-                    reactivated_emails.add(email)
-                    result["traffic_fixed"] += 1
+                else:
+                    traffic_client = traffic_by_email.get(email)
+                    if traffic_client and not bool(
+                        getattr(traffic_client, "enable", True)
+                    ):
+                        logger.info(
+                            "Client '%s' on host '%s' is active in DB but disabled/exhausted in clientTraffics; refreshing.",
+                            email,
+                            host_name,
+                        )
+                        emails_to_reset_stats.add(email)
+                        reactivated_emails.add(email)
+                        result["traffic_fixed"] += 1
             elif enable_state_changed:
                 # When DB marks a key expired we want the host to show it as disabled,
                 # not as traffic-exhausted due to a stale clientTraffics flag.

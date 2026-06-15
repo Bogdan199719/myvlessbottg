@@ -2071,6 +2071,7 @@ def reserve_pending_transaction(
     payment_method: str | None = None,
     amount_currency: float | int | None = None,
     currency_name: str | None = None,
+    allowed_statuses: tuple[str, ...] = ("pending",),
 ) -> dict | None:
     """
     Atomically reserve a pending transaction for processing.
@@ -2080,9 +2081,20 @@ def reserve_pending_transaction(
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            statuses = tuple(
+                status
+                for status in allowed_statuses
+                if status in {"pending", "expired"}
+            )
+            if not statuses:
+                return None
+            placeholders = ",".join("?" for _ in statuses)
             cursor.execute(
-                "SELECT metadata FROM transactions WHERE payment_id = ? AND status = 'pending'",
-                (payment_id,),
+                f"""
+                SELECT metadata FROM transactions
+                WHERE payment_id = ? AND status IN ({placeholders})
+                """,
+                (payment_id, *statuses),
             )
             row = cursor.fetchone()
             if not row:
@@ -2096,9 +2108,12 @@ def reserve_pending_transaction(
                     metadata_to_store = {}
             else:
                 metadata_to_store = metadata
+            metadata_to_store["processing_started_at"] = (
+                time_utils.get_msk_now().isoformat()
+            )
 
             cursor.execute(
-                """
+                f"""
                 UPDATE transactions
                 SET status = 'processing',
                     amount_currency = COALESCE(?, amount_currency),
@@ -2110,7 +2125,7 @@ def reserve_pending_transaction(
                         username,
                         (SELECT username FROM users WHERE telegram_id = transactions.user_id)
                     )
-                WHERE payment_id = ? AND status = 'pending'
+                WHERE payment_id = ? AND status IN ({placeholders})
                 """,
                 (
                     amount_currency,
@@ -2119,6 +2134,7 @@ def reserve_pending_transaction(
                     json.dumps(metadata_to_store),
                     time_utils.get_msk_now(),
                     payment_id,
+                    *statuses,
                 ),
             )
             if cursor.rowcount != 1:
@@ -2129,6 +2145,170 @@ def reserve_pending_transaction(
     except sqlite3.Error as e:
         logging.error(f"Failed to reserve pending transaction {payment_id}: {e}")
         return None
+
+
+def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> bool:
+    """Persist resumable fulfillment state while a transaction is processing."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE transactions
+                SET metadata = ?
+                WHERE payment_id = ? AND status = 'processing'
+                """,
+                (json.dumps(metadata), payment_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to persist processing metadata for transaction %s: %s",
+            payment_id,
+            e,
+        )
+        return False
+
+
+def recover_stale_global_processing_transactions(
+    older_than_minutes: int = 15,
+) -> int:
+    """Return interrupted idempotent global fulfillments to the retry queue."""
+    cutoff = time_utils.get_msk_now() - timedelta(
+        minutes=max(5, int(older_than_minutes))
+    )
+    recovered = 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT payment_id, metadata, created_date
+                FROM transactions
+                WHERE status = 'processing'
+                  AND metadata IS NOT NULL
+                  AND metadata != ''
+                """
+            )
+            for row in cursor.fetchall():
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if metadata.get("host_name") != "ALL":
+                    continue
+                if not metadata.get("provider_payment_id"):
+                    continue
+
+                started_at = time_utils.parse_iso_to_msk(
+                    metadata.get("processing_started_at")
+                )
+                if not started_at:
+                    started_at = time_utils.parse_iso_to_msk(row["created_date"])
+                if not started_at or started_at > cutoff:
+                    continue
+
+                metadata["recovered_from_interrupted_processing_at"] = (
+                    time_utils.get_msk_now().isoformat()
+                )
+                cursor.execute(
+                    """
+                    UPDATE transactions
+                    SET status = 'pending', metadata = ?
+                    WHERE payment_id = ? AND status = 'processing'
+                    """,
+                    (json.dumps(metadata), row["payment_id"]),
+                )
+                recovered += cursor.rowcount
+            conn.commit()
+        return recovered
+    except sqlite3.Error as e:
+        logging.error("Failed to recover stale processing transactions: %s", e)
+        return 0
+
+
+def apply_payment_accounting_once(
+    payment_id: str,
+    user_id: int,
+    amount_rub: float,
+    months: int,
+    referrer_id: int | None,
+    referral_reward: float,
+    metadata: dict,
+) -> bool:
+    """Atomically apply purchase stats/referral credit once per provider payment."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM transactions
+                WHERE payment_id = ?
+                """,
+                (payment_id,),
+            )
+            row = cursor.fetchone()
+            if not row or row["status"] != "processing":
+                conn.rollback()
+                return False
+            try:
+                stored_metadata = json.loads(row["metadata"] or "{}")
+            except json.JSONDecodeError:
+                stored_metadata = {}
+            if stored_metadata.get("accounting_applied"):
+                metadata["accounting_applied"] = True
+                conn.rollback()
+                return False
+
+            cursor.execute(
+                """
+                UPDATE users
+                SET total_spent = total_spent + ?,
+                    total_months = total_months + ?
+                WHERE telegram_id = ?
+                """,
+                (float(amount_rub), int(months), int(user_id)),
+            )
+            if referrer_id and float(referral_reward) > 0:
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET referral_balance = referral_balance + ?,
+                        referral_balance_all = referral_balance_all + ?
+                    WHERE telegram_id = ?
+                    """,
+                    (
+                        float(referral_reward),
+                        float(referral_reward),
+                        int(referrer_id),
+                    ),
+                )
+
+            metadata["accounting_applied"] = True
+            stored_metadata.update(metadata)
+            cursor.execute(
+                """
+                UPDATE transactions
+                SET metadata = ?
+                WHERE payment_id = ? AND status = 'processing'
+                """,
+                (json.dumps(stored_metadata), payment_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to apply accounting for payment %s: %s", payment_id, e
+        )
+        return False
 
 
 def finalize_reserved_transaction(

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import ast
+import json
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -28,6 +29,9 @@ def main() -> int:
         "Trial key was created on host %s but DB persistence failed." in handlers_source
     )
     assert "Trial access was issued for user %s" in handlers_source
+    assert "create_or_update_key_on_host_absolute_expiry(" in handlers_source
+    assert "добавлена автоматически" in handlers_source
+    assert "без изменения даты окончания" in handlers_source
     assert "if issued_count != len(hosts):" in app_source
     assert "Статистика не начислена" in app_source
 
@@ -41,6 +45,7 @@ def main() -> int:
         database.initialize_db()
         database.run_migration()
         database.register_user_if_not_exists(101, "promo-user", None)
+        database.register_user_if_not_exists(102, "referrer", None)
 
         with sqlite3.connect(database.DB_FILE) as conn:
             conn.execute(
@@ -72,6 +77,75 @@ def main() -> int:
         assert database.update_key_plan_id(key_id, 1)
         assert not database.update_key_info(999999, time_utils.get_msk_now())
         assert not database.update_key_plan_id(999999, 1)
+
+        payment_metadata = {
+            "user_id": 101,
+            "host_name": "ALL",
+            "payment_method": "Telegram Stars",
+            "provider_payment_id": "stars-recovery",
+            "fulfillment_target_expiry_ms": 2_000_000_000_000,
+        }
+        assert database.create_pending_transaction(
+            "stars-recovery", 101, 100.0, payment_metadata
+        )
+        with sqlite3.connect(database.DB_FILE) as conn:
+            conn.execute(
+                "UPDATE transactions SET status = 'expired' WHERE payment_id = ?",
+                ("stars-recovery",),
+            )
+        reserved = database.reserve_pending_transaction(
+            "stars-recovery",
+            payment_method="Telegram Stars",
+            amount_currency=50,
+            currency_name="XTR",
+            allowed_statuses=("pending", "expired"),
+        )
+        assert reserved
+        reserved.update(payment_metadata)
+        reserved["processing_started_at"] = (
+            time_utils.get_msk_now() - timedelta(minutes=20)
+        ).isoformat()
+        assert database.update_reserved_transaction_metadata(
+            "stars-recovery", reserved
+        )
+        assert database.recover_stale_global_processing_transactions(15) == 1
+        with sqlite3.connect(database.DB_FILE) as conn:
+            status, stored_metadata = conn.execute(
+                "SELECT status, metadata FROM transactions WHERE payment_id = ?",
+                ("stars-recovery",),
+            ).fetchone()
+        assert status == "pending"
+        assert json.loads(stored_metadata).get(
+            "recovered_from_interrupted_processing_at"
+        )
+
+        accounting_metadata = {
+            "user_id": 101,
+            "host_name": "ALL",
+            "provider_payment_id": "accounting-once",
+        }
+        assert database.create_pending_transaction(
+            "accounting-once", 101, 200.0, accounting_metadata
+        )
+        assert database.reserve_pending_transaction("accounting-once")
+        assert database.apply_payment_accounting_once(
+            "accounting-once", 101, 200.0, 1, 102, 20.0, accounting_metadata
+        )
+        assert not database.apply_payment_accounting_once(
+            "accounting-once", 101, 200.0, 1, 102, 20.0, accounting_metadata
+        )
+        with sqlite3.connect(database.DB_FILE) as conn:
+            spent, months = conn.execute(
+                "SELECT total_spent, total_months FROM users WHERE telegram_id = 101"
+            ).fetchone()
+            balance, balance_all = conn.execute(
+                """
+                SELECT referral_balance, referral_balance_all
+                FROM users WHERE telegram_id = 102
+                """
+            ).fetchone()
+        assert spent == 200.0 and months == 1
+        assert balance == 20.0 and balance_all == 20.0
 
         created, message = database.create_promo_code("RESUME", 10, 1, None)
         assert created, message
