@@ -21,8 +21,13 @@
 - `CRYPTOBOT_WEBHOOK_SECRET`
 - `DB_PATH`
 - `FLASK_SECRET_KEY`
+- `ENABLE_WEB_UPDATES`
 
 `DB_PATH` влияет напрямую на путь к SQLite. Остальные значения в основном копируются в `bot_settings` и дальше редактируются уже через админку.
+
+`ENABLE_WEB_UPDATES=false` оставляет встроенный update-manager выключенным. При
+включении он использует агрессивное обновление через `git reset --hard
+origin/main`, поэтому для Docker production предпочтителен ручной rebuild.
 
 `FLASK_SECRET_KEY` используется для подписи Flask-сессий админки. Он должен быть случайным и длинным: минимум 32 символа, лучше 64 hex-символа. Известные placeholder-значения из шаблона считаются небезопасными; при их обнаружении приложение использует сохранённый сильный ключ из БД или генерирует новый.
 
@@ -82,7 +87,8 @@
 - `subscription_live_sync`
 - `subscription_live_stats`
 - `subscription_allow_fallback_host_fetch`
-- `subscription_auto_provision`
+- `subscription_auto_provision` (зарезервирована; текущие пути provisioning её не учитывают)
+- `provision_timeout_seconds`
 - `panel_sync_enabled`
 - `xtls_sync_enabled`
 - `enable_global_plans`

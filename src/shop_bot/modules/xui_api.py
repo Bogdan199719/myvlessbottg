@@ -1648,9 +1648,8 @@ def update_or_create_client_on_panel(
                 raw_client["auth"] = client_uuid
                 _update_raw_client(api, inbound_id, client_uuid, raw_client)
                 logger.info(
-                    "Updated existing Hysteria client '%s' (auth: %s) on inbound %s",
+                    "Updated existing Hysteria client '%s' on inbound %s",
                     email,
-                    client_uuid,
                     inbound_id,
                 )
             else:
@@ -1663,9 +1662,8 @@ def update_or_create_client_on_panel(
                 )
                 _add_raw_client(api, inbound_id, raw_client)
                 logger.info(
-                    "Added new Hysteria client '%s' (auth: %s) on inbound %s",
+                    "Added new Hysteria client '%s' on inbound %s",
                     email,
-                    client_uuid,
                     inbound_id,
                 )
 
@@ -1755,7 +1753,7 @@ def update_or_create_client_on_panel(
                         )
                         client_uuid = actual_uuid
                     logger.info(
-                        f"Recreated client '{email}' (identifier: {client_uuid}) on inbound {inbound_id}"
+                        "Recreated client '%s' on inbound %s", email, inbound_id
                     )
 
             reactivated_from_expired = should_enable_client and (
@@ -1789,7 +1787,7 @@ def update_or_create_client_on_panel(
                     actual_uuid,
                 )
                 client_uuid = actual_uuid
-            logger.info(f"Added new client '{email}' (identifier: {client_uuid})")
+            logger.info("Added new client '%s'", email)
 
         return client_uuid, new_expiry_ms
 

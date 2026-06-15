@@ -27,6 +27,7 @@ def main() -> int:
     assert (
         "Trial key was created on host %s but DB persistence failed." in handlers_source
     )
+    assert "Trial access was issued for user %s" in handlers_source
     assert "if issued_count != len(hosts):" in app_source
     assert "Статистика не начислена" in app_source
 

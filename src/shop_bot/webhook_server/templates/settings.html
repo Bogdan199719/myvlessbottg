@@ -494,7 +494,8 @@
 					</form>
 
 					<form action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data"
-						class="import-form">
+						class="import-form"
+						data-confirm="Импорт остановит ботов и заменит текущую базу данных. Продолжить?">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<label class="file-drop">
 							<input type="file" id="backup_file" name="backup_file" accept=".zip" required />

@@ -108,7 +108,7 @@ docker compose build
 Если на host Python не установлены runtime-зависимости проекта, запускайте проверки внутри контейнера:
 
 ```bash
-docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.py
+docker compose exec bot python3 scripts/check_xui_connection_equivalence.py
 ```
 
 ## Проверка 3x-ui хостов после обновления панели

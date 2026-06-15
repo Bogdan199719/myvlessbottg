@@ -139,6 +139,22 @@ def _promo_fulfillment_is_resumable(source: str, functions: dict[str, ast.AST]) 
     )
 
 
+def _fulfillment_survives_notification_failure(
+    source: str, fn: ast.AsyncFunctionDef
+) -> bool:
+    text = _source_segment(source, fn)
+    required_fragments = (
+        "processing_message = _BestEffortProcessingMessage()",
+        "will continue without a processing message",
+    )
+    forbidden_fragment = (
+        "could not start fulfillment because the processing message failed"
+    )
+    return all(fragment in text for fragment in required_fragments) and (
+        forbidden_fragment not in text
+    )
+
+
 def main() -> int:
     source, tree = _load_tree()
     functions = _functions(tree)
@@ -163,6 +179,10 @@ def main() -> int:
             source, process_fn, "await processing_message.delete()"
         ):
             failures.append("processing-message delete must be best-effort")
+        if not _fulfillment_survives_notification_failure(source, process_fn):
+            failures.append(
+                "payment fulfillment must continue when Telegram status messaging fails"
+            )
 
     if not isinstance(execute_fn, ast.AsyncFunctionDef):
         failures.append("_execute_payment_for_hosts is missing")

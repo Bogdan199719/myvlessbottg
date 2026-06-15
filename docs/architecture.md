@@ -28,7 +28,7 @@
 ### Data layer
 
 - `src/shop_bot/data_manager/database.py` — SQLite-схема, миграции и CRUD.
-- Базовые таблицы: `users`, `vpn_keys`, `transactions`, `bot_settings`, `xui_hosts`, `mtg_hosts`, `plans`, `payment_method_rules`, `p2p_requests`, `support_threads`, `support_tickets`, `support_messages`, `vpn_keys_missing`, `sent_notifications`.
+- Основные таблицы: `users`, `vpn_keys`, `transactions`, `bot_settings`, `xui_hosts`, `mtg_hosts`, `plans`, `payment_method_rules`, `processed_webhooks`, `p2p_requests`, `promo_codes`, `promo_code_redemptions`, `profit_distributions`, `support_threads`, `support_tickets`, `support_messages`, `vpn_keys_missing`, `sent_notifications`.
 
 ### Integration layer
 

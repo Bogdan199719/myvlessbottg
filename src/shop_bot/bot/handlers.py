@@ -94,6 +94,16 @@ TELEGRAM_BOT_USERNAME = None
 ADMIN_ID = None
 
 
+class _BestEffortProcessingMessage:
+    """Keep fulfillment independent from optional Telegram status messages."""
+
+    async def edit_text(self, *_args, **_kwargs):
+        return None
+
+    async def delete(self):
+        return None
+
+
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
     domain_value = (domain or "").strip()
     token_value = (token or "").strip()
@@ -1714,7 +1724,14 @@ def get_user_router() -> Router:
                 )
                 return
 
-            await message.delete()
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.warning(
+                    "Trial access was issued for user %s, but the processing message could not be deleted: %s",
+                    user_id,
+                    e,
+                )
             new_expiry_date = min(
                 time_utils.from_timestamp_ms(res["expiry_timestamp_ms"])
                 for res in results
@@ -4066,7 +4083,11 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     pending_flag_set = False
     try:
         logger.info(
-            f"Processing successful payment for user {metadata.get('user_id')}: {metadata}"
+            "Processing successful payment for user %s provider_payment_id=%s plan_id=%s action=%s",
+            metadata.get("user_id"),
+            metadata.get("provider_payment_id"),
+            metadata.get("plan_id"),
+            metadata.get("action"),
         )
 
         user_id = int(metadata["user_id"])
@@ -4155,16 +4176,12 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
         )
     except Exception as e:
-        logger.error(
-            "Payment for user %s could not start fulfillment because the processing message failed: %s",
+        logger.warning(
+            "Payment fulfillment for user %s will continue without a processing message: %s",
             user_id,
             e,
-            exc_info=True,
         )
-        if pending_flag_set:
-            set_pending_payment(user_id, False)
-            pending_flag_set = False
-        return False
+        processing_message = _BestEffortProcessingMessage()
 
     try:
         # ── MTG Proxy branch ──────────────────────────────────────────────
