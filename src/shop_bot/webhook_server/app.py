@@ -164,6 +164,13 @@ def _is_trial_key(key: dict) -> bool:
     return _is_xui_key(key) and _key_plan_id(key) <= 0
 
 
+def _configured_trial_duration_days() -> float:
+    try:
+        return max(1.0, float(get_setting("trial_duration_days") or 1))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _user_has_paid_subscription(user: dict) -> bool:
     try:
         total_spent = float(user.get("total_spent") or 0)
@@ -179,14 +186,34 @@ def _user_int_field(user: dict, key: str) -> int:
         return 0
 
 
-def _key_is_trial_for_user(key: dict, user: dict | None = None) -> bool:
-    if not _is_xui_key(key):
+def _key_is_trial_for_user(
+    key: dict,
+    user: dict | None = None,
+    trial_duration_days: float | None = None,
+) -> bool:
+    if not _is_trial_key(key):
         return False
-    return _is_trial_key(key)
+
+    created = time_utils.parse_iso_to_msk(key.get("created_date"))
+    expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+    if not created or not expiry:
+        return True
+
+    configured_days = (
+        trial_duration_days
+        if trial_duration_days is not None
+        else _configured_trial_duration_days()
+    )
+    grace_seconds = 6 * 3600
+    return (expiry - created).total_seconds() <= (
+        configured_days * 86400 + grace_seconds
+    )
 
 
-def _key_is_trial_for_owner(key: dict) -> bool:
-    return _key_is_trial_for_user(key, key)
+def _key_is_trial_for_owner(
+    key: dict, trial_duration_days: float | None = None
+) -> bool:
+    return _key_is_trial_for_user(key, key, trial_duration_days)
 
 
 def _build_user_metrics(users: list[dict]) -> dict:
@@ -233,6 +260,7 @@ def _summarize_user_subscription(
     user: dict, keys: list[dict], now: datetime | None = None
 ) -> dict:
     now = now or time_utils.get_msk_now()
+    trial_duration_days = _configured_trial_duration_days()
     paid_active = 0
     trial_active = 0
     active_total = 0
@@ -244,7 +272,7 @@ def _summarize_user_subscription(
             continue
 
         expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-        is_trial_key = _key_is_trial_for_user(key, user)
+        is_trial_key = _key_is_trial_for_user(key, user, trial_duration_days)
         if not is_trial_key:
             paid_keys_total += 1
             if expiry and (latest_paid_expiry is None or expiry > latest_paid_expiry):
@@ -1653,11 +1681,12 @@ def create_webhook_app(bot_controller_instance):
 
                 cursor.execute(
                     """
-                    SELECT key_id, user_id, expiry_date, plan_id, service_type
+                    SELECT key_id, user_id, expiry_date, created_date, plan_id, service_type
                     FROM vpn_keys
                     WHERE COALESCE(service_type, 'xui') != 'mtg'
                     """
                 )
+                trial_duration_days = _configured_trial_duration_days()
                 paying_users: set[int] = set()
                 paid_transaction_users: set[int] = set()
                 trial_users: set[int] = set()
@@ -1690,7 +1719,9 @@ def create_webhook_app(bot_controller_instance):
                     state["has_xui_key"] = True
                     expiry_dt = time_utils.parse_iso_to_msk(key_row["expiry_date"])
                     is_active = bool(expiry_dt and expiry_dt > now)
-                    is_trial_key = _key_is_trial_for_user(key_row, state["user"])
+                    is_trial_key = _key_is_trial_for_user(
+                        key_row, state["user"], trial_duration_days
+                    )
                     if is_active:
                         state["has_active_xui_key"] = True
                     if not is_trial_key:
@@ -2710,6 +2741,7 @@ def create_webhook_app(bot_controller_instance):
             global_plan_ids = get_global_plan_ids()
         except Exception:
             global_plan_ids = set()
+        trial_duration_days = _configured_trial_duration_days()
 
         # Group keys by user and mark global ones
         users_map = {}
@@ -2729,7 +2761,12 @@ def create_webhook_app(bot_controller_instance):
             key["is_global"] = is_global_xui_key(
                 key, global_plan_ids, enabled_xui_hosts
             )
-            key["is_trial"] = _key_is_trial_for_owner(key)
+            key["is_trial"] = _key_is_trial_for_owner(key, trial_duration_days)
+            key["is_free_access"] = (
+                _is_xui_key(key)
+                and not key["is_trial"]
+                and _key_plan_id(key) <= 0
+            )
             key["expiry_status"] = _build_key_expiry_status(
                 key, is_trial=key["is_trial"], now=now
             )
@@ -2773,6 +2810,9 @@ def create_webhook_app(bot_controller_instance):
             user_data["user_keys"] = deduped_global + regular_keys
             user_data["is_trial"] = bool(deduped_global) and all(
                 key.get("is_trial") for key in deduped_global
+            )
+            user_data["is_free_access"] = bool(deduped_global) and all(
+                key.get("is_free_access") for key in deduped_global
             )
 
         grouped_users = sorted(users_map.values(), key=lambda u: u["username"])

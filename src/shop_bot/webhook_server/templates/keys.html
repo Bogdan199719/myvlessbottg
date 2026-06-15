@@ -127,10 +127,20 @@ content %}
                     data-key-search="{{ user.user_id }} {{ user.username }} global {% for g in global_keys %}{{ g.host_name }} {{ g.key_email }} {% endfor %}">
                     <td>—</td>
                     <td>
-                        <strong>{{ "Пробная подписка" if user.is_trial else "Глобальная подписка" }}</strong><br>
+                        <strong>
+                            {% if user.is_trial %}
+                                Пробная подписка
+                            {% elif user.is_free_access %}
+                                Бесплатная подписка
+                            {% else %}
+                                Глобальная подписка
+                            {% endif %}
+                        </strong><br>
                         <small>Серверов: {{ global_keys|length }}</small>
                         {% if user.is_trial %}
                         <br><small class="secret-hint">Триальный период</small>
+                        {% elif user.is_free_access %}
+                        <br><small class="secret-hint">Ручное начисление дней</small>
                         {% endif %}
                     </td>
                     <td><small>Multi-link</small></td>

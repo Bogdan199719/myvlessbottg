@@ -100,6 +100,7 @@ def main() -> int:
             "service_type": "xui",
             "plan_id": 1,
             "expiry_date": active_expiry,
+            "created_date": now.isoformat(),
         }
 
         free_summary = _summarize_user_subscription(
@@ -118,10 +119,23 @@ def main() -> int:
 
         trial_summary = _summarize_user_subscription(
             {"trial_used": 1, "paid_transaction_count": 0},
-            [{**base_key, "plan_id": 0}],
+            [
+                {
+                    **base_key,
+                    "plan_id": 0,
+                    "expiry_date": (now + timedelta(days=1)).isoformat(),
+                }
+            ],
             now,
         )
         assert trial_summary["status"] == "trial"
+
+        extended_trial_summary = _summarize_user_subscription(
+            {"trial_used": 1, "paid_transaction_count": 0},
+            [{**base_key, "plan_id": 0}],
+            now,
+        )
+        assert extended_trial_summary["status"] == "free"
 
         expired_free_summary = _summarize_user_subscription(
             {"paid_transaction_count": 0, "free_transaction_count": 1},
