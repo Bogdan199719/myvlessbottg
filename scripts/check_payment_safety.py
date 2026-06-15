@@ -43,7 +43,9 @@ def _has_final_pending_clear(source: str, fn: ast.AsyncFunctionDef) -> bool:
     )
 
 
-def _has_broad_cleanup_guard(source: str, fn: ast.AsyncFunctionDef, marker: str) -> bool:
+def _has_broad_cleanup_guard(
+    source: str, fn: ast.AsyncFunctionDef, marker: str
+) -> bool:
     text = _source_segment(source, fn)
     marker_index = text.find(marker)
     if marker_index < 0:
@@ -53,7 +55,9 @@ def _has_broad_cleanup_guard(source: str, fn: ast.AsyncFunctionDef, marker: str)
     return "try:" in prefix and "except Exception as e:" in suffix
 
 
-def _p2p_handlers_parse_command_args(source: str, functions: dict[str, ast.AST]) -> bool:
+def _p2p_handlers_parse_command_args(
+    source: str, functions: dict[str, ast.AST]
+) -> bool:
     for name in ("admin_approve_p2p_handler", "admin_decline_p2p_handler"):
         fn = functions.get(name)
         if not isinstance(fn, ast.AsyncFunctionDef):
@@ -71,7 +75,7 @@ def _execute_results_are_db_gated(source: str, fn: ast.AsyncFunctionDef) -> bool
     if "results.append(res)\n            if existing_key_db:" in text:
         return False
     required_fragments = (
-        "if not saved_key:",
+        "if not updated:",
         "if new_key_id is None:",
         "results.append(res)",
     )
@@ -95,7 +99,7 @@ def _global_fulfillment_is_complete_and_idempotent(
     execute_text = _source_segment(source, execute_fn)
     target_text = _source_segment(source, target_fn)
     required_process_fragments = (
-        "host_name == \"ALL\"",
+        'host_name == "ALL"',
         "_target_expiry_ms_for_global_payment(",
         "len(results) != len(hosts_to_process)",
         "return False",
@@ -106,12 +110,32 @@ def _global_fulfillment_is_complete_and_idempotent(
     )
     required_target_fragments = (
         "fulfillment_target_expiry_ms",
-        "metadata[\"fulfillment_target_expiry_ms\"]",
+        'metadata["fulfillment_target_expiry_ms"]',
     )
     return (
         all(fragment in process_text for fragment in required_process_fragments)
         and all(fragment in execute_text for fragment in required_execute_fragments)
         and all(fragment in target_text for fragment in required_target_fragments)
+    )
+
+
+def _promo_fulfillment_is_resumable(source: str, functions: dict[str, ast.AST]) -> bool:
+    promo_fn = functions.get("process_promo_code_handler")
+    if not isinstance(promo_fn, ast.AsyncFunctionDef):
+        return False
+    promo_text = _source_segment(source, promo_fn)
+    required_fragments = (
+        "set_promo_fulfillment_target(",
+        "promo_fulfillment_started = True",
+        "not promo_fulfillment_started",
+        "Повторите ввод этого же кода позже",
+    )
+    forbidden_fragments = (
+        "if not results:\n                release_promo_code_claim",
+        "if len(results) != len(hosts_to_process):\n                release_promo_code_claim",
+    )
+    return all(fragment in promo_text for fragment in required_fragments) and not any(
+        fragment in promo_text for fragment in forbidden_fragments
     )
 
 
@@ -128,8 +152,12 @@ def main() -> int:
         failures.append("process_successful_payment is missing")
     else:
         if not _has_final_pending_clear(source, process_fn):
-            failures.append("process_successful_payment must clear pending_payment in finally")
-        if not _has_broad_cleanup_guard(source, process_fn, "await bot.delete_message("):
+            failures.append(
+                "process_successful_payment must clear pending_payment in finally"
+            )
+        if not _has_broad_cleanup_guard(
+            source, process_fn, "await bot.delete_message("
+        ):
             failures.append("old payment-message cleanup must catch broad Exception")
         if not _has_broad_cleanup_guard(
             source, process_fn, "await processing_message.delete()"
@@ -139,7 +167,9 @@ def main() -> int:
     if not isinstance(execute_fn, ast.AsyncFunctionDef):
         failures.append("_execute_payment_for_hosts is missing")
     elif not _execute_results_are_db_gated(source, execute_fn):
-        failures.append("_execute_payment_for_hosts results must be gated by DB persistence")
+        failures.append(
+            "_execute_payment_for_hosts results must be gated by DB persistence"
+        )
 
     if not _global_fulfillment_is_complete_and_idempotent(source, functions):
         failures.append(
@@ -154,9 +184,15 @@ def main() -> int:
     else:
         promo_text = _source_segment(source, promo_fn)
         if "promo_applied = True" not in promo_text:
-            failures.append("promo handler must distinguish applied promo from reserved promo")
+            failures.append(
+                "promo handler must distinguish applied promo from reserved promo"
+            )
         if "promo and not promo_applied" not in promo_text:
             failures.append("promo handler must not release already-applied promos")
+        if not _promo_fulfillment_is_resumable(source, functions):
+            failures.append(
+                "promo fulfillment must persist its target and retain partial reservations"
+            )
 
     if failures:
         print("Payment safety checks FAILED:")

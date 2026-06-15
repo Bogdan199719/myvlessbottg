@@ -324,3 +324,13 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - YooKassa, CryptoBot и P2P этим правилом не затрагиваются.
 - Telegram Stars invoice с подтверждённым Telegram charge/provider id не истекают этим механизмом.
 - Правило запускается scheduler-ом и может быть выполнено вручную через `database.expire_stale_unpaid_stars_transactions(48)`.
+
+## Subscription business rules audit — 2026-06-15
+
+- Проверены paid, trial, promo, ручная выдача, корректировка срока и последующее платное продление на общей subscription-link.
+- `promo_code_redemptions` хранит `fulfillment_target_expiry_ms`: частичная выдача продолжает тот же резерв и не добавляет дни повторно на уже успешных хостах.
+- Trial, платёж, промокод, ручная выдача и начисление дней учитывают хост как успешный только после записи результата в SQLite.
+- Ручная глобальная выдача не начисляет `total_months`, если обработаны не все включённые XUI-хосты.
+- Админка отделяет active free-доступ (промокод/ручная выдача без реальной оплаты) от paid-подписок; Dashboard и Users используют один классификатор.
+- На live-БД не найдено одновременных active trial/paid состояний, trial-ключей при `trial_used=0` или расхождений дат между активными global-хостами.
+- Добавлен `scripts/check_subscription_business_rules.py` с временной БД; production SQLite он не изменяет.

@@ -85,6 +85,7 @@ docker compose up -d --build
 ```bash
 python3 -m compileall -q src scripts
 python3 scripts/check_payment_safety.py
+python3 scripts/check_subscription_business_rules.py
 python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
@@ -98,6 +99,8 @@ docker compose build
 ```
 
 `scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа.
+
+`scripts/check_subscription_business_rules.py` работает на временной SQLite и проверяет resumable-выдачу промокода и разделение paid/trial/free статусов. Продовые данные он не изменяет.
 По умолчанию скрипт маскирует Telegram ID и usernames в выводе, чтобы CI/аудиторские логи не раскрывали персональные данные. Для ручной локальной диагностики конкретных пользователей добавьте `--show-identities`.
 
 `scripts/check_xui_connection_equivalence.py` фиксирует правила сравнения ссылок 3x-ui. Панель может каждый раз отдавать новые `sid`/`spx` для Reality-ссылок, поэтому scheduler не должен считать такие ссылки рассинхроном, если стабильные параметры подключения не изменились.

@@ -269,6 +269,7 @@ def initialize_db():
                     user_id INTEGER NOT NULL,
                     redeemed_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'reserved',
+                    fulfillment_target_expiry_ms INTEGER,
                     UNIQUE (promo_id, user_id)
                 )
             """)
@@ -775,9 +776,17 @@ def run_migration():
                     user_id INTEGER NOT NULL,
                     redeemed_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'reserved',
+                    fulfillment_target_expiry_ms INTEGER,
                     UNIQUE (promo_id, user_id)
                 )
             """)
+            cursor.execute("PRAGMA table_info(promo_code_redemptions)")
+            promo_redemption_cols = [row[1] for row in cursor.fetchall()]
+            if "fulfillment_target_expiry_ms" not in promo_redemption_cols:
+                cursor.execute(
+                    "ALTER TABLE promo_code_redemptions "
+                    "ADD COLUMN fulfillment_target_expiry_ms INTEGER"
+                )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_promo_redemptions_promo_status ON promo_code_redemptions(promo_id, status)"
             )
@@ -2790,7 +2799,7 @@ def update_key_info(
     expiry_date: datetime,
     connection_string: str | None = None,
     xui_client_uuid: str | None = None,
-):
+) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -2808,8 +2817,10 @@ def update_key_info(
                 tuple(values),
             )
             conn.commit()
+            return cursor.rowcount == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to update key {key_id}: {e}")
+        return False
 
 
 def update_key_connection_string(key_id: int, connection_string: str):
@@ -2825,7 +2836,7 @@ def update_key_connection_string(key_id: int, connection_string: str):
         logging.error(f"Failed to update connection string for key {key_id}: {e}")
 
 
-def update_key_plan_id(key_id: int, plan_id: int):
+def update_key_plan_id(key_id: int, plan_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -2834,8 +2845,10 @@ def update_key_plan_id(key_id: int, plan_id: int):
                 (int(plan_id), int(key_id)),
             )
             conn.commit()
+            return cursor.rowcount == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to update plan_id for key {key_id}: {e}")
+        return False
 
 
 import re
@@ -4036,6 +4049,26 @@ def claim_promo_code(code: str, user_id: int) -> tuple[str, dict | None]:
                 return "not_found", None
 
             promo = dict(promo_row)
+            cursor.execute(
+                """
+                SELECT status, fulfillment_target_expiry_ms
+                FROM promo_code_redemptions
+                WHERE promo_id = ? AND user_id = ?
+                """,
+                (promo["promo_id"], int(user_id)),
+            )
+            existing_redemption = cursor.fetchone()
+            if existing_redemption:
+                if existing_redemption["status"] == "applied":
+                    conn.rollback()
+                    return "already_used", promo
+                if existing_redemption["status"] == "reserved":
+                    promo["fulfillment_target_expiry_ms"] = existing_redemption[
+                        "fulfillment_target_expiry_ms"
+                    ]
+                    conn.commit()
+                    return "ok", promo
+
             if not bool(promo.get("is_active")):
                 conn.rollback()
                 return "inactive", promo
@@ -4044,18 +4077,6 @@ def claim_promo_code(code: str, user_id: int) -> tuple[str, dict | None]:
             if expires_at and expires_at < time_utils.get_msk_now():
                 conn.rollback()
                 return "expired", promo
-
-            cursor.execute(
-                """
-                SELECT 1
-                FROM promo_code_redemptions
-                WHERE promo_id = ? AND user_id = ? AND status IN ('reserved', 'applied')
-                """,
-                (promo["promo_id"], int(user_id)),
-            )
-            if cursor.fetchone():
-                conn.rollback()
-                return "already_used", promo
 
             cursor.execute(
                 """
@@ -4085,6 +4106,57 @@ def claim_promo_code(code: str, user_id: int) -> tuple[str, dict | None]:
     except sqlite3.Error as e:
         logging.error(f"Failed to claim promo code {normalized}: {e}")
         return "error", None
+
+
+def set_promo_fulfillment_target(
+    promo_id: int, user_id: int, target_expiry_ms: int
+) -> int | None:
+    """Persist and return the stable expiry for a reserved promo fulfillment."""
+    try:
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT fulfillment_target_expiry_ms
+                FROM promo_code_redemptions
+                WHERE promo_id = ? AND user_id = ? AND status = 'reserved'
+                """,
+                (int(promo_id), int(user_id)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+
+            existing_target = row["fulfillment_target_expiry_ms"]
+            if existing_target:
+                conn.commit()
+                return int(existing_target)
+
+            cursor.execute(
+                """
+                UPDATE promo_code_redemptions
+                SET fulfillment_target_expiry_ms = ?
+                WHERE promo_id = ? AND user_id = ? AND status = 'reserved'
+                  AND fulfillment_target_expiry_ms IS NULL
+                """,
+                (int(target_expiry_ms), int(promo_id), int(user_id)),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+            return int(target_expiry_ms)
+    except sqlite3.Error as e:
+        logging.error(
+            "Failed to persist promo fulfillment target %s/%s: %s",
+            promo_id,
+            user_id,
+            e,
+        )
+        return None
 
 
 def mark_promo_code_applied(promo_id: int, user_id: int) -> bool:

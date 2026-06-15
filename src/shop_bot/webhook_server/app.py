@@ -169,11 +169,7 @@ def _user_has_paid_subscription(user: dict) -> bool:
         total_spent = float(user.get("total_spent") or 0)
     except (TypeError, ValueError):
         total_spent = 0
-    try:
-        total_months = int(user.get("total_months") or 0)
-    except (TypeError, ValueError):
-        total_months = 0
-    return total_spent > 0 or total_months > 0
+    return total_spent > 0 or _user_int_field(user, "paid_transaction_count") > 0
 
 
 def _user_int_field(user: dict, key: str) -> int:
@@ -198,6 +194,7 @@ def _build_user_metrics(users: list[dict]) -> dict:
         "total_users": len(users),
         "paid_users": 0,
         "paid_expired_users": 0,
+        "free_users": 0,
         "trial_users": 0,
         "trial_expired_users": 0,
         "payment_pending_users": 0,
@@ -213,6 +210,8 @@ def _build_user_metrics(users: list[dict]) -> dict:
             metrics["paid_users"] += 1
         elif status == "paid_expired":
             metrics["paid_expired_users"] += 1
+        elif status == "free":
+            metrics["free_users"] += 1
         elif status == "trial":
             metrics["trial_users"] += 1
         elif status == "trial_expired":
@@ -261,7 +260,7 @@ def _summarize_user_subscription(
         else:
             paid_active += 1
 
-    has_paid_history = _user_has_paid_subscription(user) or paid_keys_total > 0
+    has_paid_purchase = _user_has_paid_subscription(user)
     has_pending_payment = _user_int_field(user, "pending_transaction_count") > 0
     has_free_access_history = _user_int_field(user, "free_transaction_count") > 0
     has_support_history = (
@@ -273,15 +272,19 @@ def _summarize_user_subscription(
         status = "banned"
         label = "Забанен"
         css_class = "status-banned"
-    elif paid_active > 0:
+    elif paid_active > 0 and has_paid_purchase:
         status = "paid"
         label = "Платная подписка"
         css_class = "status-active"
+    elif paid_active > 0:
+        status = "free"
+        label = "Бесплатный доступ"
+        css_class = "status-info"
     elif trial_active > 0:
         status = "trial"
         label = "Пробная подписка"
         css_class = "status-trial"
-    elif has_paid_history:
+    elif has_paid_purchase:
         status = "paid_expired"
         label = "Платная истекла"
         css_class = "status-warning"
@@ -293,7 +296,7 @@ def _summarize_user_subscription(
         status = "payment_pending"
         label = "Счёт не оплачен"
         css_class = "status-pending"
-    elif has_free_access_history:
+    elif has_free_access_history or paid_keys_total > 0:
         status = "free_expired"
         label = "Бесплатный доступ истёк"
         css_class = "status-info"
@@ -1568,6 +1571,7 @@ def create_webhook_app(bot_controller_instance):
                 "paid_subscription_users": 0,
                 "active_subscriptions": 0,
                 "active_paid_subscriptions": 0,
+                "active_free_subscriptions": 0,
                 "active_access_subscriptions": 0,
                 "expired_paid_subscriptions": 0,
                 "expired_subscriptions": 0,
@@ -1870,7 +1874,12 @@ def create_webhook_app(bot_controller_instance):
                         ),
                         "active_subscriptions": user_status_counts["paid_users"],
                         "active_paid_subscriptions": user_status_counts["paid_users"],
-                        "active_access_subscriptions": user_status_counts["paid_users"],
+                        "active_free_subscriptions": user_status_counts["free_users"],
+                        "active_access_subscriptions": (
+                            user_status_counts["paid_users"]
+                            + user_status_counts["free_users"]
+                            + user_status_counts["trial_users"]
+                        ),
                         "expired_paid_subscriptions": user_status_counts[
                             "paid_expired_users"
                         ],
@@ -2853,9 +2862,16 @@ def create_webhook_app(bot_controller_instance):
                     expiry_dt = time_utils.from_timestamp_ms(
                         result["expiry_timestamp_ms"]
                     )
-                    update_key_info(
+                    updated = update_key_info(
                         k["key_id"], expiry_dt, result.get("connection_string")
                     )
+                    if not updated:
+                        logger.error(
+                            "Admin duration adjustment succeeded on host %s but DB update failed for key_id=%s.",
+                            k["host_name"],
+                            k["key_id"],
+                        )
+                        continue
                     success_count += 1
                     new_expiry_date = expiry_dt
 
@@ -3328,14 +3344,21 @@ def create_webhook_app(bot_controller_instance):
                                 expiry_dt = time_utils.from_timestamp_ms(
                                     result["expiry_timestamp_ms"]
                                 )
-                                update_key_info(
+                                updated = update_key_info(
                                     existing_key_db["key_id"],
                                     expiry_dt,
                                     result["connection_string"],
                                 )
-                                update_key_plan_id(
+                                updated = updated and update_key_plan_id(
                                     existing_key_db["key_id"], int(plan["plan_id"])
                                 )
+                                if not updated:
+                                    logger.error(
+                                        "Manual global issue updated host %s but DB update failed for key_id=%s.",
+                                        h["host_name"],
+                                        existing_key_db["key_id"],
+                                    )
+                                    continue
                                 issued_count += 1
                         else:
                             # Create new key
@@ -3350,7 +3373,7 @@ def create_webhook_app(bot_controller_instance):
                                 )
                             )
                             if result:
-                                add_new_key(
+                                new_key_id = add_new_key(
                                     user_id=user_id,
                                     host_name=h["host_name"],
                                     xui_client_uuid=result["client_uuid"],
@@ -3359,6 +3382,12 @@ def create_webhook_app(bot_controller_instance):
                                     connection_string=result["connection_string"],
                                     plan_id=plan["plan_id"],
                                 )
+                                if new_key_id is None:
+                                    logger.error(
+                                        "Manual global issue created host %s but DB persistence failed.",
+                                        h["host_name"],
+                                    )
+                                    continue
                                 issued_count += 1
                     except Exception as e_h:
                         logger.error(
@@ -3368,6 +3397,19 @@ def create_webhook_app(bot_controller_instance):
                     flash(
                         "Не удалось создать/обновить ни один ключ на серверах XUI.",
                         "danger",
+                    )
+                    return redirect(url_for("users_page"))
+                if issued_count != len(hosts):
+                    logger.error(
+                        "Manual global issue incomplete for user %s: %s/%s hosts.",
+                        user_id,
+                        issued_count,
+                        len(hosts),
+                    )
+                    flash(
+                        f"Подписка выдана не полностью: {issued_count} из {len(hosts)} серверов. "
+                        "Статистика не начислена; проверьте недоступные хосты и повторите операцию.",
+                        "warning",
                     )
                     return redirect(url_for("users_page"))
 
@@ -3397,16 +3439,26 @@ def create_webhook_app(bot_controller_instance):
                             expiry_dt = time_utils.from_timestamp_ms(
                                 result["expiry_timestamp_ms"]
                             )
-                            update_key_info(
+                            updated = update_key_info(
                                 existing_key_db["key_id"],
                                 expiry_dt,
                                 result["connection_string"],
                             )
-                            update_key_plan_id(
+                            updated = updated and update_key_plan_id(
                                 existing_key_db["key_id"], int(plan["plan_id"])
                             )
-                            primary_key_id = existing_key_db["key_id"]
-                            issued_count += 1
+                            if not updated:
+                                logger.error(
+                                    "Manual issue updated host %s but DB update failed for key_id=%s.",
+                                    host_name,
+                                    existing_key_db["key_id"],
+                                )
+                                result = None
+                            if not result:
+                                issued_count = 0
+                            else:
+                                primary_key_id = existing_key_db["key_id"]
+                                issued_count += 1
                     else:
                         # Create new
                         key_number = get_next_key_number(user_id)
@@ -3432,8 +3484,9 @@ def create_webhook_app(bot_controller_instance):
                                 connection_string=result["connection_string"],
                                 plan_id=plan["plan_id"],
                             )
-                            primary_key_id = new_key_id
-                            issued_count += 1
+                            if new_key_id is not None:
+                                primary_key_id = new_key_id
+                                issued_count += 1
 
                     if issued_count > 0:
                         msg = f"Подписка на сервер {host_name} успешно выдана!"

@@ -72,6 +72,7 @@ from shop_bot.data_manager.database import (
     get_global_plan_ids,
     is_global_xui_key,
     claim_promo_code,
+    set_promo_fulfillment_target,
     mark_promo_code_applied,
     release_promo_code_claim,
     normalize_promo_code,
@@ -1671,18 +1672,25 @@ def get_user_router() -> Router:
                 if not result:
                     continue
 
-                results.append(result)
                 expiry_datetime = time_utils.from_timestamp_ms(
                     result["expiry_timestamp_ms"]
                 )
                 if existing_trial_key:
-                    update_key_info(
+                    updated = update_key_info(
                         existing_trial_key["key_id"],
                         expiry_datetime,
                         result["connection_string"],
+                        xui_client_uuid=result.get("client_uuid"),
                     )
+                    if not updated:
+                        logger.error(
+                            "Trial key was updated on host %s but DB update failed for key_id=%s.",
+                            current_host_name,
+                            existing_trial_key["key_id"],
+                        )
+                        continue
                 else:
-                    add_new_key(
+                    new_key_id = add_new_key(
                         user_id=user_id,
                         host_name=current_host_name,
                         xui_client_uuid=result["client_uuid"],
@@ -1691,6 +1699,13 @@ def get_user_router() -> Router:
                         connection_string=result["connection_string"],
                         plan_id=0,
                     )
+                    if new_key_id is None:
+                        logger.error(
+                            "Trial key was created on host %s but DB persistence failed.",
+                            current_host_name,
+                        )
+                        continue
+                results.append(result)
 
             if not results:
                 release_trial_claim(user_id)
@@ -1797,6 +1812,7 @@ def get_user_router() -> Router:
 
         promo = None
         promo_applied = False
+        promo_fulfillment_started = False
         processing_message = None
         try:
             status, promo = claim_promo_code(code, user_id)
@@ -1871,10 +1887,23 @@ def get_user_router() -> Router:
                 await processing_message.edit_text(prep_error)
                 return
 
-            promo_metadata: dict = {}
-            target_expiry_ms = _target_expiry_ms_for_global_payment(
-                user_id, duration_days, hosts_to_process, promo_metadata
-            )
+            target_expiry_ms = promo.get("fulfillment_target_expiry_ms")
+            if not target_expiry_ms:
+                promo_metadata: dict = {}
+                calculated_target = _target_expiry_ms_for_global_payment(
+                    user_id, duration_days, hosts_to_process, promo_metadata
+                )
+                target_expiry_ms = set_promo_fulfillment_target(
+                    int(promo["promo_id"]), user_id, calculated_target
+                )
+            if not target_expiry_ms:
+                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                await processing_message.edit_text(
+                    "❌ Не удалось зафиксировать срок подписки по промокоду."
+                )
+                return
+
+            promo_fulfillment_started = True
             results, _primary_key_id = await _execute_payment_for_hosts(
                 user_id=user_id,
                 purchase_host_name="ALL",
@@ -1887,13 +1916,12 @@ def get_user_router() -> Router:
             )
 
             if not results:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
                 await processing_message.edit_text(
-                    "❌ Не удалось активировать подписку по промокоду."
+                    "❌ Не удалось активировать подписку по промокоду. "
+                    "Повторите ввод этого же кода позже."
                 )
                 return
             if len(results) != len(hosts_to_process):
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
                 successful_hosts = {r.get("host_name") for r in results}
                 failed_hosts = [
                     host
@@ -1908,14 +1936,15 @@ def get_user_router() -> Router:
                     failed_hosts,
                 )
                 await processing_message.edit_text(
-                    "❌ Не удалось активировать подписку на всех серверах. Попробуйте позже."
+                    "❌ Не удалось активировать подписку на всех серверах. "
+                    "Повторите ввод этого же кода позже: уже выданные дни повторно не начислятся."
                 )
                 return
 
             if not mark_promo_code_applied(int(promo["promo_id"]), user_id):
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
                 await processing_message.edit_text(
-                    "❌ Не удалось зафиксировать применение промокода."
+                    "❌ Доступ выдан, но применение промокода не зафиксировано. "
+                    "Повторите ввод этого же кода позже."
                 )
                 return
             promo_applied = True
@@ -2014,7 +2043,7 @@ def get_user_router() -> Router:
                 logger.warning("Promo admin purchase notification failed: %s", e)
 
         except Exception as e:
-            if promo and not promo_applied:
+            if promo and not promo_applied and not promo_fulfillment_started:
                 release_promo_code_claim(int(promo["promo_id"]), user_id)
             logger.error(
                 f"Error applying promo code {code} for user {user_id}: {e}",
@@ -3966,18 +3995,19 @@ async def _execute_payment_for_hosts(
                 expiry_datetime = time_utils.from_timestamp_ms(
                     res["expiry_timestamp_ms"]
                 )
-                update_key_info(
+                updated = update_key_info(
                     existing_key_db["key_id"],
                     expiry_datetime,
                     res["connection_string"],
                     xui_client_uuid=res.get("client_uuid"),
                 )
                 if action == "new" or purchase_host_name == "ALL":
-                    update_key_plan_id(existing_key_db["key_id"], int(plan_id))
-                saved_key = get_key_by_id(existing_key_db["key_id"])
-                if not saved_key:
+                    updated = updated and update_key_plan_id(
+                        existing_key_db["key_id"], int(plan_id)
+                    )
+                if not updated:
                     logger.error(
-                        "XUI key was updated on host %s but DB key_id=%s is missing.",
+                        "XUI key was updated on host %s but DB update failed for key_id=%s.",
                         h_name,
                         existing_key_db["key_id"],
                     )
@@ -4012,12 +4042,13 @@ async def _execute_payment_for_hosts(
                 expiry_datetime = time_utils.from_timestamp_ms(
                     res["expiry_timestamp_ms"]
                 )
-                update_key_info(key_id, expiry_datetime, res["connection_string"])
-                update_key_plan_id(key_id, int(plan_id))
-                saved_key = get_key_by_id(key_id)
-                if not saved_key:
+                updated = update_key_info(
+                    key_id, expiry_datetime, res["connection_string"]
+                )
+                updated = updated and update_key_plan_id(key_id, int(plan_id))
+                if not updated:
                     logger.error(
-                        "XUI key was extended on host %s but DB key_id=%s is missing.",
+                        "XUI key was extended on host %s but DB update failed for key_id=%s.",
                         h_name,
                         key_id,
                     )

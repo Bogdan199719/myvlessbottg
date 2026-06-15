@@ -20,6 +20,10 @@
 			<strong>{{ user_metrics.paid_expired_users }}</strong>
 		</div>
 		<div class="admin-summary-card">
+			<span>Бесплатный доступ</span>
+			<strong>{{ user_metrics.free_users }}</strong>
+		</div>
+		<div class="admin-summary-card">
 			<span>Пробные</span>
 			<strong>{{ user_metrics.trial_users }}</strong>
 		</div>
@@ -52,6 +56,7 @@
 				<button type="button" class="filter-chip is-active" data-user-filter="all">Все</button>
 				<button type="button" class="filter-chip" data-user-filter="paid">Платные</button>
 				<button type="button" class="filter-chip" data-user-filter="paid_expired">Платные истекли</button>
+				<button type="button" class="filter-chip" data-user-filter="free">Бесплатный доступ</button>
 				<button type="button" class="filter-chip" data-user-filter="trial">Пробные</button>
 				<button type="button" class="filter-chip" data-user-filter="trial_expired">Пробные истекли</button>
 				<button type="button" class="filter-chip" data-user-filter="payment_pending">Счёт не оплачен</button>
@@ -99,6 +104,9 @@
 							<small>
 								платная подписка{% if subscription.latest_paid_expiry %}: {{ subscription.latest_paid_expiry.strftime('%d.%m.%Y %H:%M') }}{% endif %}
 							</small>
+							{% elif subscription.status == 'free' %}
+							<strong>Активная</strong>
+							<small>бесплатная выдача или промокод</small>
 							{% elif subscription.status == 'trial' %}
 							<strong>Активная</strong>
 							<small>пробная подписка</small>
