@@ -19,8 +19,8 @@ from shop_bot.modules import mtg_api
 from shop_bot.bot import handlers, keyboards
 
 CHECK_INTERVAL_SECONDS = 60
-PAID_NOTIFY_HOURS = {24, 1, 0, -24}
-TRIAL_NOTIFY_HOURS = {1, 0, -24}
+PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}
+TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}
 
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 _HOST_FAILURE_BACKOFF_SECONDS = 15 * 60
@@ -130,7 +130,7 @@ async def send_subscription_notification(
             )
             btn_text = "➕ Восстановить доступ"
             callback_data = "select_host_new_ALL"
-        else:  # -24 follow-up
+        elif time_left_hours == -24:
             message = (
                 f"✨ <b>Внимание!</b> ✨\n\n"
                 f"☀️ Солнышко, твоя подписка закончилась вчера. "
@@ -138,6 +138,24 @@ async def send_subscription_notification(
                 f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Купить подписку"
+            callback_data = "select_host_new_ALL"
+        elif time_left_hours == -72:
+            message = (
+                "☀️ <b>Проверка связи!</b>\n\n"
+                "Твоя подписка уже 3 дня отдыхает без тебя. "
+                "Если интернет снова начал капризничать, можно быстро вернуть доступ одной кнопкой 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "➕ Вернуть доступ"
+            callback_data = "select_host_new_ALL"
+        else:  # -168 follow-up
+            message = (
+                "📡 <b>Твой VPN передаёт сигнал</b>\n\n"
+                "Подписка закончилась неделю назад. Если доступ ещё нужен, "
+                "его можно восстановить без новой настройки — просто продли подписку.\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "💳 Восстановить VPN"
             callback_data = "select_host_new_ALL"
 
         builder = InlineKeyboardBuilder()
@@ -191,7 +209,7 @@ async def send_global_subscription_notification(
                 f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Восстановить доступ"
-        else:  # -24 follow-up
+        elif time_left_hours == -24:
             message = (
                 f"✨ <b>Внимание!</b> ✨\n\n"
                 f"☀️ Солнышко, твоя подписка закончилась вчера. "
@@ -199,6 +217,22 @@ async def send_global_subscription_notification(
                 f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "💳 Купить подписку"
+        elif time_left_hours == -72:
+            message = (
+                "☀️ <b>Проверка связи!</b>\n\n"
+                "Твоя подписка уже 3 дня отдыхает без тебя. "
+                "Если интернет снова начал капризничать, можно быстро вернуть доступ одной кнопкой 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "➕ Вернуть доступ"
+        else:  # -168 follow-up
+            message = (
+                "📡 <b>Твой VPN передаёт сигнал</b>\n\n"
+                "Подписка закончилась неделю назад. Если доступ ещё нужен, "
+                "его можно восстановить без новой настройки — просто продли подписку.\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "💳 Восстановить VPN"
 
         builder = InlineKeyboardBuilder()
         builder.button(text=btn_text, callback_data="select_host_new_ALL")
@@ -251,11 +285,29 @@ async def send_proxy_expiry_notification(
             )
             btn_text = "➕ Активировать прокси"
             callback_data = f"extend_key_{key_id}"
-        else:  # -24 follow-up
+        elif time_left_hours == -24:
             message = (
                 f"✨ <b>Внимание!</b> ✨\n\n"
                 f"☀️ Солнышко, твой Telegram-прокси закончился вчера. "
                 f"Продли его, чтобы всё снова было хорошо 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "➕ Купить прокси"
+            callback_data = "buy_proxy"
+        elif time_left_hours == -72:
+            message = (
+                "☀️ <b>Проверка связи!</b>\n\n"
+                "Твой Telegram-прокси уже 3 дня отдыхает без тебя. "
+                "Если он снова нужен, можно быстро вернуть доступ одной кнопкой 💕\n\n"
+                f"Дата окончания: <b>{expiry_str}</b>"
+            )
+            btn_text = "➕ Вернуть прокси"
+            callback_data = f"extend_key_{key_id}"
+        else:  # -168 follow-up
+            message = (
+                "📡 <b>Твой прокси передаёт сигнал</b>\n\n"
+                "Доступ закончился неделю назад. Если прокси ещё нужен, "
+                "его можно восстановить без новой настройки.\n\n"
                 f"Дата окончания: <b>{expiry_str}</b>"
             )
             btn_text = "➕ Купить прокси"

@@ -23,8 +23,12 @@ def main() -> int:
     app_source = (root / "src/shop_bot/webhook_server/app.py").read_text(
         encoding="utf-8"
     )
+    scheduler_source = (
+        root / "src/shop_bot/data_manager/scheduler.py"
+    ).read_text(encoding="utf-8")
     ast.parse(handlers_source)
     ast.parse(app_source)
+    ast.parse(scheduler_source)
     assert (
         "Trial key was created on host %s but DB persistence failed." in handlers_source
     )
@@ -34,6 +38,10 @@ def main() -> int:
     assert "без изменения даты окончания" in handlers_source
     assert "if issued_count != len(hosts):" in app_source
     assert "Статистика не начислена" in app_source
+    assert "PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}" in scheduler_source
+    assert "TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}" in scheduler_source
+    assert "Твоя подписка уже 3 дня отдыхает без тебя" in scheduler_source
+    assert "Подписка закончилась неделю назад" in scheduler_source
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         os.environ["DB_PATH"] = str(Path(tmp_dir) / "test.db")
