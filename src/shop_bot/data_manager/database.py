@@ -3693,6 +3693,48 @@ def get_all_users() -> list[dict]:
         return []
 
 
+def get_idle_onboarding_users(
+    min_age_hours: int, max_age_hours: int, limit: int = 100
+) -> list[dict]:
+    """Return users who registered but never started any subscription flow."""
+    now = time_utils.get_msk_now()
+    candidates: list[dict] = []
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT u.telegram_id, u.username, u.registration_date
+                FROM users u
+                WHERE COALESCE(u.is_banned, 0) = 0
+                  AND COALESCE(u.agreed_to_terms, 0) = 1
+                  AND COALESCE(u.trial_used, 0) = 0
+                  AND u.registration_date IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vpn_keys k WHERE k.user_id = u.telegram_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM transactions t WHERE t.user_id = u.telegram_id
+                  )
+                ORDER BY u.registration_date ASC
+                """
+            )
+            for row in cursor.fetchall():
+                registered_at = time_utils.parse_iso_to_msk(row["registration_date"])
+                if not registered_at:
+                    continue
+                age_hours = (now - registered_at).total_seconds() / 3600
+                if min_age_hours <= age_hours < max_age_hours:
+                    candidates.append(dict(row))
+                    if len(candidates) >= limit:
+                        break
+            return candidates
+    except sqlite3.Error as e:
+        logging.error(f"Failed to get idle onboarding users: {e}")
+        return []
+
+
 def ban_user(telegram_id: int):
     try:
         with sqlite3.connect(DB_FILE) as conn:

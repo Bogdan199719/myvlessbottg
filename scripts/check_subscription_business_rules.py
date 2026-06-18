@@ -40,8 +40,11 @@ def main() -> int:
     assert "Статистика не начислена" in app_source
     assert "PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}" in scheduler_source
     assert "TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}" in scheduler_source
+    assert "ONBOARDING_IDLE_NOTIFY_HOURS = (3, 24, 72)" in scheduler_source
+    assert 'ONBOARDING_IDLE_NOTIFICATION_TYPE = "onboarding_idle"' in scheduler_source
     assert "Твоя подписка уже 3 дня отдыхает без тебя" in scheduler_source
     assert "Подписка закончилась неделю назад" in scheduler_source
+    assert "Ты заходил посмотреть VPN" in scheduler_source
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         os.environ["DB_PATH"] = str(Path(tmp_dir) / "test.db")
@@ -54,8 +57,25 @@ def main() -> int:
         database.run_migration()
         database.register_user_if_not_exists(101, "promo-user", None)
         database.register_user_if_not_exists(102, "referrer", None)
+        database.register_user_if_not_exists(103, "idle-user", None)
+        database.register_user_if_not_exists(104, "trial-used-user", None)
+        database.register_user_if_not_exists(105, "key-user", None)
+        database.register_user_if_not_exists(106, "tx-user", None)
 
         with sqlite3.connect(database.DB_FILE) as conn:
+            old_registration = (
+                time_utils.get_msk_now() - timedelta(hours=3, minutes=15)
+            ).isoformat()
+            for user_id in (103, 104, 105, 106):
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET registration_date = ?, agreed_to_terms = 1
+                    WHERE telegram_id = ?
+                    """,
+                    (old_registration, user_id),
+                )
+            conn.execute("UPDATE users SET trial_used = 1 WHERE telegram_id = 104")
             conn.execute(
                 """
                 INSERT INTO vpn_keys
@@ -76,6 +96,33 @@ def main() -> int:
                 ),
             )
             key_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                """
+                INSERT INTO vpn_keys
+                    (user_id, host_name, xui_client_uuid, key_email, expiry_date,
+                     created_date, connection_string, plan_id, service_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    105,
+                    "test-host",
+                    "client-105",
+                    "user105-global-testhost",
+                    time_utils.get_msk_now() + timedelta(days=1),
+                    time_utils.get_msk_now(),
+                    "vless://105",
+                    0,
+                    "xui",
+                ),
+            )
+
+        assert database.create_pending_transaction("idle-filter-tx", 106, 100.0, {})
+        idle_users = database.get_idle_onboarding_users(3, 5, 10)
+        idle_ids = {int(user["telegram_id"]) for user in idle_users}
+        assert 103 in idle_ids
+        assert 104 not in idle_ids
+        assert 105 not in idle_ids
+        assert 106 not in idle_ids
 
         assert database.update_key_info(
             key_id,

@@ -21,6 +21,9 @@ from shop_bot.bot import handlers, keyboards
 CHECK_INTERVAL_SECONDS = 60
 PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}
 TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}
+ONBOARDING_IDLE_NOTIFY_HOURS = (3, 24, 72)
+ONBOARDING_IDLE_WINDOW_HOURS = 2
+ONBOARDING_IDLE_NOTIFICATION_TYPE = "onboarding_idle"
 
 _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 _HOST_FAILURE_BACKOFF_SECONDS = 15 * 60
@@ -336,6 +339,118 @@ async def send_proxy_expiry_notification(
     except Exception as e:
         logger.error(f"Error sending proxy expiry notification to user {user_id}: {e}")
         return False
+
+
+async def send_idle_onboarding_notification(
+    bot: Bot, user_id: int, hours_mark: int
+) -> bool:
+    try:
+        trial_enabled = _bool_setting("trial_enabled", default=True)
+
+        if hours_mark == 3:
+            message = (
+                "☀️ <b>Ты заходил посмотреть VPN, но ещё не включил доступ.</b>\n\n"
+                "Можно начать без оплаты: забери пробный период и проверь скорость "
+                "на своих устройствах."
+            )
+            primary_text = "🎁 Попробовать бесплатно"
+        elif hours_mark == 24:
+            message = (
+                "✨ <b>Маленькое напоминание</b>\n\n"
+                "VPN пригодится, когда сайты не открываются, видео тормозит или "
+                "нужен стабильный доступ в дороге.\n\n"
+                "У тебя всё ещё доступен бесплатный пробный период — можно проверить без оплаты."
+            )
+            primary_text = "🎁 Забрать пробный доступ"
+        else:
+            message = (
+                "👋 <b>Последнее напоминание</b>\n\n"
+                "Ты заходил в бот, но так и не подключил VPN. Если доступ ещё актуален, "
+                "можно начать с пробного периода или сразу выбрать подписку."
+            )
+            primary_text = "🎁 Попробовать бесплатно"
+
+        builder = InlineKeyboardBuilder()
+        if trial_enabled:
+            builder.button(text=primary_text, callback_data="get_trial")
+        builder.button(text="💳 Купить подписку", callback_data="buy_subscription")
+        builder.adjust(1)
+
+        await bot.send_message(
+            chat_id=user_id,
+            text=message,
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML",
+        )
+        logger.info(
+            "Sent idle onboarding notification to user %s (%s hours after registration).",
+            user_id,
+            hours_mark,
+        )
+        return True
+    except TelegramForbiddenError as e:
+        logger.warning(
+            "Cannot send idle onboarding notification to user %s: %s. Marking as handled.",
+            user_id,
+            e,
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            "Error sending idle onboarding notification to user %s: %s",
+            user_id,
+            e,
+        )
+        return False
+
+
+async def check_idle_onboarding_users(bot: Bot):
+    logger.info("Scheduler: Checking for idle onboarding users...")
+    for hours_mark in ONBOARDING_IDLE_NOTIFY_HOURS:
+        min_age = hours_mark
+        max_age = hours_mark + ONBOARDING_IDLE_WINDOW_HOURS
+        candidates = await asyncio.to_thread(
+            database.get_idle_onboarding_users,
+            min_age,
+            max_age,
+            100,
+        )
+        if not candidates:
+            continue
+
+        for user in candidates:
+            try:
+                user_id = int(user["telegram_id"])
+            except (TypeError, ValueError):
+                continue
+
+            already_sent = await asyncio.to_thread(
+                database.is_notification_sent,
+                user_id,
+                None,
+                ONBOARDING_IDLE_NOTIFICATION_TYPE,
+                hours_mark,
+            )
+            if already_sent:
+                continue
+
+            sent_ok = await send_idle_onboarding_notification(
+                bot, user_id, hours_mark
+            )
+            if sent_ok:
+                await asyncio.to_thread(
+                    database.mark_notification_sent,
+                    user_id,
+                    None,
+                    ONBOARDING_IDLE_NOTIFICATION_TYPE,
+                    hours_mark,
+                )
+            else:
+                logger.warning(
+                    "Scheduler: Idle onboarding notification failed for user=%s mark=%s; not marking as sent.",
+                    user_id,
+                    hours_mark,
+                )
 
 
 async def _process_notification(
@@ -1535,6 +1650,7 @@ async def periodic_subscription_check(bot_controller: BotController):
                     await process_pending_paid_provider_retries(bot)
                     await expire_stale_unpaid_stars_payments()
                     await check_expiring_subscriptions(bot)
+                    await check_idle_onboarding_users(bot)
                 else:
                     logger.warning(
                         "Scheduler: Bot is marked as running, but instance is not available."
