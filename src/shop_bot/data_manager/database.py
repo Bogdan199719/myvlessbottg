@@ -20,6 +20,26 @@ def _now_iso() -> str:
     return time_utils.get_msk_now().isoformat()
 
 
+def _local_datetime_text(value: str | datetime | None) -> str | None:
+    """Return a stable MSK wall-clock timestamp for SQLite string comparisons."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return time_utils.to_msk(value).replace(tzinfo=None).isoformat(
+            sep=" ", timespec="seconds"
+        )
+    raw = str(value).strip().replace("T", " ")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw[:19]
+    return time_utils.to_msk(parsed).replace(tzinfo=None).isoformat(
+        sep=" ", timespec="seconds"
+    )
+
+
 def host_slug(host_name: str) -> str:
     """Generate the compact host slug used in key_email values (e.g. 'my server' → 'myserver')."""
     return (host_name or "").replace(" ", "").lower()
@@ -1392,11 +1412,11 @@ def get_paid_revenue_between(
     query = "SELECT SUM(amount_rub) FROM transactions WHERE status = 'paid'"
     params: list[str] = []
     if start_at:
-        query += " AND datetime(created_date) >= datetime(?)"
-        params.append(start_at)
+        query += " AND substr(created_date, 1, 19) >= ?"
+        params.append(_local_datetime_text(start_at))
     if end_at:
-        query += " AND datetime(created_date) < datetime(?)"
-        params.append(end_at)
+        query += " AND substr(created_date, 1, 19) < ?"
+        params.append(_local_datetime_text(end_at))
 
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -1418,7 +1438,7 @@ def get_first_paid_transaction_date() -> str | None:
                 FROM transactions
                 WHERE status = 'paid'
                   AND created_date IS NOT NULL
-                ORDER BY datetime(created_date) ASC, transaction_id ASC
+                ORDER BY substr(created_date, 1, 19) ASC, transaction_id ASC
                 LIMIT 1
                 """
             )
@@ -1530,10 +1550,13 @@ def has_profit_distribution_overlap(
         SELECT 1
         FROM profit_distributions
         WHERE status IN ('active', 'paid')
-          AND datetime(COALESCE(period_start, '0001-01-01 00:00:00')) < datetime(?)
-          AND datetime(period_end) > datetime(COALESCE(?, '0001-01-01 00:00:00'))
+          AND COALESCE(substr(period_start, 1, 19), '0001-01-01 00:00:00') < ?
+          AND substr(period_end, 1, 19) > COALESCE(?, '0001-01-01 00:00:00')
     """
-    params: list[object] = [period_end, period_start]
+    params: list[object] = [
+        _local_datetime_text(period_end),
+        _local_datetime_text(period_start),
+    ]
     if exclude_distribution_id is not None:
         query += " AND distribution_id != ?"
         params.append(exclude_distribution_id)

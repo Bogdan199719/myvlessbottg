@@ -1302,23 +1302,22 @@ def create_webhook_app(bot_controller_instance):
 
         total_tax = revenue * tax_percent / 100
         revenue_after_tax = revenue - total_tax
-        server_share = server_cost / 2
-        bogdan_gross = revenue_after_tax * bogdan_share / 100
-        vlad_gross = revenue_after_tax * vlad_share / 100
-        bogdan_profit = bogdan_gross - server_share
-        vlad_net = vlad_gross - server_share
+        profit_pool = revenue_after_tax - server_cost
+        bogdan_profit = profit_pool * bogdan_share / 100
+        vlad_net = profit_pool * vlad_share / 100
 
         return {
             "revenue_rub": round(revenue, 2),
             "revenue_after_tax_rub": round(revenue_after_tax, 2),
+            "profit_pool_rub": round(profit_pool, 2),
             "bogdan_share_percent": bogdan_share,
             "vlad_share_percent": vlad_share,
             "vlad_tax_percent": tax_percent,
             "server_cost_rub": round(server_cost, 2),
-            "server_share_rub": round(server_share, 2),
-            "bogdan_gross_rub": round(bogdan_gross, 2),
+            "server_share_rub": round(server_cost, 2),
+            "bogdan_gross_rub": round(bogdan_profit, 2),
             "bogdan_profit_rub": round(bogdan_profit, 2),
-            "vlad_gross_rub": round(vlad_gross, 2),
+            "vlad_gross_rub": round(vlad_net, 2),
             "vlad_tax_rub": round(total_tax, 2),
             "vlad_net_rub": round(vlad_net, 2),
             "total_net_rub": round(bogdan_profit + vlad_net, 2),
@@ -1494,8 +1493,8 @@ def create_webhook_app(bot_controller_instance):
             calculation = item.get("calculation") or {}
             item["revenue_display"] = _profit_display_amount(calculation.get("revenue_rub"))
             item["tax_display"] = _profit_display_amount(calculation.get("vlad_tax_rub"))
-            item["server_share_display"] = _profit_display_amount(
-                calculation.get("server_share_rub")
+            item["server_cost_display"] = _profit_display_amount(
+                calculation.get("server_cost_rub")
             )
             item["bogdan_display"] = _profit_display_amount(
                 calculation.get("bogdan_profit_rub")
@@ -2381,13 +2380,14 @@ def create_webhook_app(bot_controller_instance):
             )
             return redirect(request.referrer or url_for("dashboard_page"))
 
-        revenue = get_paid_revenue_between(period_start, period_end)
+        default_revenue = get_paid_revenue_between(period_start, period_end)
+        revenue = _parse_money_value(request.form.get("revenue_rub"), default_revenue)
         calculated = _calculate_partner_profit(revenue, settings)
         ok = update_profit_distribution(
             distribution_id,
             period_start=period_start,
             period_end=period_end,
-            revenue_rub=revenue,
+            revenue_rub=calculated["revenue_rub"],
             bogdan_share_percent=calculated["bogdan_share_percent"],
             vlad_share_percent=calculated["vlad_share_percent"],
             vlad_tax_percent=calculated["vlad_tax_percent"],

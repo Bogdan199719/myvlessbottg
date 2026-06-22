@@ -600,7 +600,7 @@ document.addEventListener('DOMContentLoaded', function () {
 			period: preview.querySelector('[data-profit-preview="period"]'),
 			revenue: preview.querySelector('[data-profit-preview="revenue"]'),
 			tax: preview.querySelector('[data-profit-preview="tax"]'),
-			serverShare: preview.querySelector('[data-profit-preview="serverShare"]'),
+			serverCost: preview.querySelector('[data-profit-preview="serverCost"]'),
 			bogdan: preview.querySelector('[data-profit-preview="bogdan"]'),
 			vlad: preview.querySelector('[data-profit-preview="vlad"]'),
 		}
@@ -611,8 +611,8 @@ document.addEventListener('DOMContentLoaded', function () {
 			if (fields.period) fields.period.textContent = option.dataset.period || '—'
 			if (fields.revenue) fields.revenue.textContent = option.dataset.revenue || '0'
 			if (fields.tax) fields.tax.textContent = option.dataset.tax || '0'
-			if (fields.serverShare) {
-				fields.serverShare.textContent = option.dataset.serverShare || '0'
+			if (fields.serverCost) {
+				fields.serverCost.textContent = option.dataset.serverCost || '0'
 			}
 			if (fields.bogdan) fields.bogdan.textContent = option.dataset.bogdan || '0'
 			if (fields.vlad) fields.vlad.textContent = option.dataset.vlad || '0'

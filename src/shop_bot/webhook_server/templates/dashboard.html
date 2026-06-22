@@ -65,7 +65,7 @@
 	<div class="section-head">
 		<div>
 			<h2>Делёж прибыли</h2>
-			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, серверы пополам, затем Богдан {{ profit.settings.bogdan_share_percent|round(2) }}% и Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
+			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, затем минус серверы и делёж прибыли: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
 		</div>
 		<form class="profit-settings-form" action="{{ url_for('update_profit_settings_route') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -105,7 +105,7 @@
 					<strong>{{ "%.0f"|format(item.vlad_net_rub) }} ₽</strong>
 				</div>
 			</div>
-			<small>Налог с выручки: {{ "%.0f"|format(item.vlad_tax_rub) }} ₽. Серверы: {{ "%.0f"|format(item.server_cost_rub) }} ₽, у каждого по {{ "%.0f"|format(item.server_share_rub) }} ₽.</small>
+			<small>Налог с выручки: {{ "%.0f"|format(item.vlad_tax_rub) }} ₽. Серверы до дележа: {{ "%.0f"|format(item.server_cost_rub) }} ₽.</small>
 		</div>
 		{% endfor %}
 	</div>
@@ -121,7 +121,7 @@
 					<option value="{{ item.value }}"
 						data-revenue="{{ item.revenue_display }}"
 						data-tax="{{ item.tax_display }}"
-						data-server-share="{{ item.server_share_display }}"
+						data-server-cost="{{ item.server_cost_display }}"
 						data-bogdan="{{ item.bogdan_display }}"
 						data-vlad="{{ item.vlad_display }}"
 						data-period="{{ item.note }}">{{ item.label }} — {{ item.note }}</option>
@@ -141,7 +141,7 @@
 				<div><span>Период</span><strong data-profit-preview="period">—</strong></div>
 				<div><span>Выручка</span><strong><b data-profit-preview="revenue">0</b> ₽</strong></div>
 				<div><span>Налог</span><strong><b data-profit-preview="tax">0</b> ₽</strong></div>
-				<div><span>Сервер с каждого</span><strong><b data-profit-preview="serverShare">0</b> ₽</strong></div>
+				<div><span>Серверы до дележа</span><strong><b data-profit-preview="serverCost">0</b> ₽</strong></div>
 				<div><span>Богдан</span><strong><b data-profit-preview="bogdan">0</b> ₽</strong></div>
 				<div><span>Влад</span><strong><b data-profit-preview="vlad">0</b> ₽</strong></div>
 			</div>

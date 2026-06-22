@@ -89,6 +89,7 @@ python3 scripts/check_subscription_business_rules.py
 python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
+python3 scripts/check_profit_accounting.py
 python3 scripts/check_subscription_consistency.py
 python3 scripts/check_xui_connection_equivalence.py
 python3 scripts/check_settings_defaults.py
@@ -102,6 +103,8 @@ docker compose build
 
 `scripts/check_subscription_business_rules.py` работает на временной SQLite и проверяет resumable-выдачу промокода и разделение paid/trial/free статусов. Продовые данные он не изменяет.
 По умолчанию скрипт маскирует Telegram ID и usernames в выводе, чтобы CI/аудиторские логи не раскрывали персональные данные. Для ручной локальной диагностики конкретных пользователей добавьте `--show-identities`.
+
+`scripts/check_profit_accounting.py` работает на временной SQLite и проверяет расчёты выручки по MSK-окнам, пересечение периодов распределения прибыли и backend-связку формы редактирования фиксаций.
 
 `scripts/check_xui_connection_equivalence.py` фиксирует правила сравнения ссылок 3x-ui. Панель может каждый раз отдавать новые `sid`/`spx` для Reality-ссылок, поэтому scheduler не должен считать такие ссылки рассинхроном, если стабильные параметры подключения не изменились.
 

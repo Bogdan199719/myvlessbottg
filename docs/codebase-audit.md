@@ -334,3 +334,15 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - Админка отделяет active free-доступ (промокод/ручная выдача без реальной оплаты) от paid-подписок; Dashboard и Users используют один классификатор.
 - На live-БД не найдено одновременных active trial/paid состояний, trial-ключей при `trial_used=0` или расхождений дат между активными global-хостами.
 - Добавлен `scripts/check_subscription_business_rules.py` с временной БД; production SQLite он не изменяет.
+
+## Profit accounting audit — 2026-06-22
+
+### Исправлено
+
+- История фиксаций прибыли больше не игнорирует поле `revenue_rub` при редактировании: значение из формы используется для перерасчёта долей и сохраняется в `profit_distributions`.
+- Расчёты выручки по периодам прибыли сравнивают MSK wall-clock timestamps без timezone suffix, чтобы SQLite не смещал строки вида `2026-06-22 17:02:44+03:00` при `datetime(...)`.
+- Preview и текст Dashboard приведены к правилу: налог вычитается из выручки, затем полная стоимость серверов вычитается до дележа прибыли.
+
+### Проверка
+
+- Добавлен `scripts/check_profit_accounting.py`: временная SQLite проверяет выручку по локальному дню, первое paid-событие, пересечения `profit_distributions` и backend-связку редактирования выручки.
