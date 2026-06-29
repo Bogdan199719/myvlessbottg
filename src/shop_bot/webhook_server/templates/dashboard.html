@@ -235,7 +235,7 @@
 	<section class="analytics-panel">
 		<div class="section-head">
 			<h2>Методы оплаты</h2>
-			<span class="panel-note">оплаченные платежи</span>
+			<span class="panel-note">оплаченные платежи {{ analytics.period_label }}</span>
 		</div>
 		<div class="analytics-chart analytics-chart-donut">
 			<canvas id="paymentMethodsChart"></canvas>
@@ -258,7 +258,7 @@
 	<section class="analytics-panel">
 		<div class="section-head">
 			<h2>Тарифы</h2>
-			<span class="panel-note">по выручке</span>
+			<span class="panel-note">по выручке {{ analytics.period_label }}</span>
 		</div>
 		{% if analytics.plan_revenue %}
 		<div class="analytics-bar-list">

@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 from yookassa import Configuration
 from yookassa import Payment
 
-from shop_bot.modules import xui_api
+from shop_bot.modules import mtg_api, xui_api
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
 from shop_bot.data_manager import scheduler
@@ -1543,9 +1543,9 @@ def create_webhook_app(bot_controller_instance):
                             FROM users
                             WHERE registration_date IS NOT NULL
                             UNION ALL
-                            SELECT substr(created_date, 1, 10) AS day
+                            SELECT substr(COALESCE(paid_date, created_date), 1, 10) AS day
                             FROM transactions
-                            WHERE created_date IS NOT NULL
+                            WHERE COALESCE(paid_date, created_date) IS NOT NULL
                             UNION ALL
                             SELECT substr(created_date, 1, 10) AS day
                             FROM vpn_keys
@@ -1799,9 +1799,9 @@ def create_webhook_app(bot_controller_instance):
                 cursor.execute(
                     """
                     SELECT payment_id, user_id, username, status, amount_rub,
-                           payment_method, metadata, created_date
+                           payment_method, metadata, created_date, paid_date
                     FROM transactions
-                    ORDER BY created_date DESC
+                    ORDER BY COALESCE(paid_date, created_date) DESC
                     """
                 )
                 method_totals: dict[str, dict] = {}
@@ -1822,7 +1822,8 @@ def create_webhook_app(bot_controller_instance):
                 for row in cursor.fetchall():
                     status = str(row["status"] or "unknown")
                     status_counts[status] = status_counts.get(status, 0) + 1
-                    day = str(row["created_date"] or "")[:10]
+                    transaction_date = row["paid_date"] or row["created_date"]
+                    day = str(transaction_date or "")[:10]
                     metadata = _safe_metadata(row["metadata"])
                     method = _format_payment_method(
                         row["payment_method"] or metadata.get("payment_method")
@@ -1844,11 +1845,11 @@ def create_webhook_app(bot_controller_instance):
                         top_days[day]["orders"] += 1
                         top_days[day]["users"] += 1
 
-                    method_bucket = method_totals.setdefault(
-                        method, {"method": method, "revenue": 0.0, "orders": 0}
-                    )
-                    method_bucket["revenue"] += amount
-                    method_bucket["orders"] += 1
+                        method_bucket = method_totals.setdefault(
+                            method, {"method": method, "revenue": 0.0, "orders": 0}
+                        )
+                        method_bucket["revenue"] += amount
+                        method_bucket["orders"] += 1
 
                     plan_id = str(metadata.get("plan_id") or "")
                     if method == "Promo" and metadata.get("promo_code"):
@@ -1864,11 +1865,12 @@ def create_webhook_app(bot_controller_instance):
                             or plan_names.get(plan_id)
                             or (f"Тариф #{plan_id}" if plan_id else "Не указан")
                         )
-                    plan_bucket = plan_totals.setdefault(
-                        plan_name, {"plan": plan_name, "revenue": 0.0, "orders": 0}
-                    )
-                    plan_bucket["revenue"] += amount
-                    plan_bucket["orders"] += 1
+                    if day in date_set:
+                        plan_bucket = plan_totals.setdefault(
+                            plan_name, {"plan": plan_name, "revenue": 0.0, "orders": 0}
+                        )
+                        plan_bucket["revenue"] += amount
+                        plan_bucket["orders"] += 1
 
                     paid_transactions.append(
                         {
@@ -1878,8 +1880,8 @@ def create_webhook_app(bot_controller_instance):
                             "amount": amount,
                             "method": method,
                             "plan": plan_name,
-                            "date": row["created_date"],
-                            "date_label": _format_transaction_dt(row["created_date"]),
+                            "date": transaction_date,
+                            "date_label": _format_transaction_dt(transaction_date),
                         }
                     )
 
@@ -2574,9 +2576,9 @@ def create_webhook_app(bot_controller_instance):
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT transaction_id, payment_id, user_id, username, status, amount_rub,
-                       amount_currency, currency_name, payment_method, metadata, created_date
+                       amount_currency, currency_name, payment_method, metadata, created_date, paid_date
                 FROM transactions
-                ORDER BY created_date DESC
+                ORDER BY COALESCE(paid_date, created_date) DESC
                 """)
             for row in cursor.fetchall():
                 rows.append(dict(row))
@@ -2596,6 +2598,7 @@ def create_webhook_app(bot_controller_instance):
                 "payment_method",
                 "metadata",
                 "created_date",
+                "paid_date",
             ],
         )
 
@@ -2858,6 +2861,15 @@ def create_webhook_app(bot_controller_instance):
             if not key_data:
                 flash(f"Ключ {key_id} не найден.", "danger")
                 return redirect(url_for("keys_page"))
+            if (
+                key_data.get("service_type") == "mtg"
+                and (hours_to_adjust != 0 or days_to_adjust <= 0)
+            ):
+                flash(
+                    "Telegram Proxy можно продлить только на положительное число полных дней.",
+                    "warning",
+                )
+                return redirect(url_for("keys_page"))
 
             # Check if this key belongs to a Global Plan
             is_global = False
@@ -2887,7 +2899,47 @@ def create_webhook_app(bot_controller_instance):
             new_expiry_date = None
 
             for k in keys_to_adjust:
-                # Call logic to adjust on panel using seconds for precision
+                if k.get("service_type") == "mtg":
+                    try:
+                        node_id = int(k.get("xui_client_uuid") or 0)
+                    except (TypeError, ValueError):
+                        logger.error(
+                            "Cannot adjust MTG key_id=%s: invalid node id %r.",
+                            k.get("key_id"),
+                            k.get("xui_client_uuid"),
+                        )
+                        continue
+                    current_expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
+                    current_expiry_ms = (
+                        int(current_expiry.timestamp() * 1000)
+                        if current_expiry
+                        else 0
+                    )
+                    new_expiry_ms = _run_async(
+                        mtg_api.renew_proxy_for_user(
+                            k["host_name"],
+                            k["key_email"],
+                            node_id,
+                            days_to_adjust,
+                            current_expiry_ms,
+                        )
+                    )
+                    if not new_expiry_ms:
+                        continue
+                    expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
+                    updated = update_key_info(k["key_id"], expiry_dt)
+                    if not updated:
+                        logger.error(
+                            "Admin MTG duration adjustment succeeded on host %s but DB update failed for key_id=%s.",
+                            k["host_name"],
+                            k["key_id"],
+                        )
+                        continue
+                    success_count += 1
+                    new_expiry_date = expiry_dt
+                    continue
+
+                # Call XUI logic to adjust on panel using seconds for precision.
                 result = _run_async(
                     xui_api.create_or_update_key_on_host_seconds(
                         host_name=k["host_name"],
@@ -2958,9 +3010,19 @@ def create_webhook_app(bot_controller_instance):
                         "success",
                     )
                 else:
-                    flash(f"Ключ #{key_id} успешно изменён на {time_str}.", "success")
+                    service_label = (
+                        "Telegram Proxy"
+                        if key_data.get("service_type") == "mtg"
+                        else f"Ключ #{key_id}"
+                    )
+                    flash(f"{service_label} успешно изменён на {time_str}.", "success")
             else:
-                flash(f"Ошибка при изменении ключа(ей) на сервере XUI.", "danger")
+                service_label = (
+                    "Telegram Proxy"
+                    if key_data.get("service_type") == "mtg"
+                    else "XUI"
+                )
+                flash(f"Ошибка при изменении ключа(ей) на сервере {service_label}.", "danger")
 
         except Exception as e:
             logger.error(f"Error adjusting key duration: {e}", exc_info=True)
@@ -4102,7 +4164,7 @@ def create_webhook_app(bot_controller_instance):
             logger.warning(
                 f"Payment rule set IGNORED: context={context_key!r} method={method!r}"
             )
-        return redirect(url_for("settings_page") + "#payment-rules")
+        return redirect(request.referrer or url_for("settings_page"))
 
     @flask_app.route("/payment-rules/reset", methods=["POST"])
     @login_required
@@ -4113,7 +4175,7 @@ def create_webhook_app(bot_controller_instance):
             flash(
                 f"Правила оплаты для «{context_key}» сброшены до глобальных.", "success"
             )
-        return redirect(url_for("settings_page"))
+        return redirect(request.referrer or url_for("settings_page"))
 
     # ─────────────────────────────────────────────────────────────────────────
 

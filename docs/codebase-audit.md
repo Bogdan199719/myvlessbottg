@@ -346,3 +346,15 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 ### Проверка
 
 - Добавлен `scripts/check_profit_accounting.py`: временная SQLite проверяет выручку по локальному дню, первое paid-событие, пересечения `profit_distributions` и backend-связку редактирования выручки.
+
+## Admin payment analytics audit — 2026-06-29
+
+### Исправлено
+
+- Dashboard и profit-расчёты используют дату фактической оплаты `transactions.paid_date`, а не дату создания счёта. Для старых строк миграция заполняет `paid_date = created_date`, поэтому историческая выручка не теряется.
+- Блоки Dashboard `Методы оплаты` и `Тарифы` считаются за выбранный период и подписаны тем же period label, что и верхние KPI.
+- Админская страница ключей различает XUI и Telegram Proxy: XUI по-прежнему поддерживает изменение дней/часов, а MTG-прокси продлевается через MTG renew API только на положительное число полных дней.
+
+### Проверка
+
+- Добавлен `scripts/check_payment_analytics.py`: временная копия SQLite проверяет миграцию `paid_date`, backfill старых paid-транзакций, выручку all-time и запись `paid_date` при финализации оплаты.

@@ -162,7 +162,8 @@ def initialize_db():
                     currency_name TEXT,
                     payment_method TEXT,
                     metadata TEXT,
-                    created_date TIMESTAMP
+                    created_date TIMESTAMP,
+                    paid_date TIMESTAMP
                 )
             """)
             cursor.execute("""
@@ -672,6 +673,22 @@ def run_migration():
                     and "status" in trans_columns
                     and "username" in trans_columns
                 ):
+                    if "paid_date" not in trans_columns:
+                        cursor.execute(
+                            "ALTER TABLE transactions ADD COLUMN paid_date TIMESTAMP"
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE transactions
+                            SET paid_date = created_date
+                            WHERE status = 'paid'
+                              AND paid_date IS NULL
+                              AND created_date IS NOT NULL
+                            """
+                        )
+                        logging.info(
+                            " -> The column 'paid_date' is successfully added to transactions."
+                        )
                     logging.info(
                         "The 'Transactions' table already has a new structure. Migration is not required."
                     )
@@ -906,7 +923,8 @@ def create_new_transactions_table(cursor: sqlite3.Cursor):
             currency_name TEXT,
             payment_method TEXT,
             metadata TEXT,
-            created_date TIMESTAMP
+            created_date TIMESTAMP,
+            paid_date TIMESTAMP
         )
     """)
 
@@ -1412,10 +1430,10 @@ def get_paid_revenue_between(
     query = "SELECT SUM(amount_rub) FROM transactions WHERE status = 'paid'"
     params: list[str] = []
     if start_at:
-        query += " AND substr(created_date, 1, 19) >= ?"
+        query += " AND substr(COALESCE(paid_date, created_date), 1, 19) >= ?"
         params.append(_local_datetime_text(start_at))
     if end_at:
-        query += " AND substr(created_date, 1, 19) < ?"
+        query += " AND substr(COALESCE(paid_date, created_date), 1, 19) < ?"
         params.append(_local_datetime_text(end_at))
 
     try:
@@ -1434,11 +1452,11 @@ def get_first_paid_transaction_date() -> str | None:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT created_date
+                SELECT COALESCE(paid_date, created_date)
                 FROM transactions
                 WHERE status = 'paid'
-                  AND created_date IS NOT NULL
-                ORDER BY substr(created_date, 1, 19) ASC, transaction_id ASC
+                  AND COALESCE(paid_date, created_date) IS NOT NULL
+                ORDER BY substr(COALESCE(paid_date, created_date), 1, 19) ASC, transaction_id ASC
                 LIMIT 1
                 """
             )
@@ -2359,7 +2377,11 @@ def finalize_reserved_transaction(
                     metadata = COALESCE(?, metadata),
                     payment_method = COALESCE(?, payment_method),
                     amount_currency = COALESCE(?, amount_currency),
-                    currency_name = COALESCE(?, currency_name)
+                    currency_name = COALESCE(?, currency_name),
+                    paid_date = CASE
+                        WHEN ? = 'paid' THEN COALESCE(paid_date, ?)
+                        ELSE paid_date
+                    END
                 WHERE payment_id = ? AND status = 'processing'
                 """,
                 (
@@ -2368,6 +2390,8 @@ def finalize_reserved_transaction(
                     payment_method,
                     amount_currency,
                     currency_name,
+                    target_status,
+                    time_utils.get_msk_now(),
                     payment_id,
                 ),
             )
@@ -2615,8 +2639,8 @@ def log_transaction(
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO transactions
-                   (username, transaction_id, payment_id, user_id, status, amount_rub, amount_currency, currency_name, payment_method, metadata, created_date)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (username, transaction_id, payment_id, user_id, status, amount_rub, amount_currency, currency_name, payment_method, metadata, created_date, paid_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     username,
                     transaction_id,
@@ -2629,6 +2653,7 @@ def log_transaction(
                     payment_method,
                     metadata,
                     time_utils.get_msk_now(),
+                    time_utils.get_msk_now() if status == "paid" else None,
                 ),
             )
             conn.commit()
@@ -2651,7 +2676,8 @@ def get_paginated_transactions(
             total = cursor.fetchone()[0]
 
             query = (
-                "SELECT * FROM transactions ORDER BY created_date DESC LIMIT ? OFFSET ?"
+                "SELECT * FROM transactions "
+                "ORDER BY COALESCE(paid_date, created_date) DESC LIMIT ? OFFSET ?"
             )
             cursor.execute(query, (per_page, offset))
 
@@ -3180,9 +3206,10 @@ def get_recent_transactions(limit: int = 15) -> list[dict]:
                     t.amount_rub,
                     t.payment_method,
                     t.metadata,
-                    t.created_date
+                    t.created_date,
+                    t.paid_date
                 FROM transactions t
-                ORDER BY t.created_date DESC
+                ORDER BY COALESCE(t.paid_date, t.created_date) DESC
                 LIMIT ?;
             """
             cursor.execute(query, (limit,))
@@ -3630,7 +3657,8 @@ def get_latest_transaction(user_id: int) -> dict | None:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM transactions WHERE user_id = ? ORDER BY created_date DESC LIMIT 1",
+                "SELECT * FROM transactions WHERE user_id = ? "
+                "ORDER BY COALESCE(paid_date, created_date) DESC LIMIT 1",
                 (user_id,),
             )
             transaction = cursor.fetchone()
@@ -3652,7 +3680,7 @@ def get_latest_paid_transaction(user_id: int) -> dict | None:
                 WHERE user_id = ?
                   AND status = 'paid'
                   AND amount_rub > 0
-                ORDER BY created_date DESC
+                ORDER BY COALESCE(paid_date, created_date) DESC
                 LIMIT 1
                 """,
                 (user_id,),

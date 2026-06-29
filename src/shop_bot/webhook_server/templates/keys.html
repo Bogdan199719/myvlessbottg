@@ -231,6 +231,22 @@ content %}
                         <span class="status-badge {{ key.expiry_status.css_class }}">{{ key.expiry_status.label }}</span>
                     </td>
                     <td class="actions-cell">
+                        {% if key.service_type == 'mtg' %}
+                        <form action="{{ url_for('adjust_key_duration', key_id=key.key_id) }}" method="POST"
+                            class="duration-form"
+                            onsubmit="var d = parseInt(this.days.value) || 0; if(d <= 0) { alert('Укажите положительное количество дней'); return false; } return confirm('Вы уверены, что хотите продлить Telegram Proxy #{{ key.key_id }}?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                            <input type="hidden" name="hours" value="0" />
+
+                            <label class="duration-input-wrap">
+                                <span>Дней</span>
+                                <input type="number" name="days" value="0" min="1" max="365" oninput="checkChanges(this.form)" />
+                            </label>
+                            <button type="submit" class="button button-small button-success duration-submit" title="Продлить Telegram Proxy">
+                                Продлить
+                            </button>
+                        </form>
+                        {% else %}
                         <form action="{{ url_for('adjust_key_duration', key_id=key.key_id) }}" method="POST"
                             class="duration-form"
                             onsubmit="var d = parseInt(this.days.value) || 0; var h = parseInt(this.hours.value) || 0; if(d === 0 && h === 0) { alert('Укажите количество дней или часов'); return false; } var txt = (d >= 0 && h >= 0) ? 'продлить' : 'уменьшить срок'; return confirm('Вы уверены, что хотите ' + txt + ' ключ #{{ key.key_id }}?');">
@@ -248,6 +264,7 @@ content %}
                                 Применить
                             </button>
                         </form>
+                        {% endif %}
                     </td>
                 </tr>
                 {% endif %}

@@ -106,6 +106,8 @@ docker compose build
 
 `scripts/check_profit_accounting.py` работает на временной SQLite и проверяет расчёты выручки по MSK-окнам, пересечение периодов распределения прибыли и backend-связку формы редактирования фиксаций.
 
+`scripts/check_payment_analytics.py` работает на временной копии `users.db` и проверяет миграцию `transactions.paid_date`, backfill старых paid-платежей и дату фактической оплаты в dashboard/profit analytics.
+
 `scripts/check_xui_connection_equivalence.py` фиксирует правила сравнения ссылок 3x-ui. Панель может каждый раз отдавать новые `sid`/`spx` для Reality-ссылок, поэтому scheduler не должен считать такие ссылки рассинхроном, если стабильные параметры подключения не изменились.
 
 Если на host Python не установлены runtime-зависимости проекта, запускайте проверки внутри контейнера:

@@ -184,7 +184,9 @@ async def get_user_summary(user_id: int, username: str) -> str:
         }
         status_text = status_labels.get(status, status)
         status_suffix = f", {html.escape(status_text)}" if status_text else ""
-        tx_date = time_utils.parse_iso_to_msk(transaction.get("created_date"))
+        tx_date = time_utils.parse_iso_to_msk(
+            transaction.get("paid_date") or transaction.get("created_date")
+        )
         date = time_utils.format_msk(tx_date, "%d.%m.%Y") if tx_date else "N/A"
         return f"- {html.escape(str(plan_name))} за {price} RUB ({date}{method_text}{status_suffix})"
 
