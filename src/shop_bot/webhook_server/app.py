@@ -774,6 +774,8 @@ ALL_SETTINGS_KEYS = [
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
     "subscription_auto_provision",
+    "happ_routing_enabled",
+    "happ_routing_rules",
     "panel_sync_enabled",
     "xtls_sync_enabled",
     "enable_promo_codes",
@@ -3192,6 +3194,7 @@ def create_webhook_app(bot_controller_instance):
                 "enable_admin_trial_notifications",
                 "email_prompt_enabled",
                 "enable_promo_codes",
+                "happ_routing_enabled",
             ]:
                 values = request.form.getlist(checkbox_key)
                 value = values[-1] if values else "false"
@@ -3213,6 +3216,7 @@ def create_webhook_app(bot_controller_instance):
                     "enable_admin_trial_notifications",
                     "email_prompt_enabled",
                     "enable_promo_codes",
+                    "happ_routing_enabled",
                 ]:
                     continue
                 value = request.form.get(key)

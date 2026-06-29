@@ -767,6 +767,20 @@
 					<small class="field-hint">Это имя будет отображаться при импорте
 						подписки.</small>
 				</div>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="happ_routing_enabled" value="false" />
+					<input type="checkbox" id="happ_routing_enabled" name="happ_routing_enabled" value="true" {% if
+						settings.happ_routing_enabled=='true' %}checked{% endif %}>
+					<label for="happ_routing_enabled">Добавлять Happ-маршрутизацию в подписку</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="happ_routing_enabled">
+					<div class="form-group">
+						<label for="happ_routing_rules">Happ routing link:</label>
+						<textarea id="happ_routing_rules" name="happ_routing_rules" rows="4"
+							placeholder="happ://routing/onadd/...">{{ settings.happ_routing_rules or "" }}</textarea>
+						<small class="field-hint">Эта строка добавляется после VPN-серверов в тело подписки.</small>
+					</div>
+				</div>
 			</section>
 
 			<section class="settings-section" id="content-settings">

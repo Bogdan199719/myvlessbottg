@@ -31,6 +31,8 @@ REQUIRED_DEFAULT_SETTINGS = {
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
     "subscription_auto_provision",
+    "happ_routing_enabled",
+    "happ_routing_rules",
     "provision_timeout_seconds",
     "panel_sync_enabled",
     "xtls_sync_enabled",

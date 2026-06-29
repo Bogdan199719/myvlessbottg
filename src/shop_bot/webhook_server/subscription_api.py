@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
@@ -126,6 +127,13 @@ def _bool_setting(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sanitize_subscription_line(value: str, max_length: int = 4096) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_length]
 
 
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
@@ -596,8 +604,20 @@ def get_subscription(token):
 
         logger.info(f"User {user_id}: Final config count: {len(configs)}")
 
+        subscription_lines = list(configs)
+        if configs and _bool_setting("happ_routing_enabled", default=False):
+            happ_routing_rules = _sanitize_subscription_line(
+                get_setting("happ_routing_rules") or ""
+            )
+            if happ_routing_rules.startswith("happ://routing/onadd/"):
+                subscription_lines.append(happ_routing_rules)
+            elif happ_routing_rules:
+                logger.warning(
+                    "Happ routing is enabled but happ_routing_rules has an unsupported format."
+                )
+
         # Join with newlines
-        subscription_data = "\n".join(configs)
+        subscription_data = "\n".join(subscription_lines)
 
         # Base64 encode for wide compatibility
         encoded_data = base64.b64encode(subscription_data.encode("utf-8")).decode(

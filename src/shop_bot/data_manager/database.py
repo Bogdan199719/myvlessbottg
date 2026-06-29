@@ -97,6 +97,8 @@ DEFAULT_BOT_SETTINGS = {
     "subscription_live_stats": "false",
     "subscription_allow_fallback_host_fetch": "false",
     "subscription_auto_provision": "false",
+    "happ_routing_enabled": "false",
+    "happ_routing_rules": "",
     "provision_timeout_seconds": "45",
     "panel_sync_enabled": "false",
     "xtls_sync_enabled": "false",
