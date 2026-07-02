@@ -2270,7 +2270,7 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
-            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973'>Happ из App Store</a>.\n"
+            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Happ из App Store</a>.\n"
             "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
             "3. Подтвердите добавление в Happ.\n"
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
