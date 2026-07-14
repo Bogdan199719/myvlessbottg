@@ -146,6 +146,8 @@ MAX_BACKUP_FILES = 3
 ALLOWED_BACKUP_FILES = {"users.db", "metadata.json", ".env"}
 ADMIN_LIST_DEFAULT_PER_PAGE = 50
 ADMIN_LIST_ALLOWED_PER_PAGE = {25, 50, 100}
+XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS = 120
+XUI_FIX_HOST_TIMEOUT_SECONDS = 60
 
 
 def _admin_list_request_args(allowed_statuses: set[str]) -> tuple[str, str, int, int]:
@@ -2127,7 +2129,8 @@ def create_webhook_app(bot_controller_instance):
             total_hosts += 1
             try:
                 mapping = await asyncio.wait_for(
-                    xui_api.get_connection_strings_for_host(host_name), timeout=15
+                    xui_api.get_connection_strings_for_host(host_name),
+                    timeout=XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS,
                 )
             except Exception as k_e:
                 total_errors += 1
@@ -2163,7 +2166,8 @@ def create_webhook_app(bot_controller_instance):
             total_hosts += 1
             try:
                 fixed = await asyncio.wait_for(
-                    xui_api.fix_all_client_parameters_on_host(host_name), timeout=20
+                    xui_api.fix_all_client_parameters_on_host(host_name),
+                    timeout=XUI_FIX_HOST_TIMEOUT_SECONDS,
                 )
                 total_fixed += int(fixed)
             except Exception as k_e:
@@ -3246,10 +3250,15 @@ def create_webhook_app(bot_controller_instance):
             async def _sync_all_keys_wrapper():
                 try:
                     result = await _sync_keys_job()
+                    has_errors = result["errors"] > 0
                     _set_task_status(
                         "sync_configs",
-                        "success",
-                        f"Готово: обновлено {result['updated']} ключей",
+                        "error" if has_errors else "success",
+                        (
+                            f"Завершено с ошибками: {result['errors']} хост(а)"
+                            if has_errors
+                            else f"Готово: обновлено {result['updated']} ключей"
+                        ),
                         details=result,
                     )
                     logger.info(f"Sync keys completed: {result}")
@@ -3286,10 +3295,15 @@ def create_webhook_app(bot_controller_instance):
             async def _fix_all_clients_wrapper():
                 try:
                     result = await _fix_clients_job()
+                    has_errors = result["errors"] > 0
                     _set_task_status(
                         "fix_parameters",
-                        "success",
-                        f"Готово: исправлено {result['fixed']} клиентов",
+                        "error" if has_errors else "success",
+                        (
+                            f"Завершено с ошибками: {result['errors']} хост(а)"
+                            if has_errors
+                            else f"Готово: исправлено {result['fixed']} клиентов"
+                        ),
                         details=result,
                     )
                     logger.info(f"Fix parameters completed: {result}")
@@ -3324,32 +3338,49 @@ def create_webhook_app(bot_controller_instance):
                 "maintenance", "running", "Комплексное обслуживание запущено"
             )
             _set_task_status(
-                "sync_configs", "running", "Синхронизация конфигов запущена"
+                "fix_parameters", "running", "Исправление параметров запущено"
             )
 
             async def _maintenance_wrapper():
                 try:
-                    sync_result = await _sync_keys_job()
-                    _set_task_status(
-                        "sync_configs",
-                        "success",
-                        f"Готово: обновлено {sync_result['updated']} ключей",
-                        details=sync_result,
-                    )
-                    _set_task_status(
-                        "fix_parameters", "running", "Исправление параметров запущено"
-                    )
                     fix_result = await _fix_clients_job()
+                    fix_has_errors = fix_result["errors"] > 0
                     _set_task_status(
                         "fix_parameters",
-                        "success",
-                        f"Готово: исправлено {fix_result['fixed']} клиентов",
+                        "error" if fix_has_errors else "success",
+                        (
+                            f"Завершено с ошибками: {fix_result['errors']} хост(а)"
+                            if fix_has_errors
+                            else f"Готово: исправлено {fix_result['fixed']} клиентов"
+                        ),
                         details=fix_result,
                     )
                     _set_task_status(
+                        "sync_configs",
+                        "running",
+                        "Синхронизация конфигов запущена",
+                    )
+                    sync_result = await _sync_keys_job()
+                    sync_has_errors = sync_result["errors"] > 0
+                    _set_task_status(
+                        "sync_configs",
+                        "error" if sync_has_errors else "success",
+                        (
+                            f"Завершено с ошибками: {sync_result['errors']} хост(а)"
+                            if sync_has_errors
+                            else f"Готово: обновлено {sync_result['updated']} ключей"
+                        ),
+                        details=sync_result,
+                    )
+                    has_errors = fix_has_errors or sync_has_errors
+                    _set_task_status(
                         "maintenance",
-                        "success",
-                        "Комплексное обслуживание завершено",
+                        "error" if has_errors else "success",
+                        (
+                            "Комплексное обслуживание завершено с ошибками"
+                            if has_errors
+                            else "Комплексное обслуживание завершено"
+                        ),
                         details={"sync": sync_result, "fix": fix_result},
                     )
                 except Exception as e:

@@ -159,6 +159,14 @@ def _check_source_invariants() -> None:
     )
     for fragment in required_app_fragments:
         assert fragment in app_source, f"missing admin safety invariant: {fragment}"
+    assert "XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS = 120" in app_source
+    assert '"error" if has_errors else "success"' in app_source
+    maintenance_source = app_source.split("def maintenance_route():", 1)[1].split(
+        '@flask_app.route("/settings"', 1
+    )[0]
+    assert maintenance_source.index("fix_result = await _fix_clients_job()") < (
+        maintenance_source.index("sync_result = await _sync_keys_job()")
+    ), "maintenance must normalize panel clients before refreshing cached links"
     assert "shutil.copyfile(db_src, DB_FILE)" not in app_source, (
         "web request must never replace the live SQLite main file"
     )

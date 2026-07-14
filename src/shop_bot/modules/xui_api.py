@@ -1,6 +1,7 @@
 import uuid
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
@@ -29,6 +30,7 @@ _ERROR_LOG_INTERVAL = 300  # Log same error once per 5 minutes
 _BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
+_LINK_FETCH_MAX_WORKERS = 6
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
     "connection aborted",
     "connection reset",
@@ -788,6 +790,43 @@ def _connection_string_for_client(
     return _replace_link_remark(connection_string, remark)
 
 
+def _connection_strings_for_client_rows(
+    api: Api,
+    inbound: Inbound,
+    host_url: str,
+    host_name: str,
+    client_rows,
+) -> dict[str, str]:
+    """Build panel-accurate links concurrently with bounded request pressure."""
+    rows = [
+        (str(email), str(client_identifier))
+        for email, client_identifier in client_rows
+        if email and client_identifier
+    ]
+    if not rows:
+        return {}
+
+    server_remark = _build_server_remark(host_name)
+
+    def _build(row: tuple[str, str]) -> tuple[str, str | None]:
+        email, client_identifier = row
+        connection_string = _connection_string_for_client(
+            api=api,
+            inbound=inbound,
+            host_url=host_url,
+            email=email,
+            client_identifier=client_identifier,
+            remark=server_remark,
+        )
+        return email, connection_string
+
+    worker_count = min(_LINK_FETCH_MAX_WORKERS, len(rows))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        generated = executor.map(_build, rows)
+
+    return {email: conn for email, conn in generated if conn}
+
+
 def _raw_api_request(
     api: Api, method, endpoint: str, payload: dict | None = None
 ) -> dict:
@@ -928,79 +967,79 @@ def _add_client_v3(
 def _add_client_compat(
     api: Api, inbound_id: int, client: Client, client_identifier: str
 ) -> None:
+    payload = _client_payload_for_clients_api(client, client_identifier)
     try:
-        api.client.add(inbound_id, [client])
+        _add_client_v3(api, inbound_id, payload)
         return
     except Exception as e:
         if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    payload = _client_payload_for_clients_api(client, client_identifier)
-    _add_client_v3(api, inbound_id, payload)
+    api.client.add(inbound_id, [client])
 
 
 def _update_client_compat(api: Api, client_identifier: str, client: Client) -> None:
+    email = getattr(client, "email", "") or client_identifier
     try:
-        api.client.update(client_identifier, client)
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/update/{quote(email, safe='')}",
+            _client_payload_for_clients_api(client, client_identifier),
+        )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    email = getattr(client, "email", "") or client_identifier
-    _raw_api_request(
-        api,
-        requests.post,
-        f"panel/api/clients/update/{quote(email, safe='')}",
-        _client_payload_for_clients_api(client, client_identifier),
-    )
+    api.client.update(client_identifier, client)
 
 
 def _delete_client_compat(
     api: Api, inbound_id: int, client_identifier: str, email: str
 ) -> None:
     try:
-        api.client.delete(inbound_id, client_identifier)
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/del/{quote(email or client_identifier, safe='')}",
+        )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    _raw_api_request(
-        api,
-        requests.post,
-        f"panel/api/clients/del/{quote(email or client_identifier, safe='')}",
-    )
+    api.client.delete(inbound_id, client_identifier)
 
 
 def _reset_client_traffic_compat(api: Api, inbound_id: int, email: str) -> None:
     try:
-        api.client.reset_stats(inbound_id, email)
+        _raw_api_request(
+            api,
+            requests.post,
+            f"panel/api/clients/resetTraffic/{quote(email, safe='')}",
+        )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    _raw_api_request(
-        api,
-        requests.post,
-        f"panel/api/clients/resetTraffic/{quote(email, safe='')}",
-    )
+    api.client.reset_stats(inbound_id, email)
 
 
 def _get_client_traffic_compat(api: Api, email: str):
     try:
-        return api.client.get_by_email(email)
+        payload = _raw_api_request(
+            api,
+            requests.get,
+            f"panel/api/clients/traffic/{quote(email, safe='')}",
+        )
+        return payload.get("obj")
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    payload = _raw_api_request(
-        api,
-        requests.get,
-        f"panel/api/clients/traffic/{quote(email, safe='')}",
-    )
-    return payload.get("obj")
+    return api.client.get_by_email(email)
 
 
 def _get_raw_inbound_obj(api: Api, inbound_id: int) -> dict:
@@ -1080,77 +1119,71 @@ def _build_raw_client_for_protocol(
 
 
 def _add_raw_client(api: Api, inbound_id: int, client: dict) -> None:
+    client_payload = _raw_client_payload_for_clients_api(client)
     try:
-        _raw_api_request(
-            api,
-            requests.post,
-            "panel/api/inbounds/addClient",
-            {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
-        )
+        _add_client_v3(api, inbound_id, client_payload)
         return
     except Exception as e:
         if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    client_payload = _raw_client_payload_for_clients_api(client)
-    _add_client_v3(api, inbound_id, client_payload)
+    _raw_api_request(
+        api,
+        requests.post,
+        "panel/api/inbounds/addClient",
+        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+    )
 
 
 def _update_raw_client(
     api: Api, inbound_id: int, client_identifier: str, client: dict
 ) -> None:
+    email = client.get("email") or client_identifier
     try:
         _raw_api_request(
             api,
             requests.post,
-            f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
-            {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
+            f"panel/api/clients/update/{quote(email, safe='')}",
+            _raw_client_payload_for_clients_api(client),
         )
         return
     except Exception as e:
         if not _is_legacy_client_write_fallback_error(e):
             raise
 
-    email = client.get("email") or client_identifier
     _raw_api_request(
         api,
         requests.post,
-        f"panel/api/clients/update/{quote(email, safe='')}",
-        _raw_client_payload_for_clients_api(client),
+        f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
+        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
     )
 
 
-def _delete_raw_client(api: Api, inbound_id: int, client_identifier: str) -> None:
+def _delete_raw_client(
+    api: Api,
+    inbound_id: int,
+    client_identifier: str,
+    email: str | None = None,
+) -> None:
+    delete_key = email or client_identifier
     try:
         _raw_api_request(
             api,
             requests.post,
-            (
-                f"panel/api/inbounds/{inbound_id}/delClient/"
-                f"{quote(client_identifier, safe='')}"
-            ),
+            f"panel/api/clients/del/{quote(delete_key, safe='')}",
         )
         return
     except Exception as e:
-        if not _is_endpoint_not_found_error(e):
+        if not _is_legacy_client_write_fallback_error(e):
             raise
-
-    delete_key = client_identifier
-    for raw_client in _get_raw_clients(api, inbound_id):
-        raw_identifier = (
-            raw_client.get("auth")
-            or raw_client.get("id")
-            or raw_client.get("password")
-            or raw_client.get("email")
-        )
-        if str(raw_identifier) == str(client_identifier):
-            delete_key = raw_client.get("email") or client_identifier
-            break
 
     _raw_api_request(
         api,
         requests.post,
-        f"panel/api/clients/del/{quote(delete_key, safe='')}",
+        (
+            f"panel/api/inbounds/{inbound_id}/delClient/"
+            f"{quote(client_identifier, safe='')}"
+        ),
     )
 
 
@@ -1320,7 +1353,7 @@ def validate_host_write_access(
 
     try:
         if _protocol_uses_raw_client_api(protocol):
-            _delete_raw_client(api, inbound.id, probe_identifier)
+            _delete_raw_client(api, inbound.id, probe_identifier, probe_email)
         else:
             _delete_client_compat(api, inbound.id, probe_identifier, probe_email)
     except Exception as e:
@@ -2038,48 +2071,28 @@ def _get_connection_strings_for_host_sync(host_name: str) -> dict[str, str]:
     if not inbound_fresh or not inbound_fresh.settings.clients:
         return {}
 
-    server_remark = _build_server_remark(host_name)
-
-    result: dict[str, str] = {}
     protocol = getattr(inbound_fresh, "protocol", "") or ""
     if _protocol_uses_raw_client_api(protocol):
-        for raw_client in _get_raw_clients(api, inbound.id):
-            email = raw_client.get("email")
-            client_identifier = raw_client.get("auth")
-            if not email or not client_identifier:
-                continue
-            conn = _connection_string_for_client(
-                api=api,
-                inbound=inbound_fresh,
-                host_url=host_db_data["host_url"],
-                email=email,
-                client_identifier=client_identifier,
-                remark=server_remark,
+        client_rows = (
+            (raw_client.get("email"), raw_client.get("auth"))
+            for raw_client in _get_raw_clients(api, inbound.id)
+        )
+    else:
+        client_rows = (
+            (
+                getattr(client, "email", None),
+                _get_client_identifier_for_protocol(protocol, client),
             )
-            if conn:
-                result[email] = conn
-        return result
+            for client in inbound_fresh.settings.clients
+        )
 
-    for client in inbound_fresh.settings.clients:
-        email = getattr(client, "email", None)
-        if not email:
-            continue
-
-        client_identifier = _get_client_identifier_for_protocol(protocol, client)
-        conn = None
-        if client_identifier:
-            conn = _connection_string_for_client(
-                api=api,
-                inbound=inbound_fresh,
-                host_url=host_db_data["host_url"],
-                email=email,
-                client_identifier=client_identifier,
-                remark=server_remark,
-            )
-        if conn:
-            result[email] = conn
-
-    return result
+    return _connection_strings_for_client_rows(
+        api=api,
+        inbound=inbound_fresh,
+        host_url=host_db_data["host_url"],
+        host_name=host_name,
+        client_rows=client_rows,
+    )
 
 
 async def fix_client_parameters_on_host(host_name: str, client_email: str) -> bool:
@@ -2271,51 +2284,14 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
             inbound_to_modify.settings.clients = []
 
         protocol = (getattr(inbound_to_modify, "protocol", "") or "").lower()
-        server_remark = _build_server_remark(host_name)
 
         if protocol != "vless":
-            refreshed = 0
-            if protocol in {"hysteria", "hysteria2"}:
-                raw_clients = _get_raw_clients(api, inbound.id)
-                client_rows = (
-                    (client.get("email"), client.get("auth"))
-                    for client in raw_clients
-                )
-            else:
-                client_rows = (
-                    (
-                        getattr(client, "email", None),
-                        _get_client_identifier_for_protocol(protocol, client),
-                    )
-                    for client in inbound_to_modify.settings.clients
-                )
-
-            for email, client_identifier in client_rows:
-                if not email or not client_identifier:
-                    continue
-                key = get_key_by_email(email)
-                if not key:
-                    continue
-                conn = _connection_string_for_client(
-                    api=api,
-                    inbound=inbound_to_modify,
-                    host_url=host_data["host_url"],
-                    email=email,
-                    client_identifier=str(client_identifier),
-                    remark=server_remark,
-                )
-                if conn:
-                    update_key_connection_string(key["key_id"], conn)
-                    purge_missing_key(email)
-                    refreshed += 1
-
             logger.info(
-                "Refreshed %s connection string(s) for protocol '%s' on host '%s' without inbound.update.",
-                refreshed,
+                "No client parameter normalization is required for protocol '%s' on host '%s'.",
                 protocol,
                 host_name,
             )
-            return refreshed
+            return 0
 
         network, security = _get_stream_network_security(inbound_to_modify)
         target_flow = ""
@@ -2331,33 +2307,6 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
             except (ValueError, AttributeError):
                 pass
             updated += 1
-
-            try:
-                email = getattr(client, "email", None)
-                if not email:
-                    continue
-                key = get_key_by_email(email)
-                if not key:
-                    continue
-                client_identifier = _get_client_identifier_for_protocol(
-                    getattr(inbound_to_modify, "protocol", "") or "",
-                    client,
-                )
-                conn = _connection_string_for_client(
-                    api=api,
-                    inbound=inbound_to_modify,
-                    host_url=host_data["host_url"],
-                    email=email,
-                    client_identifier=client_identifier,
-                    remark=server_remark,
-                )
-                if conn:
-                    update_key_connection_string(key["key_id"], conn)
-                    purge_missing_key(email)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to refresh connection string for '{getattr(client, 'email', '')}': {e}"
-                )
 
         api.inbound.update(inbound.id, inbound_to_modify)
         logger.info(f"Fixed parameters for {updated} clients on host '{host_name}'.")
