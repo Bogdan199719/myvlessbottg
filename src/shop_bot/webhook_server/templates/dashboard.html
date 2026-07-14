@@ -27,7 +27,7 @@
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Выручка за всё время</span>
 		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
-		<small>оплаченных подписок: {{ summary.all_time_orders }}</small>
+		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных промокодов: {{ summary.all_time_free_promos }}</small>
 	</div>
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Активные оплаченные подписки</span>
@@ -37,7 +37,7 @@
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Оплаченные заказы {{ analytics.period_label }}</span>
 		<strong>{{ summary.period_orders }}</strong>
-		<small>сегодня: {{ summary.today_orders }}, уникальных клиентов: {{ summary.period_paid_transaction_users }}</small>
+		<small>сегодня: {{ summary.today_orders }}, клиентов: {{ summary.period_paid_transaction_users }}, промокодов: {{ summary.period_free_promos }}</small>
 	</div>
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Пользователи</span>
@@ -315,8 +315,12 @@
 				<strong>{{ summary.paid_transaction_users }}</strong>
 			</div>
 			<div class="subscription-state-item">
-				<span>Оплаченные заказы</span>
+				<span>Денежные оплаты</span>
 				<strong>{{ summary.all_time_orders }}</strong>
+			</div>
+			<div class="subscription-state-item is-trial">
+				<span>Бесплатные промокоды</span>
+				<strong>{{ summary.all_time_free_promos }}</strong>
 			</div>
 		</div>
 	</section>
@@ -363,8 +367,8 @@
 	<section class="analytics-panel analytics-panel-wide paid-transactions-panel">
 		<div class="section-head">
 			<div>
-				<h2>Все оплаченные покупки</h2>
-				<span class="panel-note">последние платежи сверху, всего {{ analytics.paid_transactions|length }}</span>
+				<h2>Все завершённые покупки</h2>
+				<span class="panel-note">денежные оплаты и бесплатные промокоды, последние сверху; всего {{ analytics.paid_transactions|length }}</span>
 			</div>
 			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
 		</div>
@@ -392,14 +396,14 @@
 						</td>
 						<td><span class="tx-plan">{{ tx.plan }}</span></td>
 						<td><span class="tx-method">{{ tx.method }}</span></td>
-						<td class="tx-amount"><strong>{{ "%.2f"|format(tx.amount) }} ₽</strong></td>
+						<td class="tx-amount"><strong>{{ 'Бесплатно' if tx.is_free_promo else ('%.2f ₽'|format(tx.amount)) }}</strong></td>
 					</tr>
 					{% endfor %}
 				</tbody>
 			</table>
 		</div>
 		{% else %}
-		<p class="empty-state">Оплаченных покупок пока нет.</p>
+		<p class="empty-state">Завершённых покупок пока нет.</p>
 		{% endif %}
 	</section>
 

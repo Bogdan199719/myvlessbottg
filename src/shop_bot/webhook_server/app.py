@@ -20,6 +20,7 @@ from collections import defaultdict
 from hmac import compare_digest
 from datetime import datetime, timedelta
 from shop_bot.utils import time_utils, update_manager
+from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
 from shop_bot.version import APP_VERSION
 from functools import wraps
 from math import ceil
@@ -51,6 +52,11 @@ from yookassa import Payment
 from shop_bot.modules import mtg_api, xui_api
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
+from shop_bot.webhook_server.restore_manager import (
+    schedule_process_restart,
+    stage_pending_restore,
+    validate_sqlite_database,
+)
 from shop_bot.data_manager import scheduler
 from shop_bot.data_manager.database import (
     get_all_settings,
@@ -449,29 +455,10 @@ def _get_schema_version(db_path: Path) -> int:
 
 def _validate_restore_db(db_path: Path) -> None:
     """Validate uploaded SQLite DB before it can replace the live database."""
-    required_tables = {"users", "vpn_keys", "transactions", "bot_settings"}
     try:
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA integrity_check")
-            integrity_row = cursor.fetchone()
-            integrity_result = str(integrity_row[0] if integrity_row else "").lower()
-            if integrity_result != "ok":
-                raise ValueError("Проверка целостности БД не пройдена.")
-
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-            tables = {str(row[0]) for row in cursor.fetchall()}
+        validate_sqlite_database(db_path)
     except sqlite3.DatabaseError as e:
         raise ValueError("Файл users.db в архиве не является корректной SQLite БД.") from e
-
-    missing_tables = sorted(required_tables - tables)
-    if missing_tables:
-        raise ValueError(
-            "В backup-базе отсутствуют обязательные таблицы: "
-            + ", ".join(missing_tables)
-        )
 
 
 def _create_backup_zip(include_env: bool = False) -> tuple[Path, Path]:
@@ -543,12 +530,6 @@ def _safe_extract_zip(zip_ref: zipfile.ZipFile, extract_dir: Path) -> None:
 
 def _restore_from_backup(zip_file, apply_env: bool = False) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix="restore_"))
-    restart_results: dict[str, dict] = {}
-    previous_status = {
-        "shop_bot_running": False,
-        "support_bot_running": False,
-        "is_running": False,
-    }
     try:
         upload_path = temp_dir / "upload.zip"
         zip_file.save(upload_path)
@@ -575,46 +556,12 @@ def _restore_from_backup(zip_file, apply_env: bool = False) -> dict:
                         "Контрольная сумма БД не совпадает, архив повреждён."
                     )
 
-        # Остановить ботов перед заменой БД
-        try:
-            if _bot_controller:
-                previous_status = dict(_bot_controller.get_status())
-                if previous_status.get("is_running"):
-                    _bot_controller.stop()
-        except Exception as e:
-            logger.error(f"Failed to stop bots before restore: {e}", exc_info=True)
+        env_src = extract_dir / ".env" if apply_env else None
+        if apply_env and (env_src is None or not env_src.exists()):
+            raise ValueError("В архиве нет файла .env, но его импорт был запрошен.")
 
-        # Резервная копия текущей базы
-        DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if DB_FILE.exists():
-            backup_path = DB_FILE.with_suffix(
-                f".bak.{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
-            )
-            shutil.copyfile(DB_FILE, backup_path)
-
-        # Замена базы
-        shutil.copyfile(db_src, DB_FILE)
-        run_migration()
-
-        if apply_env:
-            env_src = extract_dir / ".env"
-            if env_src.exists():
-                shutil.copyfile(env_src, ENV_FILE)
-
-        if _bot_controller:
-            if previous_status.get("shop_bot_running"):
-                restart_results["shop"] = _bot_controller.start_shop_bot()
-            if previous_status.get("support_bot_running"):
-                restart_results["support"] = _bot_controller.start_support_bot()
-
-        return {
-            "restart_results": restart_results,
-            "restart_errors": [
-                result.get("message", "unknown error")
-                for result in restart_results.values()
-                if result.get("status") != "success"
-            ],
-        }
+        pending_dir = stage_pending_restore(APP_ROOT, db_src, env_src)
+        return {"restart_required": True, "pending_dir": str(pending_dir)}
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -737,6 +684,7 @@ def _is_valid_cryptobot_signature() -> bool:
 ALL_SETTINGS_KEYS = [
     "panel_login",
     "panel_password",
+    "admin_ip_allowlist",
     "show_about_menu_item",
     "about_text",
     "terms_url",
@@ -862,6 +810,7 @@ def create_webhook_app(bot_controller_instance):
 
     # Login brute-force protection
     _login_attempts = defaultdict(list)
+    _login_attempts_lock = threading.Lock()
     _LOGIN_MAX_ATTEMPTS = 5
     _LOGIN_WINDOW_SECONDS = 300
 
@@ -1029,16 +978,27 @@ def create_webhook_app(bot_controller_instance):
         settings = get_all_settings()
         if request.method == "POST":
             # Brute-force protection
-            client_ip = request.remote_addr or "unknown"
+            client_ip = get_client_ip(request)
+            client_is_allowlisted = is_ip_allowlisted(
+                client_ip, settings.get("admin_ip_allowlist")
+            )
             now = _time.time()
-            _login_attempts[client_ip] = [
-                t for t in _login_attempts[client_ip] if now - t < _LOGIN_WINDOW_SECONDS
-            ]
-            if len(_login_attempts[client_ip]) >= _LOGIN_MAX_ATTEMPTS:
-                flash(
-                    "Слишком много попыток входа. Попробуйте через 5 минут.", "danger"
-                )
-                return render_template("login.html"), 429
+            if not client_is_allowlisted:
+                with _login_attempts_lock:
+                    _login_attempts[client_ip] = [
+                        t
+                        for t in _login_attempts[client_ip]
+                        if now - t < _LOGIN_WINDOW_SECONDS
+                    ]
+                    login_is_limited = (
+                        len(_login_attempts[client_ip]) >= _LOGIN_MAX_ATTEMPTS
+                    )
+                if login_is_limited:
+                    flash(
+                        "Слишком много попыток входа. Попробуйте через 5 минут.",
+                        "danger",
+                    )
+                    return render_template("login.html"), 429
 
             username_ok = request.form.get("username") == settings.get("panel_login")
             password_ok = _verify_and_upgrade_panel_password(
@@ -1046,7 +1006,8 @@ def create_webhook_app(bot_controller_instance):
                 settings.get("panel_password"),
             )
             if username_ok and password_ok:
-                _login_attempts.pop(client_ip, None)
+                with _login_attempts_lock:
+                    _login_attempts.pop(client_ip, None)
                 session["logged_in"] = True
                 session.permanent = True
                 session.pop("_csrf_token", None)  # Rotate CSRF token on login
@@ -1055,7 +1016,9 @@ def create_webhook_app(bot_controller_instance):
                     return redirect(next_url)
                 return redirect(url_for("dashboard_page"))
             else:
-                _login_attempts[client_ip].append(now)
+                if not client_is_allowlisted:
+                    with _login_attempts_lock:
+                        _login_attempts[client_ip].append(now)
                 flash("Неверный логин или пароль", "danger")
         return render_template("login.html")
 
@@ -1582,6 +1545,8 @@ def create_webhook_app(bot_controller_instance):
                 "period_orders": 0,
                 "all_time_revenue": 0.0,
                 "all_time_orders": 0,
+                "all_time_free_promos": 0,
+                "period_free_promos": 0,
                 "active_paid_keys": 0,
                 "expired_paid_keys": 0,
                 "active_total_keys": 0,
@@ -1835,23 +1800,33 @@ def create_webhook_app(bot_controller_instance):
                     if status != "paid":
                         continue
 
-                    paid_transaction_users.add(int(row["user_id"]))
-                    analytics["summary"]["all_time_revenue"] += amount
-                    analytics["summary"]["all_time_orders"] += 1
+                    is_free_promo = method == "Promo" and amount <= 0
+                    is_monetary_payment = amount > 0 and not is_free_promo
 
-                    if day in date_set:
-                        period_paid_transaction_users.add(int(row["user_id"]))
-                        analytics["series"]["revenue"][day] += amount
-                        analytics["series"]["orders"][day] += 1
-                        top_days[day]["revenue"] += amount
-                        top_days[day]["orders"] += 1
-                        top_days[day]["users"] += 1
+                    if is_free_promo:
+                        analytics["summary"]["all_time_free_promos"] += 1
+                        if day in date_set:
+                            analytics["summary"]["period_free_promos"] += 1
 
-                        method_bucket = method_totals.setdefault(
-                            method, {"method": method, "revenue": 0.0, "orders": 0}
-                        )
-                        method_bucket["revenue"] += amount
-                        method_bucket["orders"] += 1
+                    if is_monetary_payment:
+                        paid_transaction_users.add(int(row["user_id"]))
+                        analytics["summary"]["all_time_revenue"] += amount
+                        analytics["summary"]["all_time_orders"] += 1
+
+                        if day in date_set:
+                            period_paid_transaction_users.add(int(row["user_id"]))
+                            analytics["series"]["revenue"][day] += amount
+                            analytics["series"]["orders"][day] += 1
+                            top_days[day]["revenue"] += amount
+                            top_days[day]["orders"] += 1
+                            top_days[day]["users"] += 1
+
+                            method_bucket = method_totals.setdefault(
+                                method,
+                                {"method": method, "revenue": 0.0, "orders": 0},
+                            )
+                            method_bucket["revenue"] += amount
+                            method_bucket["orders"] += 1
 
                     plan_id = str(metadata.get("plan_id") or "")
                     if method == "Promo" and metadata.get("promo_code"):
@@ -1867,7 +1842,7 @@ def create_webhook_app(bot_controller_instance):
                             or plan_names.get(plan_id)
                             or (f"Тариф #{plan_id}" if plan_id else "Не указан")
                         )
-                    if day in date_set:
+                    if day in date_set and is_monetary_payment:
                         plan_bucket = plan_totals.setdefault(
                             plan_name, {"plan": plan_name, "revenue": 0.0, "orders": 0}
                         )
@@ -1884,6 +1859,7 @@ def create_webhook_app(bot_controller_instance):
                             "plan": plan_name,
                             "date": transaction_date,
                             "date_label": _format_transaction_dt(transaction_date),
+                            "is_free_promo": is_free_promo,
                         }
                     )
 
@@ -1959,7 +1935,7 @@ def create_webhook_app(bot_controller_instance):
                     reverse=True,
                 )[:6]
                 analytics["top_days"] = sorted(
-                    top_days.values(),
+                    (item for item in top_days.values() if item["orders"] > 0),
                     key=lambda item: item["revenue"],
                     reverse=True,
                 )[:5]
@@ -2530,6 +2506,10 @@ def create_webhook_app(bot_controller_instance):
                 "paid_keys_total",
                 "latest_paid_expiry",
                 "trial_keys_active",
+                "pending_transactions",
+                "free_transactions",
+                "support_tickets",
+                "support_messages",
             ],
         )
 
@@ -3809,12 +3789,17 @@ def create_webhook_app(bot_controller_instance):
 
         try:
             restore_result = _restore_from_backup(backup_file, apply_env=apply_env)
-            flash("Бэкап успешно импортирован. Текущая база заменена.", "success")
-            for message in restore_result.get("restart_errors", []):
-                flash(
-                    f"Боты после импорта не были перезапущены автоматически: {message}",
-                    "warning",
-                )
+            flash(
+                "Бэкап проверен и подготовлен. Приложение перезапускается; "
+                "база будет заменена до запуска ботов и планировщика.",
+                "success",
+            )
+
+            @after_this_request
+            def restart_after_restore(response):
+                if restore_result.get("restart_required"):
+                    schedule_process_restart()
+                return response
         except ValueError as e:
             flash(str(e), "warning")
         except Exception as e:

@@ -53,6 +53,9 @@ DEFAULT_BOT_SETTINGS = {
     "panel_login": os.getenv("PANEL_LOGIN", "admin"),
     "panel_password": os.getenv("PANEL_PASSWORD"),
     "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
+    "admin_ip_allowlist": os.getenv(
+        "ADMIN_IP_ALLOWLIST", "94.183.234.189 79.139.250.224"
+    ),
     "show_about_menu_item": "true",
     "about_text": None,
     "terms_url": None,
@@ -270,6 +273,9 @@ def initialize_db():
                     key_id INTEGER,
                     host_name TEXT,
                     customer_email TEXT,
+                    service_type TEXT,
+                    plan_name TEXT,
+                    referral_discount_applied INTEGER NOT NULL DEFAULT 0,
                     submitted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
@@ -829,6 +835,18 @@ def run_migration():
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_promo_redemptions_promo_status ON promo_code_redemptions(promo_id, status)"
             )
+
+            cursor.execute("PRAGMA table_info(p2p_requests)")
+            p2p_columns = {row[1] for row in cursor.fetchall()}
+            for column_name, column_sql in (
+                ("service_type", "TEXT"),
+                ("plan_name", "TEXT"),
+                ("referral_discount_applied", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column_name not in p2p_columns:
+                    cursor.execute(
+                        f"ALTER TABLE p2p_requests ADD COLUMN {column_name} {column_sql}"
+                    )
 
             logging.info("The migration of profit distribution tables ...")
             cursor.execute("""
@@ -2073,12 +2091,112 @@ def get_total_spent_sum() -> float:
         return 0.0
 
 
+def has_paid_vpn_transaction(user_id: int) -> bool:
+    """Return whether payment history proves that the user bought VPN access.
+
+    Legacy rows did not snapshot ``service_type``.  For those, use the current
+    plan/host tables when available and default unknown historical purchases to
+    XUI, while never treating a positively identified MTG purchase as VPN.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT metadata
+                FROM transactions
+                WHERE user_id = ? AND status = 'paid'
+                """,
+                (int(user_id),),
+            ).fetchall()
+            xui_hosts = {
+                str(row[0])
+                for row in conn.execute("SELECT host_name FROM xui_hosts").fetchall()
+            }
+            mtg_hosts = {
+                str(row[0])
+                for row in conn.execute("SELECT host_name FROM mtg_hosts").fetchall()
+            }
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                service_type = str(metadata.get("service_type") or "").lower()
+                if service_type == "mtg":
+                    continue
+                if service_type == "xui":
+                    return True
+
+                plan_id = metadata.get("plan_id")
+                if plan_id is not None:
+                    plan_row = conn.execute(
+                        "SELECT service_type FROM plans WHERE plan_id = ?",
+                        (plan_id,),
+                    ).fetchone()
+                    if plan_row:
+                        if str(plan_row[0] or "xui").lower() == "mtg":
+                            continue
+                        return True
+
+                host_name = str(metadata.get("host_name") or "")
+                if host_name and host_name in mtg_hosts and host_name not in xui_hosts:
+                    continue
+                # Promo and pre-service_type transaction rows represented XUI
+                # subscriptions. Preserve that historical eligibility rule.
+                return True
+        return False
+    except sqlite3.Error as e:
+        logging.error("Failed to inspect paid VPN history for user %s: %s", user_id, e)
+        return False
+
+
 def create_pending_transaction(
     payment_id: str, user_id: int, amount_rub: float, metadata: dict
 ) -> int:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            if metadata.get("referral_discount_applied"):
+                cursor.execute(
+                    """
+                    SELECT metadata
+                    FROM transactions
+                    WHERE user_id = ?
+                      AND status IN ('pending', 'processing', 'paid')
+                      AND payment_id != ?
+                    """,
+                    (int(user_id), str(payment_id)),
+                )
+                for row in cursor.fetchall():
+                    try:
+                        other_metadata = json.loads(row[0] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if other_metadata.get("referral_discount_applied"):
+                        conn.rollback()
+                        logging.warning(
+                            "Refusing a second active first-purchase discount invoice for user %s",
+                            user_id,
+                        )
+                        return 0
+                cursor.execute(
+                    """
+                    SELECT 1 FROM p2p_requests
+                    WHERE user_id = ? AND referral_discount_applied = 1
+                      AND request_id != ?
+                    LIMIT 1
+                    """,
+                    (int(user_id), str(metadata.get("request_id") or "")),
+                )
+                if cursor.fetchone():
+                    conn.rollback()
+                    logging.warning(
+                        "Refusing a discounted invoice while a discounted P2P request exists for user %s",
+                        user_id,
+                    )
+                    return 0
             cursor.execute(
                 "SELECT username FROM users WHERE telegram_id = ?", (user_id,)
             )
@@ -2214,10 +2332,14 @@ def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> boo
         return False
 
 
-def recover_stale_global_processing_transactions(
+def recover_stale_processing_transactions(
     older_than_minutes: int = 15,
 ) -> int:
-    """Return interrupted idempotent global fulfillments to the retry queue."""
+    """Return interrupted provider-confirmed fulfillments to the retry queue.
+
+    Payment fulfillment persists an absolute target before touching a panel, so
+    global and single-host XUI/MTG purchases can all be resumed safely.
+    """
     cutoff = time_utils.get_msk_now() - timedelta(
         minutes=max(5, int(older_than_minutes))
     )
@@ -2240,9 +2362,9 @@ def recover_stale_global_processing_transactions(
                     metadata = json.loads(row["metadata"] or "{}")
                 except json.JSONDecodeError:
                     continue
-                if metadata.get("host_name") != "ALL":
-                    continue
                 if not metadata.get("provider_payment_id"):
+                    continue
+                if not metadata.get("fulfillment_target_expiry_ms"):
                     continue
 
                 started_at = time_utils.parse_iso_to_msk(
@@ -2270,6 +2392,13 @@ def recover_stale_global_processing_transactions(
     except sqlite3.Error as e:
         logging.error("Failed to recover stale processing transactions: %s", e)
         return 0
+
+
+def recover_stale_global_processing_transactions(
+    older_than_minutes: int = 15,
+) -> int:
+    """Backward-compatible alias for the generalized recovery routine."""
+    return recover_stale_processing_transactions(older_than_minutes)
 
 
 def apply_payment_accounting_once(
@@ -4474,13 +4603,54 @@ def release_promo_code_claim(promo_id: int, user_id: int) -> bool:
 # --- P2P requests (persistent) ---
 
 
-def create_p2p_request(request_id: str, data: dict) -> None:
+def create_p2p_request(request_id: str, data: dict) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if data.get("referral_discount_applied"):
+                # A not-yet-submitted card request is only a draft. Replace an
+                # older draft so it cannot reserve the one-time discount forever.
+                conn.execute(
+                    """
+                    DELETE FROM p2p_requests
+                    WHERE user_id = ? AND submitted = 0
+                      AND referral_discount_applied = 1
+                      AND request_id != ?
+                    """,
+                    (int(data["user_id"]), request_id),
+                )
+                row = conn.execute(
+                    """
+                    SELECT metadata FROM transactions
+                    WHERE user_id = ? AND status IN ('pending', 'processing', 'paid')
+                    """,
+                    (int(data["user_id"]),),
+                ).fetchall()
+                for transaction_row in row:
+                    try:
+                        transaction_metadata = json.loads(transaction_row[0] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if transaction_metadata.get("referral_discount_applied"):
+                        conn.rollback()
+                        return False
+                existing = conn.execute(
+                    """
+                    SELECT 1 FROM p2p_requests
+                    WHERE user_id = ? AND referral_discount_applied = 1
+                      AND request_id != ? LIMIT 1
+                    """,
+                    (int(data["user_id"]), request_id),
+                ).fetchone()
+                if existing:
+                    conn.rollback()
+                    return False
             conn.execute(
                 """INSERT OR REPLACE INTO p2p_requests
-                   (request_id, user_id, plan_id, months, price, action, key_id, host_name, customer_email, submitted, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (request_id, user_id, plan_id, months, price, action, key_id,
+                    host_name, customer_email, service_type, plan_name,
+                    referral_discount_applied, submitted, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     data["user_id"],
@@ -4491,13 +4661,18 @@ def create_p2p_request(request_id: str, data: dict) -> None:
                     data.get("key_id"),
                     data.get("host_name"),
                     data.get("customer_email"),
+                    data.get("service_type"),
+                    data.get("plan_name"),
+                    int(bool(data.get("referral_discount_applied"))),
                     int(data.get("submitted", False)),
                     time_utils.get_msk_now().isoformat(),
                 ),
             )
             conn.commit()
+            return True
     except sqlite3.Error as e:
         logging.error(f"Failed to create p2p_request {request_id}: {e}")
+        return False
 
 
 def get_p2p_request(request_id: str) -> dict | None:

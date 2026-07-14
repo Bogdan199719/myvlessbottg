@@ -87,7 +87,7 @@ def _global_fulfillment_is_complete_and_idempotent(
 ) -> bool:
     process_fn = functions.get("process_successful_payment")
     execute_fn = functions.get("_execute_payment_for_hosts")
-    target_fn = functions.get("_target_expiry_ms_for_global_payment")
+    target_fn = functions.get("_target_expiry_ms_for_xui_payment")
     if not (
         isinstance(process_fn, ast.AsyncFunctionDef)
         and isinstance(execute_fn, ast.AsyncFunctionDef)
@@ -99,8 +99,7 @@ def _global_fulfillment_is_complete_and_idempotent(
     execute_text = _source_segment(source, execute_fn)
     target_text = _source_segment(source, target_fn)
     required_process_fragments = (
-        'host_name == "ALL"',
-        "_target_expiry_ms_for_global_payment(",
+        "_target_expiry_ms_for_xui_payment(",
         "update_reserved_transaction_metadata(",
         "len(results) != len(hosts_to_process)",
         "return False",
@@ -187,9 +186,9 @@ def main() -> int:
                 "payment fulfillment must continue when Telegram status messaging fails"
             )
         process_text = _source_segment(source, process_fn)
-        if "Could not persist global fulfillment target" not in process_text:
+        if "Could not persist fulfillment target" not in process_text:
             failures.append(
-                "global payment target must be persisted before external fulfillment"
+                "payment target must be persisted before external fulfillment"
             )
         if "apply_payment_accounting_once(" not in process_text:
             failures.append(

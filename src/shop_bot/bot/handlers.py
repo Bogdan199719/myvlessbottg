@@ -54,12 +54,14 @@ from shop_bot.data_manager.database import (
     update_reserved_transaction_metadata,
     apply_payment_accounting_once,
     finalize_reserved_transaction,
+    mark_pending_transaction_status,
     get_all_users,
     set_referral_balance,
     set_referral_balance_all,
     DB_FILE,
     get_user_paid_keys,
     get_user_trial_keys,
+    has_paid_vpn_transaction,
     set_pending_payment,
     clear_all_pending_payments,
     get_or_create_subscription_token,
@@ -419,23 +421,21 @@ def get_active_global_paid_keys(user_id: int) -> list[dict]:
 
 def has_ever_purchased_vpn_subscription(user_id: int) -> bool:
     """Trial is only for users who have never bought VPN access."""
-    user_data = get_user(user_id)
-    if user_data:
-        try:
-            if float(user_data.get("total_spent") or 0) > 0:
-                return True
-        except (TypeError, ValueError):
-            pass
-        try:
-            if int(user_data.get("total_months") or 0) > 0:
-                return True
-        except (TypeError, ValueError):
-            pass
-
+    # Aggregate spend/months include MTG proxy purchases.  They must not make
+    # an otherwise eligible user lose the VPN trial.
     for key in get_user_paid_keys(user_id):
-        if key.get("service_type", "xui") == "xui":
+        if key.get("service_type", "xui") != "mtg":
             return True
-    return False
+    return has_paid_vpn_transaction(user_id)
+
+
+def _plan_snapshot(plan: dict) -> dict:
+    """Fields required to fulfil an invoice even if the plan later changes."""
+    return {
+        "months": int(plan["months"]),
+        "service_type": str(plan.get("service_type") or "xui"),
+        "plan_name": str(plan.get("plan_name") or f"{plan['months']} мес."),
+    }
 
 
 def _get_stars_transaction(payment_id: str) -> dict | None:
@@ -1959,7 +1959,7 @@ def get_user_router() -> Router:
             target_expiry_ms = promo.get("fulfillment_target_expiry_ms")
             if not target_expiry_ms:
                 promo_metadata: dict = {}
-                calculated_target = _target_expiry_ms_for_global_payment(
+                calculated_target = _target_expiry_ms_for_xui_payment(
                     user_id, duration_days, hosts_to_process, promo_metadata
                 )
                 target_expiry_ms = set_promo_fulfillment_target(
@@ -2677,7 +2677,10 @@ def get_user_router() -> Router:
                     f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
                 ) + CHOOSE_PAYMENT_METHOD_MESSAGE
 
-        await state.update_data(final_price=float(final_price))
+        await state.update_data(
+            final_price=float(final_price),
+            referral_discount_applied=bool(final_price < price),
+        )
 
         methods = get_active_payment_methods(
             context_key=_build_payment_context(
@@ -2788,6 +2791,8 @@ def get_user_router() -> Router:
         action = data.get("action")
         key_id = data.get("key_id")
         months = plan["months"]
+        plan_snapshot = _plan_snapshot(plan)
+        referral_discount_applied = bool(price_rub < base_price)
 
         try:
             price_str_for_api = f"{price_rub:.2f}"
@@ -2819,7 +2824,7 @@ def get_user_router() -> Router:
                 "description": f"Подписка на {months} мес.",
                 "metadata": {
                     "user_id": user_id,
-                    "months": months,
+                    **plan_snapshot,
                     "price": price_float_for_metadata,
                     "action": action,
                     "key_id": key_id,
@@ -2827,6 +2832,7 @@ def get_user_router() -> Router:
                     "plan_id": plan_id,
                     "customer_email": customer_email,
                     "payment_method": "YooKassa",
+                    "referral_discount_applied": referral_discount_applied,
                 },
             }
             if receipt:
@@ -3032,7 +3038,7 @@ def get_user_router() -> Router:
         payment_id = str(uuid.uuid4())
         metadata = {
             "user_id": user_id,
-            "months": plan["months"],
+            **_plan_snapshot(plan),
             "price": float(price_rub),
             "expected_stars_amount": stars_amount,
             "action": data.get("action"),
@@ -3041,6 +3047,9 @@ def get_user_router() -> Router:
             "plan_id": data.get("plan_id"),
             "customer_email": data.get("customer_email"),
             "payment_method": "Telegram Stars",
+            "referral_discount_applied": bool(
+                data.get("referral_discount_applied")
+            ),
         }
 
         title = f"Подписка на {plan['months']} мес."
@@ -3276,7 +3285,10 @@ def get_user_router() -> Router:
                 )
                 price_rub = base_price - discount_amount
         months = plan["months"]
+        plan_snapshot = _plan_snapshot(plan)
+        referral_discount_applied = bool(price_rub < base_price)
 
+        payment_id = None
         try:
             exchange_rate = await get_usdt_rub_rate()
 
@@ -3321,7 +3333,7 @@ def get_user_router() -> Router:
             payment_id = str(uuid.uuid4())
             metadata = {
                 "user_id": user_id,
-                "months": months,
+                **plan_snapshot,
                 "price": float(price_rub),
                 "action": action,
                 "key_id": key_id,
@@ -3329,6 +3341,7 @@ def get_user_router() -> Router:
                 "plan_id": plan_id,
                 "customer_email": customer_email,
                 "payment_method": "CryptoBot",
+                "referral_discount_applied": referral_discount_applied,
             }
             pending_id = create_pending_transaction(
                 payment_id, user_id, float(price_rub), metadata
@@ -3357,6 +3370,12 @@ def get_user_router() -> Router:
             await state.clear()
 
         except Exception as e:
+            if payment_id:
+                mark_pending_transaction_status(
+                    payment_id,
+                    "failed",
+                    payment_method="CryptoBot",
+                )
             logger.error(
                 f"Failed to create Crypto Pay invoice for user {user_id}: {e}",
                 exc_info=True,
@@ -3397,7 +3416,7 @@ def get_user_router() -> Router:
         final_price = Decimal(str(data.get("final_price", base_price)))
         price_rub = float(final_price)
 
-        create_p2p_request(
+        created = create_p2p_request(
             request_id,
             {
                 "user_id": user_id,
@@ -3408,9 +3427,24 @@ def get_user_router() -> Router:
                 "host_name": data.get("host_name") or "",
                 "plan_id": plan_id or 0,
                 "customer_email": data.get("customer_email"),
+                **(_plan_snapshot(plan) if plan else {}),
+                "plan_name": (
+                    str(plan.get("plan_name") or f"{plan['months']} мес.")
+                    if plan
+                    else None
+                ),
+                "referral_discount_applied": bool(
+                    data.get("referral_discount_applied")
+                ),
                 "submitted": False,
             },
         )
+        if not created:
+            await callback.message.edit_text(
+                "⚠️ Скидка на первую покупку уже зарезервирована в другом счёте. "
+                "Завершите или отмените предыдущую оплату и попробуйте снова."
+            )
+            return
 
         await callback.message.edit_text(
             (
@@ -3508,17 +3542,11 @@ def get_user_router() -> Router:
             await message.answer("Заявка не найдена или уже подтверждена/отклонена.")
             return
 
-        if not delete_p2p_request(request_id):
-            await message.answer("Заявка уже обрабатывается другим подтверждением.")
-            return
-
         await message.answer("Платеж подтвержден. Выполняю выдачу ключа.")
-        pending["payment_method"] = "P2P"
-        success = await process_successful_payment(bot, pending)
+        success = await _process_approved_p2p_request(bot, request_id, pending)
         if success:
             await message.answer("Ключ успешно выдан.")
         else:
-            create_p2p_request(request_id, pending)
             await message.answer(
                 "Выдача не завершилась. Заявка сохранена, можно повторить подтверждение позже."
             )
@@ -3563,27 +3591,16 @@ def get_user_router() -> Router:
             await callback.message.edit_text("⚠️ Заявка уже была обработана ранее.")
             return
 
-        # Delete BEFORE processing to prevent double-approve race condition
-        if not delete_p2p_request(request_id):
-            await callback.answer(
-                "Заявка уже обрабатывается другим подтверждением.", show_alert=True
-            )
-            await callback.message.edit_text("⚠️ Заявка уже обрабатывается.")
-            return
-
         await callback.answer("Платеж подтвержден.")
         await callback.message.edit_text(
             "✅ Платеж подтвержден. Выполняю выдачу ключа."
         )
-        pending["payment_method"] = "P2P"
-        success = await process_successful_payment(bot, pending)
+        success = await _process_approved_p2p_request(bot, request_id, pending)
         if success:
             await callback.message.edit_text(
                 "✅ Платеж подтвержден. Ключ успешно выдан."
             )
         else:
-            # Restore request so admin can retry
-            create_p2p_request(request_id, pending)
             await callback.message.edit_text(
                 "⚠️ Выдача завершилась ошибкой. Заявка восстановлена, подтверждение можно повторить."
             )
@@ -3783,7 +3800,8 @@ async def _create_mtg_proxy_after_payment(
     months: int,
     price: float,
     metadata: dict,
-    plan: dict,
+    plan: dict | None,
+    target_expiry_ms: int,
 ) -> bool:
     """Handle the MTG proxy creation/renewal after successful payment."""
     from shop_bot.data_manager.database import (
@@ -3804,48 +3822,141 @@ async def _create_mtg_proxy_after_payment(
                 return False
             proxy_name = existing_key["key_email"]
             node_id = int(existing_key["xui_client_uuid"])
-            current_exp = time_utils.parse_iso_to_msk(existing_key.get("expiry_date"))
-            current_expiry_ms = (
-                int(current_exp.timestamp() * 1000) if current_exp else 0
+            panel_details = await mtg_api.get_proxy_details(host_name, proxy_name)
+            panel_expiry_ms = int(
+                (panel_details or {}).get("expiry_timestamp_ms") or 0
             )
-            new_expiry_ms = await mtg_api.renew_proxy_for_user(
-                host_name, proxy_name, node_id, days, current_expiry_ms
-            )
-            if not new_expiry_ms:
-                await processing_message.edit_text(
-                    "❌ Не удалось продлить прокси. Обратитесь в поддержку."
+            if not panel_details or panel_expiry_ms <= 0:
+                logger.error(
+                    "MTG panel expiry is unavailable for %s; refusing a relative renew",
+                    proxy_name,
                 )
                 return False
+            current_expiry_ms = panel_expiry_ms
+            if panel_details and panel_details.get("node_id") is not None:
+                node_id = int(panel_details["node_id"])
+            if current_expiry_ms >= int(target_expiry_ms):
+                new_expiry_ms = current_expiry_ms
+            else:
+                base_ms = max(
+                    current_expiry_ms,
+                    time_utils.get_timestamp_ms(time_utils.get_msk_now()),
+                )
+                remaining_ms = max(1, int(target_expiry_ms) - base_ms)
+                days = max(1, (remaining_ms + 86_400_000 - 1) // 86_400_000)
+                new_expiry_ms = await mtg_api.renew_proxy_for_user(
+                    host_name, proxy_name, node_id, days, current_expiry_ms
+                )
+                if not new_expiry_ms:
+                    await processing_message.edit_text(
+                        "❌ Не удалось продлить прокси. Обратитесь в поддержку."
+                    )
+                    return False
             new_expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
-            update_key_info(key_id, new_expiry_dt)
-            update_key_plan_id(key_id, int(plan_id))
-            proxy_link = existing_key.get(
+            proxy_link = (panel_details or {}).get(
                 "connection_string"
-            ) or await mtg_api.get_proxy_link(host_name, proxy_name)
+            ) or existing_key.get("connection_string")
+            if not proxy_link:
+                logger.error("MTG proxy link is unavailable for key_id=%s", key_id)
+                return False
+            if not update_key_info(
+                key_id,
+                new_expiry_dt,
+                proxy_link,
+                xui_client_uuid=str(node_id),
+            ):
+                logger.error(
+                    "MTG proxy was renewed/recovered but DB update failed for key_id=%s",
+                    key_id,
+                )
+                return False
+            if not update_key_plan_id(key_id, int(plan_id)):
+                logger.error(
+                    "MTG proxy was renewed/recovered but plan update failed for key_id=%s",
+                    key_id,
+                )
+                return False
             used_key_id = key_id
         else:
             # New proxy
-            key_num = get_next_key_number(user_id)
-            proxy_name = f"user{user_id}key{key_num}mtg"
-            result = await mtg_api.create_proxy_for_user(host_name, proxy_name, days)
-            if not result:
-                await processing_message.edit_text(
-                    "❌ Не удалось создать прокси. Обратитесь в поддержку."
-                )
-                return False
-            proxy_link = result["connection_string"]
-            new_expiry_ms = result["expiry_timestamp_ms"]
-            new_expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
-            used_key_id = add_new_key(
-                user_id=user_id,
-                host_name=host_name,
-                xui_client_uuid=str(result["node_id"]),
-                key_email=proxy_name,
-                expiry_timestamp_ms=new_expiry_ms,
-                connection_string=proxy_link,
-                plan_id=plan_id,
-                service_type="mtg",
+            proxy_name = str(metadata.get("fulfillment_key_email") or "").strip()
+            if not proxy_name:
+                key_num = get_next_key_number(user_id)
+                proxy_name = f"user{user_id}key{key_num}mtg"
+                metadata["fulfillment_key_email"] = proxy_name
+                provider_payment_id = metadata.get("provider_payment_id")
+                if provider_payment_id and not update_reserved_transaction_metadata(
+                    str(provider_payment_id), metadata
+                ):
+                    logger.error(
+                        "Could not persist MTG proxy identity for payment %s",
+                        provider_payment_id,
+                    )
+                    return False
+
+            existing_proxy_key = next(
+                (
+                    key
+                    for key in get_user_keys(user_id)
+                    if key.get("service_type") == "mtg"
+                    and key.get("key_email") == proxy_name
+                ),
+                None,
             )
+            if existing_proxy_key:
+                used_key_id = int(existing_proxy_key["key_id"])
+                proxy_link = existing_proxy_key.get("connection_string")
+                new_expiry_dt = time_utils.parse_iso_to_msk(
+                    existing_proxy_key.get("expiry_date")
+                )
+                if not proxy_link or not new_expiry_dt:
+                    logger.error(
+                        "Stored MTG fulfillment is incomplete for key_id=%s",
+                        used_key_id,
+                    )
+                    return False
+            else:
+                result = await mtg_api.get_proxy_details(host_name, proxy_name)
+                if result and not all(
+                    (
+                        result.get("node_id") is not None,
+                        result.get("connection_string"),
+                        int(result.get("expiry_timestamp_ms") or 0) > 0,
+                    )
+                ):
+                    logger.error(
+                        "MTG panel returned incomplete existing proxy details for %s",
+                        proxy_name,
+                    )
+                    return False
+                if not result:
+                    result = await mtg_api.create_proxy_for_user(
+                        host_name, proxy_name, days
+                    )
+                if not result:
+                    await processing_message.edit_text(
+                        "❌ Не удалось создать прокси. Обратитесь в поддержку."
+                    )
+                    return False
+                proxy_link = result["connection_string"]
+                new_expiry_ms = result["expiry_timestamp_ms"]
+                new_expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
+                used_key_id = add_new_key(
+                    user_id=user_id,
+                    host_name=host_name,
+                    xui_client_uuid=str(result["node_id"]),
+                    key_email=proxy_name,
+                    expiry_timestamp_ms=new_expiry_ms,
+                    connection_string=proxy_link,
+                    plan_id=plan_id,
+                    service_type="mtg",
+                )
+                if not used_key_id:
+                    logger.error(
+                        "MTG proxy was created but DB insert failed for %s",
+                        proxy_name,
+                    )
+                    return False
     except Exception as e:
         logger.error(
             f"MTG proxy creation/renewal failed for user {user_id}: {e}", exc_info=True
@@ -3857,24 +3968,46 @@ async def _create_mtg_proxy_after_payment(
 
     # Shared: referrals, stats, transaction log
     try:
-        user_data = get_user(user_id)
+        user_data = get_user(user_id) or {}
         referrer_id = user_data.get("referred_by")
+        reward = Decimal("0")
         if referrer_id:
             percentage = Decimal(get_setting("referral_percentage") or "0")
             reward = (Decimal(str(price)) * percentage / 100).quantize(Decimal("0.01"))
-            if float(reward) > 0:
-                add_to_referral_balance(referrer_id, float(reward))
-                try:
-                    referrer_username = user_data.get("username", "пользователь")
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 Ваш реферал @{referrer_username} совершил покупку на сумму {price:.2f} RUB!\n"
-                        f"💰 На ваш баланс начислено вознаграждение: {reward:.2f} RUB.",
-                    )
-                except Exception:
-                    pass
-        update_user_stats(user_id, price, months)
         provider_payment_id = metadata.get("provider_payment_id")
+        accounting_applied_now = True
+        if provider_payment_id:
+            accounting_applied_now = apply_payment_accounting_once(
+                str(provider_payment_id),
+                user_id,
+                price,
+                months,
+                int(referrer_id) if referrer_id else None,
+                float(reward),
+                metadata,
+            )
+            if not accounting_applied_now and not metadata.get("accounting_applied"):
+                logger.error(
+                    "Could not atomically apply MTG accounting for payment %s",
+                    provider_payment_id,
+                )
+                return False
+        else:
+            if referrer_id and float(reward) > 0:
+                add_to_referral_balance(referrer_id, float(reward))
+            update_user_stats(user_id, price, months)
+
+        if accounting_applied_now and referrer_id and float(reward) > 0:
+            try:
+                referrer_username = user_data.get("username", "пользователь")
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 Ваш реферал @{referrer_username} совершил покупку на сумму {price:.2f} RUB!\n"
+                    f"💰 На ваш баланс начислено вознаграждение: {reward:.2f} RUB.",
+                )
+            except Exception:
+                pass
+
         payment_id_for_log = (
             str(provider_payment_id).strip()
             if provider_payment_id
@@ -3906,7 +4039,7 @@ async def _create_mtg_proxy_after_payment(
                     {
                         "plan_id": plan_id,
                         "plan_name": (
-                            plan.get("plan_name", "Unknown") if plan else "Unknown"
+                            metadata.get("plan_name", "Unknown")
                         ),
                         "host_name": host_name,
                         "service_type": "mtg",
@@ -3918,6 +4051,7 @@ async def _create_mtg_proxy_after_payment(
         logger.error(
             f"MTG post-payment stats/log error for user {user_id}: {e}", exc_info=True
         )
+        return False
 
     try:
         try:
@@ -4011,13 +4145,71 @@ def _p2p_request_id_from_command(message: types.Message, command: CommandObject)
     return parts[1].strip() if len(parts) == 2 else ""
 
 
-def _target_expiry_ms_for_global_payment(
+async def _process_approved_p2p_request(
+    bot: Bot, request_id: str, pending: dict
+) -> bool:
+    """Fulfil a manual payment through the same durable state machine as providers."""
+    payment_id = f"p2p-{request_id}"
+    metadata = dict(pending)
+    metadata.update(
+        {
+            "payment_method": "P2P",
+            "provider_payment_id": payment_id,
+        }
+    )
+
+    status = _get_transaction_status(payment_id)
+    if status == "paid":
+        delete_p2p_request(request_id)
+        return True
+    if status is None:
+        if not create_pending_transaction(
+            payment_id,
+            int(metadata["user_id"]),
+            float(metadata["price"]),
+            metadata,
+        ):
+            return False
+
+    reserved = reserve_pending_transaction(
+        payment_id,
+        metadata,
+        payment_method="P2P",
+    )
+    if reserved is None:
+        return False
+
+    processed_ok = False
+    try:
+        processed_ok = await process_successful_payment(bot, reserved)
+    except Exception:
+        logger.exception("P2P fulfillment failed for request %s", request_id)
+    finally:
+        finalized = finalize_reserved_transaction(
+            payment_id,
+            success=processed_ok,
+            metadata=reserved,
+            payment_method="P2P",
+        )
+    if not finalized:
+        logger.error(
+            "Could not finalize P2P transaction %s after processing=%s",
+            payment_id,
+            processed_ok,
+        )
+        return False
+    if processed_ok:
+        delete_p2p_request(request_id)
+    return processed_ok
+
+
+def _target_expiry_ms_for_xui_payment(
     user_id: int,
     days_to_add: int,
     hosts_to_process: list[tuple[str, str]],
     metadata: dict | None = None,
 ) -> int:
-    """Return the stable absolute expiry used for idempotent ALL fulfillment."""
+    """Return the stable absolute expiry used for idempotent XUI fulfillment."""
     metadata = metadata if isinstance(metadata, dict) else {}
     existing_target = metadata.get("fulfillment_target_expiry_ms")
     try:
@@ -4045,6 +4237,42 @@ def _target_expiry_ms_for_global_payment(
     return target_ms
 
 
+def _target_expiry_ms_for_service_payment(
+    user_id: int,
+    days_to_add: int,
+    host_name: str,
+    service_type: str,
+    key_id: int,
+    metadata: dict,
+) -> int:
+    existing_target = metadata.get("fulfillment_target_expiry_ms")
+    try:
+        if int(existing_target or 0) > 0:
+            return int(existing_target)
+    except (TypeError, ValueError):
+        pass
+
+    now = time_utils.get_msk_now()
+    base_expiry = now
+    candidates = get_user_keys(user_id)
+    for key in candidates:
+        if str(key.get("service_type") or "xui") != service_type:
+            continue
+        if key_id and int(key.get("key_id") or 0) != int(key_id):
+            continue
+        if not key_id and key.get("host_name") != host_name:
+            continue
+        expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+        if expiry and expiry > base_expiry:
+            base_expiry = expiry
+
+    target_ms = time_utils.get_timestamp_ms(
+        base_expiry + timedelta(days=int(days_to_add))
+    )
+    metadata["fulfillment_target_expiry_ms"] = target_ms
+    return target_ms
+
+
 async def _execute_payment_for_hosts(
     user_id: int,
     purchase_host_name: str,
@@ -4068,7 +4296,7 @@ async def _execute_payment_for_hosts(
                 if existing_key_db:
                     h_email = existing_key_db["key_email"]
 
-            if purchase_host_name == "ALL" and target_expiry_ms:
+            if target_expiry_ms:
                 res = await xui_api.create_or_update_key_on_host_absolute_expiry(
                     host_name=h_name,
                     email=h_email,
@@ -4202,18 +4430,28 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             )
             return False
 
+        # The invoice snapshot is authoritative: changing/deleting a plan after
+        # payment creation must not change what the customer receives.
         plan = get_plan_by_id(plan_id)
-        if not plan:
-            logger.error(f"Plan {plan_id} not found during payment processing")
+        service_type = metadata.get("service_type")
+        if not service_type and plan:
+            service_type = plan.get("service_type", "xui")
+        if not service_type:
+            logger.error(
+                "Payment %s has neither a service snapshot nor an existing plan %s",
+                metadata.get("provider_payment_id"),
+                plan_id,
+            )
             await bot.send_message(
-                user_id, "❌ Ошибка: Тариф не найден. Обратитесь в поддержку."
+                user_id,
+                "❌ Не удалось определить тип оплаченной услуги. Обратитесь в поддержку.",
             )
             return False
-
-        months = plan[
-            "months"
-        ]  # Re-assign months from plan, as it might be different from metadata['months'] for some payment methods
-        service_type = plan.get("service_type", "xui")
+        metadata.setdefault("service_type", str(service_type))
+        metadata.setdefault(
+            "plan_name",
+            plan.get("plan_name", f"{months} мес.") if plan else f"{months} мес.",
+        )
 
     except (ValueError, TypeError) as e:
         logger.error(
@@ -4263,6 +4501,23 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     try:
         # ── MTG Proxy branch ──────────────────────────────────────────────
         if service_type == "mtg":
+            target_expiry_ms = _target_expiry_ms_for_service_payment(
+                user_id=user_id,
+                days_to_add=months * 30,
+                host_name=host_name,
+                service_type="mtg",
+                key_id=key_id,
+                metadata=metadata,
+            )
+            provider_payment_id = metadata.get("provider_payment_id")
+            if provider_payment_id and not update_reserved_transaction_metadata(
+                str(provider_payment_id), metadata
+            ):
+                logger.error(
+                    "Could not persist MTG fulfillment target for payment %s.",
+                    provider_payment_id,
+                )
+                return False
             return await _create_mtg_proxy_after_payment(
                 bot=bot,
                 processing_message=processing_message,
@@ -4275,6 +4530,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 price=float(metadata.get("price", 0)),
                 metadata=metadata,
                 plan=plan,
+                target_expiry_ms=target_expiry_ms,
             )
         # ─────────────────────────────────────────────────────────────────
 
@@ -4285,25 +4541,30 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             await processing_message.edit_text(prep_error)
             return False
 
+        if host_name != "ALL" and action == "new" and hosts_to_process:
+            stable_email = str(
+                metadata.get("fulfillment_key_email") or hosts_to_process[0][1]
+            ).strip()
+            metadata["fulfillment_key_email"] = stable_email
+            hosts_to_process = [(hosts_to_process[0][0], stable_email)]
+
         days_to_add = months * 30
-        target_expiry_ms = None
-        if host_name == "ALL":
-            target_expiry_ms = _target_expiry_ms_for_global_payment(
-                user_id, days_to_add, hosts_to_process, metadata
+        target_expiry_ms = _target_expiry_ms_for_xui_payment(
+            user_id, days_to_add, hosts_to_process, metadata
+        )
+        provider_payment_id = metadata.get("provider_payment_id")
+        if provider_payment_id and not update_reserved_transaction_metadata(
+            str(provider_payment_id), metadata
+        ):
+            logger.error(
+                "Could not persist fulfillment target for payment %s.",
+                provider_payment_id,
             )
-            provider_payment_id = metadata.get("provider_payment_id")
-            if provider_payment_id and not update_reserved_transaction_metadata(
-                str(provider_payment_id), metadata
-            ):
-                logger.error(
-                    "Could not persist global fulfillment target for payment %s.",
-                    provider_payment_id,
-                )
-                await processing_message.edit_text(
-                    "❌ Не удалось безопасно подготовить выдачу подписки. "
-                    "Я повторю попытку автоматически."
-                )
-                return False
+            await processing_message.edit_text(
+                "❌ Не удалось безопасно подготовить выдачу подписки. "
+                "Я повторю попытку автоматически."
+            )
+            return False
         results, primary_key_id = await _execute_payment_for_hosts(
             user_id=user_id,
             purchase_host_name=host_name,
@@ -4399,7 +4660,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         log_metadata = json.dumps(
             {
                 "plan_id": metadata.get("plan_id"),
-                "plan_name": plan.get("plan_name", "Unknown") if plan else "Unknown",
+                "plan_name": metadata.get("plan_name", "Unknown"),
+                "service_type": metadata.get("service_type", "xui"),
                 "host_name": metadata.get("host_name"),
                 "customer_email": metadata.get("customer_email"),
             }
@@ -4482,8 +4744,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         if host_name == "ALL":
             domain = get_setting("domain")
             user_token = get_or_create_subscription_token(user_id)
-            plan = get_plan_by_id(metadata.get("plan_id")) if metadata else None
-            plan_name = plan.get("plan_name") if isinstance(plan, dict) else None
+            plan_name = metadata.get("plan_name") if metadata else None
             if not plan_name:
                 plan_name = "—"
 

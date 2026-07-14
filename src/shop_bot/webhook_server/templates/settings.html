@@ -495,7 +495,7 @@
 
 					<form action="{{ url_for('import_route') }}" method="post" enctype="multipart/form-data"
 						class="import-form"
-						data-confirm="Импорт остановит ботов и заменит текущую базу данных. Продолжить?">
+						data-confirm="Импорт подготовит базу и завершит процесс для безопасного применения при следующем запуске. Продолжить?">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 						<label class="file-drop">
 							<input type="file" id="backup_file" name="backup_file" accept=".zip" required />
@@ -505,8 +505,7 @@
 							<input type="checkbox" name="apply_env" value="true" />
 							<span>Применить `.env` из архива вместе с базой</span>
 						</label>
-						<p class="warning-text">Импорт остановит ботов и заменит базу. `.env` будет заменён только если
-							включить опцию выше.</p>
+					<p class="warning-text">Импорт проверит архив, затем завершит процесс и применит базу до запуска ботов и планировщика. Docker перезапустит сервис автоматически; при ручном запуске запустите приложение снова. `.env` будет заменён только если включить опцию выше.</p>
 						<button type="submit" class="button button-danger button-wide">⬆️ Импортировать бэкап</button>
 					</form>
 				</div>
@@ -535,6 +534,12 @@
 					<label for="panel_login">Логин для входа в панель:</label>
 					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}" placeholder="admin" required />
 					<small class="field-hint">Admin login for the web panel.</small>
+				</div>
+				<div class="form-group">
+					<label for="admin_ip_allowlist">Доверенные IP/CIDR:</label>
+					<textarea id="admin_ip_allowlist" name="admin_ip_allowlist" rows="3"
+						placeholder="94.183.234.189 79.139.250.224">{{ settings.admin_ip_allowlist or "" }}</textarea>
+					<small class="field-hint">Эти адреса не попадают под внутренний лимит неверных входов и неверных subscription-токенов.</small>
 				</div>
 				<div class="form-group">
 					<label for="panel_password">Новый пароль (оставьте пустым, чтобы не менять):</label>

@@ -16,6 +16,7 @@ REQUIRED_DEFAULT_SETTINGS = {
     "panel_login",
     "panel_password",
     "flask_secret_key",
+    "admin_ip_allowlist",
     "telegram_bot_token",
     "telegram_bot_username",
     "admin_telegram_id",

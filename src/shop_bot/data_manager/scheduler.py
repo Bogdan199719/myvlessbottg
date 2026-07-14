@@ -29,6 +29,12 @@ _DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 _HOST_FAILURE_BACKOFF_SECONDS = 15 * 60
 _HOST_STATE_SYNC_TIMEOUT_SECONDS = 120
 _host_failure_backoff: dict[str, float] = {}
+_PANEL_SNAPSHOT_TIMEOUT_SECONDS = 120
+_MTG_ENFORCE_REQUEST_TIMEOUT_SECONDS = 20
+_MTG_ENFORCE_MAX_CONCURRENCY = 8
+_MTG_ENFORCE_PER_HOST_CONCURRENCY = 2
+_MTG_FAILURE_BACKOFF_SECONDS = 15 * 60
+_mtg_failure_backoff: dict[str, float] = {}
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +82,34 @@ def _mark_host_failure(host_name: str, reason: str) -> None:
 
 def _mark_host_success(host_name: str) -> None:
     _host_failure_backoff.pop(host_name, None)
+
+
+def _is_mtg_host_in_failure_backoff(host_name: str) -> bool:
+    retry_at = _mtg_failure_backoff.get(host_name)
+    if not retry_at:
+        return False
+    if time.monotonic() >= retry_at:
+        _mtg_failure_backoff.pop(host_name, None)
+        return False
+    return True
+
+
+def _mark_mtg_host_failure(host_name: str, reason: str) -> None:
+    was_in_backoff = _is_mtg_host_in_failure_backoff(host_name)
+    _mtg_failure_backoff[host_name] = (
+        time.monotonic() + _MTG_FAILURE_BACKOFF_SECONDS
+    )
+    if not was_in_backoff:
+        logger.warning(
+            "Scheduler: MTG host '%s' temporarily backed off for %s seconds after failure: %s",
+            host_name,
+            _MTG_FAILURE_BACKOFF_SECONDS,
+            reason,
+        )
+
+
+def _mark_mtg_host_success(host_name: str) -> None:
+    _mtg_failure_backoff.pop(host_name, None)
 
 
 def format_time_left(hours: int) -> str:
@@ -804,6 +838,31 @@ async def enforce_clients_state_from_db() -> None:
     )
 
 
+def _load_xui_panel_snapshot(host: dict):
+    """Load one panel snapshot in a worker thread.
+
+    ``login_to_host`` and the py3xui inbound client use blocking ``requests``
+    internally, including retry sleeps. Keep the complete network operation out
+    of the scheduler's asyncio event loop.
+    """
+    api, inbound = xui_api.login_to_host(
+        host_url=host["host_url"],
+        username=host["host_username"],
+        password=host["host_pass"],
+        inbound_id=host["host_inbound_id"],
+        api_token=host.get("api_token"),
+    )
+    if not api or not inbound:
+        return None
+
+    full_inbound_details = api.inbound.get_by_id(inbound.id)
+    if not full_inbound_details or not getattr(
+        full_inbound_details, "settings", None
+    ):
+        return None
+    return full_inbound_details
+
+
 async def sync_keys_with_panels():
     logger.info("Scheduler: Starting sync with XUI panels...")
     total_affected_records = 0
@@ -824,30 +883,15 @@ async def sync_keys_with_panels():
             continue
 
         try:
-            api, inbound = xui_api.login_to_host(
-                host_url=host["host_url"],
-                username=host["host_username"],
-                password=host["host_pass"],
-                inbound_id=host["host_inbound_id"],
-                api_token=host.get("api_token"),
+            full_inbound_details = await asyncio.wait_for(
+                asyncio.to_thread(_load_xui_panel_snapshot, host),
+                timeout=_PANEL_SNAPSHOT_TIMEOUT_SECONDS,
             )
-
-            if not api or not inbound:
+            if not full_inbound_details:
                 _mark_host_failure(host_name, "panel sync login/inbound lookup failed")
                 failed_hosts.append(host_name)
                 continue
             _mark_host_success(host_name)
-
-            full_inbound_details = api.inbound.get_by_id(inbound.id)
-            if not full_inbound_details or not getattr(
-                full_inbound_details, "settings", None
-            ):
-                logger.error(
-                    f"Scheduler: Failed to load full inbound details for host '{host_name}' "
-                    f"(inbound_id={host.get('host_inbound_id')})."
-                )
-                failed_hosts.append(host_name)
-                continue
 
             clients_on_server = {
                 client.email: client
@@ -990,7 +1034,16 @@ async def sync_keys_with_panels():
                         f"Scheduler: Found orphan client '{orphan_email}' on host '{host_name}' that is not tracked by the bot."
                     )
 
+        except asyncio.TimeoutError:
+            _mark_host_failure(host_name, "panel snapshot timed out")
+            failed_hosts.append(host_name)
+            logger.warning(
+                "Scheduler: Panel snapshot timed out for host '%s' after %s seconds.",
+                host_name,
+                _PANEL_SNAPSHOT_TIMEOUT_SECONDS,
+            )
         except Exception as e:
+            _mark_host_failure(host_name, "unexpected panel sync error")
             logger.error(
                 f"Scheduler: An unexpected error occurred while processing host '{host_name}': {e}",
                 exc_info=True,
@@ -1316,10 +1369,59 @@ async def enforce_mtg_proxies_state() -> None:
         h["host_name"]
         for h in await asyncio.to_thread(database.get_all_mtg_hosts, True)
     }
+    global_limit = asyncio.Semaphore(_MTG_ENFORCE_MAX_CONCURRENCY)
+    host_limits: dict[str, asyncio.Semaphore] = {}
+    attempted_by_host: dict[str, int] = {}
+    failed_by_host: dict[str, int] = {}
+
+    async def enforce_one(
+        host_name: str,
+        proxy_name: str,
+        node_id: int,
+        should_enable: bool,
+    ) -> None:
+        host_limit = host_limits.setdefault(
+            host_name, asyncio.Semaphore(_MTG_ENFORCE_PER_HOST_CONCURRENCY)
+        )
+        attempted_by_host[host_name] = attempted_by_host.get(host_name, 0) + 1
+        try:
+            async with host_limit:
+                async with global_limit:
+                    operation = (
+                        mtg_api.enable_proxy_for_user
+                        if should_enable
+                        else mtg_api.disable_proxy_for_user
+                    )
+                    succeeded = await asyncio.wait_for(
+                        operation(host_name, proxy_name, node_id),
+                        timeout=_MTG_ENFORCE_REQUEST_TIMEOUT_SECONDS,
+                    )
+            if not succeeded:
+                raise RuntimeError("panel rejected the state change")
+        except asyncio.TimeoutError:
+            failed_by_host[host_name] = failed_by_host.get(host_name, 0) + 1
+            logger.warning(
+                "Scheduler: MTG state enforce timed out for proxy '%s' on host '%s' after %s seconds.",
+                proxy_name,
+                host_name,
+                _MTG_ENFORCE_REQUEST_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            failed_by_host[host_name] = failed_by_host.get(host_name, 0) + 1
+            logger.warning(
+                "Scheduler: MTG state enforce failed for proxy '%s' on host '%s': %s",
+                proxy_name,
+                host_name,
+                e,
+            )
+
+    pending = []
 
     for key in mtg_keys:
         host_name = key.get("host_name")
         if host_name not in enabled_hosts:
+            continue
+        if _is_mtg_host_in_failure_backoff(host_name):
             continue
         proxy_name = key.get("key_email")
         node_id_str = key.get("xui_client_uuid")
@@ -1334,17 +1436,35 @@ async def enforce_mtg_proxies_state() -> None:
         if not expiry_date:
             continue
 
-        try:
-            if expiry_date <= now:
-                await mtg_api.disable_proxy_for_user(host_name, proxy_name, node_id)
-            else:
-                await mtg_api.enable_proxy_for_user(host_name, proxy_name, node_id)
-        except Exception as e:
-            logger.warning(
-                f"Scheduler: MTG state enforce failed for proxy '{proxy_name}': {e}"
+        pending.append(
+            enforce_one(
+                host_name,
+                proxy_name,
+                node_id,
+                should_enable=expiry_date > now,
             )
+        )
 
-    logger.debug("Scheduler: MTG proxy state enforce finished.")
+    if pending:
+        await asyncio.gather(*pending)
+
+    for host_name, attempted in attempted_by_host.items():
+        failures = failed_by_host.get(host_name, 0)
+        # Back off the whole host only when every attempted operation failed.
+        # An isolated missing/broken proxy must not delay enforcement for the
+        # other proxies on an otherwise healthy panel.
+        if failures == attempted:
+            _mark_mtg_host_failure(
+                host_name, f"{failures} of {attempted} state changes failed"
+            )
+        else:
+            _mark_mtg_host_success(host_name)
+
+    logger.debug(
+        "Scheduler: MTG proxy state enforce finished. attempted=%s failures=%s",
+        sum(attempted_by_host.values()),
+        sum(failed_by_host.values()),
+    )
 
 
 async def process_pending_yookassa_payments(bot: Bot) -> None:
@@ -1582,11 +1702,11 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
 
 async def recover_interrupted_payment_processing() -> None:
     recovered = await asyncio.to_thread(
-        database.recover_stale_global_processing_transactions, 15
+        database.recover_stale_processing_transactions, 15
     )
     if recovered:
         logger.warning(
-            "Scheduler: Recovered %s interrupted global payment fulfillment(s).",
+            "Scheduler: Recovered %s interrupted payment fulfillment(s).",
             recovered,
         )
 

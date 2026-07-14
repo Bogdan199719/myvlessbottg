@@ -3,9 +3,40 @@ import threading
 import asyncio
 import signal
 import time
-from dotenv import load_dotenv
+import os
+from pathlib import Path
+from dotenv import dotenv_values, load_dotenv
+from shop_bot.webhook_server.restore_manager import (
+    apply_pending_restore,
+    quarantine_pending_restore,
+)
 
 load_dotenv()
+
+# A database import is staged by the web process and only installed here,
+# before database.py, the scheduler, Flask, or either bot can open SQLite.
+_APP_ROOT = Path(__file__).resolve().parents[2]
+_ENV_FILE = _APP_ROOT / ".env"
+_DB_FILE = Path(os.getenv("DB_PATH", Path.cwd() / "users.db"))
+try:
+    _pending_env = _APP_ROOT / ".restore_pending" / ".env"
+    if _pending_env.exists():
+        _pending_db_path = dotenv_values(_pending_env).get("DB_PATH")
+        if _pending_db_path and Path(_pending_db_path).resolve() != _DB_FILE.resolve():
+            raise RuntimeError(
+                "Pending .env changes DB_PATH; restore it separately to avoid "
+                "installing the database at an inactive path"
+            )
+    _restore_result = apply_pending_restore(_APP_ROOT, _DB_FILE, _ENV_FILE)
+    if _restore_result is not None:
+        load_dotenv(_ENV_FILE, override=True)
+except Exception:
+    _failed_restore = quarantine_pending_restore(_APP_ROOT)
+    logging.getLogger(__name__).critical(
+        "Pending database restore failed and was quarantined at %s",
+        _failed_restore,
+        exc_info=True,
+    )
 
 from shop_bot.webhook_server.app import create_webhook_app
 from shop_bot.data_manager.scheduler import periodic_subscription_check

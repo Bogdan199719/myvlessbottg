@@ -21,6 +21,8 @@
 - `CRYPTOBOT_WEBHOOK_SECRET`
 - `DB_PATH`
 - `FLASK_SECRET_KEY`
+- `ADMIN_IP_ALLOWLIST`
+- `TRUSTED_PROXY_CIDRS`
 - `ENABLE_WEB_UPDATES`
 
 `DB_PATH` влияет напрямую на путь к SQLite. Остальные значения в основном копируются в `bot_settings` и дальше редактируются уже через админку.
@@ -31,12 +33,20 @@ origin/main`, поэтому для Docker production предпочтителе
 
 `FLASK_SECRET_KEY` используется для подписи Flask-сессий админки. Он должен быть случайным и длинным: минимум 32 символа, лучше 64 hex-символа. Известные placeholder-значения из шаблона считаются небезопасными; при их обнаружении приложение использует сохранённый сильный ключ из БД или генерирует новый.
 
+`ADMIN_IP_ALLOWLIST` — список доверенных IP/CIDR через пробел, запятую или перенос строки. Эти адреса не попадают под внутренний лимит неверных входов в админку и лимит неверных `/sub/` или `/happ/` токенов. Настройка не отменяет пароль админки и не заменяет системный Fail2Ban.
+
+`TRUSTED_PROXY_CIDRS` — адреса только непосредственных reverse proxy. Заголовок
+`X-Forwarded-For` игнорируется от остальных клиентов. По умолчанию доверены
+localhost и Docker bridge (`127.0.0.0/8`, `::1/128`, `172.16.0.0/12`); внешний
+CDN или дополнительный proxy нужно добавить явно.
+
 ## Важные настройки в `bot_settings`
 
 ### Базовые
 
 - `panel_login`
 - `panel_password`
+- `admin_ip_allowlist`
 - `telegram_bot_token`
 - `support_bot_token`
 - `telegram_bot_username`

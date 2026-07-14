@@ -192,36 +192,46 @@ content %}
                 </tr>
                 {% endif %}
 
-                {% if not global_keys and regular_keys %}
-                {% set key = regular_keys[0] %}
+                {% for key in regular_keys %}
                 <tr data-key-row="1" data-group="{{ user.user_id }}" data-key-type="regular"
                     data-key-trial="{{ '1' if key.is_trial else '0' }}"
                     data-key-status="{{ key.expiry_status.filter }}"
                     data-key-search="{{ user.user_id }} {{ user.username }} {{ key.host_name }} {{ key.key_email }} {{ key.key_id }}">
                     <td>{{ key.key_id }}</td>
                     <td>
-                        <strong>{{ "Пробный ключ" if key.is_trial else "Ключ подписки" }}</strong><br>
-                        <small>{{ "Триальный период" if key.is_trial else "Подписка пользователя" }}</small>
+                        <strong>{{ key.host_name }}</strong><br>
+                        <small>
+                            {% if key.service_type == 'mtg' %}
+                                Telegram Proxy
+                            {% elif key.is_trial %}
+                                Пробный ключ
+                            {% elif key.is_free_access %}
+                                Бесплатный доступ
+                            {% else %}
+                                Ключ подписки
+                            {% endif %}
+                        </small>
                     </td>
-                    <td><small>Multi-link</small></td>
+                    <td><small>{{ key.key_email }}</small></td>
                     <td class="key-link-cell">
-                        {% if user.subscription_link %}
+                        {% set secret_value = key.copy_value if key.has_copy_value else user.subscription_link %}
+                        {% if secret_value %}
                         <div class="key-copy-tools">
                             <button type="button" class="button button-small button-primary js-toggle-secret"
                                 data-target="secret-key-{{ key.key_id }}">
                                 Показать
                             </button>
                             <button type="button" class="button button-small button-secondary js-copy-secret"
-                                data-copy="{{ user.subscription_link }}">
+                                data-copy="{{ secret_value }}">
                                 Копировать
                             </button>
                         </div>
                         <div id="secret-key-{{ key.key_id }}" class="secret-value" hidden>
-                            <code>{{ user.subscription_link }}</code>
+                            <code>{{ secret_value }}</code>
                         </div>
-                        <small class="secret-hint">Subscription URL пользователя</small>
+                        <small class="secret-hint">{{ key.copy_kind if key.has_copy_value else 'Subscription URL пользователя' }}</small>
                         {% else %}
-                        <span class="secret-empty">Домен или токен не настроен</span>
+                        <span class="secret-empty">Ключ не сохранён в БД</span>
                         {% endif %}
                     </td>
                     <td>
@@ -267,7 +277,7 @@ content %}
                         {% endif %}
                     </td>
                 </tr>
-                {% endif %}
+                {% endfor %}
                 {% endfor %}
             </tbody>
         </table>

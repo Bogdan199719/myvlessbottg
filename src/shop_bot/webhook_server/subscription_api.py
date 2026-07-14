@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from flask import Blueprint, Response, request, abort, current_app
@@ -25,6 +26,7 @@ from shop_bot.data_manager.database import (
     is_global_xui_key,
 )
 from shop_bot.modules import xui_api
+from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ _INVALID_TOKEN_LOG_INTERVAL_SECONDS = 60
 _INVALID_TOKEN_MAX_TRACKED_IPS = 2048
 _invalid_token_hits_by_ip: dict[str, list[float]] = {}
 _invalid_token_last_log_by_ip: dict[str, float] = {}
+_invalid_token_lock = threading.Lock()
 
 
 def _run_on_event_loop(coro, timeout_seconds: int, operation: str):
@@ -76,41 +79,49 @@ def _token_prefix(token: str, limit: int = 5) -> str:
 
 
 def _client_ip() -> str:
-    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
-    return forwarded or request.remote_addr or "unknown"
+    return get_client_ip(request)
 
 
 def _record_invalid_token_request(route_name: str, token: str) -> bool:
     """Return True when the caller should be rate limited."""
     now = time.monotonic()
     ip = _client_ip()
-    hits = [
-        ts
-        for ts in _invalid_token_hits_by_ip.get(ip, [])
-        if now - ts < _INVALID_TOKEN_WINDOW_SECONDS
-    ]
-    hits.append(now)
-    _invalid_token_hits_by_ip[ip] = hits
+    if is_ip_allowlisted(ip, get_setting("admin_ip_allowlist")):
+        return False
 
-    if len(_invalid_token_hits_by_ip) > _INVALID_TOKEN_MAX_TRACKED_IPS:
-        stale_ips = [
-            tracked_ip
-            for tracked_ip, tracked_hits in _invalid_token_hits_by_ip.items()
-            if not tracked_hits
-            or now - max(tracked_hits) >= _INVALID_TOKEN_WINDOW_SECONDS
+    should_log = False
+    with _invalid_token_lock:
+        hits = [
+            ts
+            for ts in _invalid_token_hits_by_ip.get(ip, [])
+            if now - ts < _INVALID_TOKEN_WINDOW_SECONDS
         ]
-        if not stale_ips:
-            trim_count = max(
-                1, len(_invalid_token_hits_by_ip) - _INVALID_TOKEN_MAX_TRACKED_IPS
-            )
-            stale_ips = list(_invalid_token_hits_by_ip.keys())[:trim_count]
-        for tracked_ip in stale_ips:
-            _invalid_token_hits_by_ip.pop(tracked_ip, None)
-            _invalid_token_last_log_by_ip.pop(tracked_ip, None)
+        hits.append(now)
+        _invalid_token_hits_by_ip[ip] = hits
 
-    last_log = _invalid_token_last_log_by_ip.get(ip, 0.0)
-    if now - last_log >= _INVALID_TOKEN_LOG_INTERVAL_SECONDS:
-        _invalid_token_last_log_by_ip[ip] = now
+        if len(_invalid_token_hits_by_ip) > _INVALID_TOKEN_MAX_TRACKED_IPS:
+            stale_ips = [
+                tracked_ip
+                for tracked_ip, tracked_hits in _invalid_token_hits_by_ip.items()
+                if not tracked_hits
+                or now - max(tracked_hits) >= _INVALID_TOKEN_WINDOW_SECONDS
+            ]
+            if not stale_ips:
+                trim_count = max(
+                    1, len(_invalid_token_hits_by_ip) - _INVALID_TOKEN_MAX_TRACKED_IPS
+                )
+                stale_ips = list(_invalid_token_hits_by_ip.keys())[:trim_count]
+            for tracked_ip in stale_ips:
+                _invalid_token_hits_by_ip.pop(tracked_ip, None)
+                _invalid_token_last_log_by_ip.pop(tracked_ip, None)
+
+        last_log = _invalid_token_last_log_by_ip.get(ip, 0.0)
+        if now - last_log >= _INVALID_TOKEN_LOG_INTERVAL_SECONDS:
+            _invalid_token_last_log_by_ip[ip] = now
+            should_log = True
+        should_limit = len(hits) > _INVALID_TOKEN_MAX_PER_WINDOW
+
+    if should_log:
         logger.info(
             "%s token not found from ip=%s prefix=%s recent_invalid=%s",
             route_name,
@@ -119,7 +130,7 @@ def _record_invalid_token_request(route_name: str, token: str) -> bool:
             len(hits),
         )
 
-    return len(hits) > _INVALID_TOKEN_MAX_PER_WINDOW
+    return should_limit
 
 
 def _bool_setting(key: str, default: bool = False) -> bool:

@@ -23,48 +23,74 @@ logger = logging.getLogger(__name__)
 
 # ── token cache: {host_name: (token, expires_at_unix)} ──────────────────────
 _token_cache: dict[str, tuple[str, float]] = {}
+_token_locks: dict[str, asyncio.Lock] = {}
 _TOKEN_TTL = 3600  # seconds
 
 
 async def _get_token(host_name: str) -> str | None:
     """Login to MTG panel and return the x-auth-token, with in-process caching."""
-    cached = _token_cache.get(host_name)
-    if cached:
-        token, expires_at = cached
-        if time.time() < expires_at:
+
+    def valid_cached_token() -> str | None:
+        cached = _token_cache.get(host_name)
+        if cached:
+            token, expires_at = cached
+            if time.time() < expires_at:
+                return token
+        return None
+
+    token = valid_cached_token()
+    if token:
+        return token
+
+    # Concurrent proxy operations on the same host must not perform parallel
+    # logins. Some MTG panels invalidate the previous token on every login.
+    lock = _token_locks.setdefault(host_name, asyncio.Lock())
+    async with lock:
+        token = valid_cached_token()
+        if token:
             return token
 
-    host = get_mtg_host(host_name)
-    if not host:
-        logger.error(f"MTG host '{host_name}' not found in DB.")
-        return None
+        host = await asyncio.to_thread(get_mtg_host, host_name)
+        if not host:
+            logger.error(f"MTG host '{host_name}' not found in DB.")
+            return None
 
-    url = host["host_url"].rstrip("/")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{url}/api/login",
-                json={"username": host["username"], "password": host["password"]},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(
-                        f"MTG login failed for host '{host_name}': {resp.status} {text}"
-                    )
-                    return None
-                data = await resp.json()
-                token = data.get("token")
-                if not token:
-                    logger.error(
-                        f"MTG login response missing token for host '{host_name}': {data}"
-                    )
-                    return None
-                _token_cache[host_name] = (token, time.time() + _TOKEN_TTL)
-                return token
-    except Exception as e:
-        logger.error(f"MTG login exception for host '{host_name}': {e}", exc_info=True)
-        return None
+        url = host["host_url"].rstrip("/")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{url}/api/login",
+                    json={
+                        "username": host["username"],
+                        "password": host["password"],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(
+                            "MTG login failed for host '%s': %s %s",
+                            host_name,
+                            resp.status,
+                            text,
+                        )
+                        return None
+                    data = await resp.json()
+                    token = data.get("token")
+                    if not token:
+                        logger.error(
+                            "MTG login response missing token for host '%s': %s",
+                            host_name,
+                            data,
+                        )
+                        return None
+                    _token_cache[host_name] = (token, time.time() + _TOKEN_TTL)
+                    return token
+        except Exception as e:
+            logger.error(
+                f"MTG login exception for host '{host_name}': {e}", exc_info=True
+            )
+            return None
 
 
 def _invalidate_token(host_name: str):
@@ -110,7 +136,9 @@ async def create_proxy_for_user(
     if not token:
         return None
 
-    host = get_mtg_host(host_name)
+    host = await asyncio.to_thread(get_mtg_host, host_name)
+    if not host:
+        return None
     url = host["host_url"].rstrip("/")
 
     node_id = await _get_best_node_id(url, token)
@@ -167,7 +195,9 @@ async def delete_proxy_for_user(host_name: str, proxy_name: str, node_id: int) -
     token = await _get_token(host_name)
     if not token:
         return False
-    host = get_mtg_host(host_name)
+    host = await asyncio.to_thread(get_mtg_host, host_name)
+    if not host:
+        return False
     url = host["host_url"].rstrip("/")
     try:
         async with aiohttp.ClientSession() as session:
@@ -198,7 +228,9 @@ async def _toggle_proxy(
     token = await _get_token(host_name)
     if not token:
         return False
-    host = get_mtg_host(host_name)
+    host = await asyncio.to_thread(get_mtg_host, host_name)
+    if not host:
+        return False
     url = host["host_url"].rstrip("/")
     try:
         async with aiohttp.ClientSession() as session:
@@ -231,7 +263,9 @@ async def renew_proxy_for_user(
     token = await _get_token(host_name)
     if not token:
         return None
-    host = get_mtg_host(host_name)
+    host = await asyncio.to_thread(get_mtg_host, host_name)
+    if not host:
+        return None
     url = host["host_url"].rstrip("/")
     try:
         async with aiohttp.ClientSession() as session:
@@ -254,12 +288,14 @@ async def renew_proxy_for_user(
         return None
 
 
-async def get_proxy_link(host_name: str, proxy_name: str) -> str | None:
-    """Fetch proxy connection link from panel."""
+async def get_proxy_details(host_name: str, proxy_name: str) -> dict | None:
+    """Fetch the panel's current proxy identity, link, node and expiry."""
     token = await _get_token(host_name)
     if not token:
         return None
-    host = get_mtg_host(host_name)
+    host = await asyncio.to_thread(get_mtg_host, host_name)
+    if not host:
+        return None
     url = host["host_url"].rstrip("/")
     try:
         async with aiohttp.ClientSession() as session:
@@ -273,10 +309,33 @@ async def get_proxy_link(host_name: str, proxy_name: str) -> str | None:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
-                return data.get("link")
+                node_value = data.get("node")
+                node = node_value if isinstance(node_value, dict) else {}
+                node_id = (
+                    data.get("node_id")
+                    or data.get("nodeId")
+                    or node.get("id")
+                    or (node_value if not isinstance(node_value, dict) else None)
+                )
+                try:
+                    node_id = int(node_id) if node_id is not None else None
+                except (TypeError, ValueError):
+                    node_id = None
+                return {
+                    "proxy_name": data.get("name") or proxy_name,
+                    "node_id": node_id,
+                    "connection_string": data.get("link") or _build_proxy_link(url, data),
+                    "expiry_timestamp_ms": _iso_to_ms(data.get("expires_at")),
+                }
     except Exception as e:
-        logger.error(f"MTG get_proxy_link exception: {e}", exc_info=True)
+        logger.error(f"MTG get_proxy_details exception: {e}", exc_info=True)
         return None
+
+
+async def get_proxy_link(host_name: str, proxy_name: str) -> str | None:
+    """Fetch proxy connection link from panel."""
+    details = await get_proxy_details(host_name, proxy_name)
+    return details.get("connection_string") if details else None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
