@@ -38,6 +38,7 @@ from flask import (
     g,
     send_file,
     after_this_request,
+    jsonify,
     Response,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -143,6 +144,44 @@ MAX_BACKUP_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_BACKUP_UNPACKED_BYTES = 100 * 1024 * 1024
 MAX_BACKUP_FILES = 3
 ALLOWED_BACKUP_FILES = {"users.db", "metadata.json", ".env"}
+ADMIN_LIST_DEFAULT_PER_PAGE = 50
+ADMIN_LIST_ALLOWED_PER_PAGE = {25, 50, 100}
+
+
+def _admin_list_request_args(allowed_statuses: set[str]) -> tuple[str, str, int, int]:
+    query = (request.args.get("q") or "").strip()[:200]
+    status = (request.args.get("status") or "all").strip().lower()
+    if status not in allowed_statuses:
+        status = "all"
+    page = max(1, request.args.get("page", 1, type=int) or 1)
+    per_page = request.args.get(
+        "per_page", ADMIN_LIST_DEFAULT_PER_PAGE, type=int
+    )
+    if per_page not in ADMIN_LIST_ALLOWED_PER_PAGE:
+        per_page = ADMIN_LIST_DEFAULT_PER_PAGE
+    return query, status, page, per_page
+
+
+def _paginate_admin_items(items: list, page: int, per_page: int) -> tuple[list, dict]:
+    total_items = len(items)
+    total_pages = max(1, ceil(total_items / per_page))
+    current_page = min(max(1, page), total_pages)
+    start = (current_page - 1) * per_page
+    page_items = items[start : start + per_page]
+    first_page_link = max(1, current_page - 2)
+    last_page_link = min(total_pages, first_page_link + 4)
+    first_page_link = max(1, last_page_link - 4)
+    return page_items, {
+        "page": current_page,
+        "per_page": per_page,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "pages": list(range(first_page_link, last_page_link + 1)),
+        "has_previous": current_page > 1,
+        "has_next": current_page < total_pages,
+        "previous_page": current_page - 1,
+        "next_page": current_page + 1,
+    }
 
 
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
@@ -2422,13 +2461,56 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def users_page():
         users = get_all_users()
+        keys_by_user: dict[int, list[dict]] = defaultdict(list)
+        for key in get_all_keys_with_usernames():
+            keys_by_user[int(key["user_id"])].append(key)
+
         now = time_utils.get_msk_now()
         for user in users:
-            user["user_keys"] = get_user_keys(user["telegram_id"])
+            user["user_keys"] = keys_by_user.get(int(user["telegram_id"]), [])
             user["subscription_summary"] = _summarize_user_subscription(
                 user, user["user_keys"], now
             )
         user_metrics = _build_user_metrics(users)
+
+        allowed_statuses = {
+            "all",
+            "paid",
+            "paid_expired",
+            "free",
+            "trial",
+            "trial_expired",
+            "payment_pending",
+            "free_expired",
+            "support_only",
+            "no_subscription",
+            "banned",
+        }
+        query, selected_status, requested_page, per_page = (
+            _admin_list_request_args(allowed_statuses)
+        )
+        normalized_query = query.casefold()
+        filtered_users = []
+        for user in users:
+            summary = user["subscription_summary"]
+            if selected_status != "all" and summary["status"] != selected_status:
+                continue
+            searchable = " ".join(
+                str(value or "")
+                for value in (
+                    user.get("telegram_id"),
+                    user.get("username"),
+                    user.get("receipt_email"),
+                    summary.get("label"),
+                )
+            ).casefold()
+            if normalized_query and normalized_query not in searchable:
+                continue
+            filtered_users.append(user)
+
+        paged_users, pagination = _paginate_admin_items(
+            filtered_users, requested_page, per_page
+        )
 
         # Prepare plans for manual issuance
         all_hosts = get_all_hosts()
@@ -2445,8 +2527,11 @@ def create_webhook_app(bot_controller_instance):
         common_data = get_common_template_data()
         return render_template(
             "users.html",
-            users=users,
+            users=paged_users,
             user_metrics=user_metrics,
+            list_query=query,
+            selected_status=selected_status,
+            pagination=pagination,
             issuance_data=issuance_data,
             **common_data,
         )
@@ -2739,7 +2824,7 @@ def create_webhook_app(bot_controller_instance):
                 users_map[uid] = {
                     "username": key.get("username") or f"User {uid}",
                     "user_id": uid,
-                    "subscription_link": None,
+                    "has_subscription_link": False,
                     "user_keys": [],
                 }
 
@@ -2761,14 +2846,17 @@ def create_webhook_app(bot_controller_instance):
                     active_trial_users.add(int(uid))
                 else:
                     active_paid_users.add(int(uid))
-            key["copy_value"] = (key.get("connection_string") or "").strip()
-            key["has_copy_value"] = bool(key["copy_value"])
+            key["has_copy_value"] = bool(
+                (key.get("connection_string") or "").strip()
+            )
             key["copy_kind"] = (
                 "Telegram Proxy" if key.get("service_type") == "mtg" else "VPN ключ"
             )
-            if not users_map[uid]["subscription_link"]:
-                users_map[uid]["subscription_link"] = _build_subscription_link(
-                    subscription_domain, key.get("subscription_token")
+            if not users_map[uid]["has_subscription_link"]:
+                users_map[uid]["has_subscription_link"] = bool(
+                    _build_subscription_link(
+                        subscription_domain, key.get("subscription_token")
+                    )
                 )
             users_map[uid]["user_keys"].append(key)
 
@@ -2800,7 +2888,9 @@ def create_webhook_app(bot_controller_instance):
                 key.get("is_free_access") for key in deduped_global
             )
 
-        grouped_users = sorted(users_map.values(), key=lambda u: u["username"])
+        grouped_users = sorted(
+            users_map.values(), key=lambda u: str(u["username"]).casefold()
+        )
         key_stats = {
             "total_users": get_user_count(),
             "users_with_keys": len(grouped_users),
@@ -2810,14 +2900,142 @@ def create_webhook_app(bot_controller_instance):
             "active_trial_users": len(active_trial_users),
         }
 
+        display_rows: list[dict] = []
+        for user_data in grouped_users:
+            global_keys = [
+                key for key in user_data["user_keys"] if key.get("is_global")
+            ]
+            regular_keys = [
+                key for key in user_data["user_keys"] if not key.get("is_global")
+            ]
+            if global_keys:
+                first_key = global_keys[0]
+                display_rows.append(
+                    {
+                        "kind": "global",
+                        "user": user_data,
+                        "key": first_key,
+                        "global_keys": global_keys,
+                        "filter_status": first_key["expiry_status"]["filter"],
+                        "is_trial": bool(user_data["is_trial"]),
+                        "search": " ".join(
+                            [
+                                str(user_data["user_id"]),
+                                str(user_data["username"]),
+                                "global",
+                                *[
+                                    f"{key.get('host_name') or ''} "
+                                    f"{key.get('key_email') or ''}"
+                                    for key in global_keys
+                                ],
+                            ]
+                        ).casefold(),
+                    }
+                )
+            for key in regular_keys:
+                display_rows.append(
+                    {
+                        "kind": "regular",
+                        "user": user_data,
+                        "key": key,
+                        "global_keys": [],
+                        "filter_status": key["expiry_status"]["filter"],
+                        "is_trial": bool(key["is_trial"]),
+                        "search": " ".join(
+                            str(value or "")
+                            for value in (
+                                user_data["user_id"],
+                                user_data["username"],
+                                key.get("host_name"),
+                                key.get("key_email"),
+                                key.get("key_id"),
+                            )
+                        ).casefold(),
+                    }
+                )
+
+        allowed_statuses = {
+            "all",
+            "active",
+            "expiring",
+            "expired",
+            "trial",
+            "global",
+        }
+        query, selected_status, requested_page, per_page = (
+            _admin_list_request_args(allowed_statuses)
+        )
+        normalized_query = query.casefold()
+
+        def _key_row_matches(row: dict) -> bool:
+            if normalized_query and normalized_query not in row["search"]:
+                return False
+            if selected_status == "all":
+                return True
+            if selected_status == "global":
+                return row["kind"] == "global"
+            if selected_status == "trial":
+                return row["is_trial"]
+            return row["filter_status"] == selected_status
+
+        filtered_rows = [row for row in display_rows if _key_row_matches(row)]
+        key_rows, pagination = _paginate_admin_items(
+            filtered_rows, requested_page, per_page
+        )
+        previous_user_id = None
+        for row in key_rows:
+            user_id = row["user"]["user_id"]
+            row["show_group_header"] = user_id != previous_user_id
+            previous_user_id = user_id
+
         common_data = get_common_template_data()
         return render_template(
             "keys.html",
-            grouped_users=grouped_users,
+            key_rows=key_rows,
             key_stats=key_stats,
+            list_query=query,
+            selected_status=selected_status,
+            pagination=pagination,
             task_statuses=_task_status_snapshot(),
             **common_data,
         )
+
+    def _admin_secret_response(value: str | None, kind: str):
+        if not value:
+            return jsonify({"error": "Секрет не найден."}), 404
+        response = jsonify({"value": value, "kind": kind})
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+    @flask_app.route("/keys/<int:key_id>/secret")
+    @login_required
+    def key_secret_route(key_id: int):
+        key = get_key_by_id(key_id)
+        if not key:
+            return _admin_secret_response(None, "")
+        connection_string = (key.get("connection_string") or "").strip()
+        if connection_string:
+            kind = (
+                "Telegram Proxy"
+                if key.get("service_type") == "mtg"
+                else "VPN ключ"
+            )
+            return _admin_secret_response(connection_string, kind)
+        user = get_user(int(key["user_id"]))
+        subscription_link = _build_subscription_link(
+            get_setting("domain"), (user or {}).get("subscription_token")
+        )
+        return _admin_secret_response(subscription_link, "Subscription URL")
+
+    @flask_app.route("/users/<int:user_id>/subscription-secret")
+    @login_required
+    def user_subscription_secret_route(user_id: int):
+        user = get_user(user_id)
+        subscription_link = _build_subscription_link(
+            get_setting("domain"), (user or {}).get("subscription_token")
+        )
+        return _admin_secret_response(subscription_link, "Subscription URL")
 
     @flask_app.route("/api/tasks/status", methods=["GET"])
     @login_required

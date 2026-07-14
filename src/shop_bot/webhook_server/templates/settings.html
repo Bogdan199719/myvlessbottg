@@ -3,6 +3,91 @@
 
 <h1>Настройки</h1>
 
+<style>
+	/* Scoped navigation for this long settings page. Every item is a normal
+	   anchor, so navigation remains usable when JavaScript is unavailable. */
+	.settings-category-tabs {
+		display: grid;
+		grid-template-columns: repeat(5, minmax(9rem, 1fr));
+		gap: .65rem;
+		margin: 0 0 1.25rem;
+	}
+	.settings-category-tabs a {
+		display: flex;
+		align-items: center;
+		gap: .55rem;
+		min-height: 2.75rem;
+		padding: .7rem .85rem;
+		border: 1px solid var(--border);
+		border-radius: .65rem;
+		background: var(--bg-card);
+		color: inherit;
+		font-weight: 650;
+		text-decoration: none;
+	}
+	.settings-category-tabs a:hover,
+	.settings-category-tabs a:focus-visible {
+		border-color: var(--primary);
+		outline: 2px solid transparent;
+		box-shadow: 0 0 0 2px rgba(79, 107, 237, .18);
+	}
+	.settings-category-tabs small {
+		display: block;
+		font-size: .72rem;
+		font-weight: 400;
+		opacity: .72;
+	}
+	.settings-page-intro {
+		margin: -.65rem 0 1rem;
+		color: var(--muted);
+	}
+	.settings-section,
+	.service-divider,
+	.settings-sub-h {
+		scroll-margin-top: 1rem;
+	}
+	.settings-section:target,
+	.settings-sub-h:target {
+		outline: 2px solid var(--primary);
+		outline-offset: 3px;
+	}
+	.settings-quicknav {
+		display: flex;
+		flex-wrap: wrap;
+		gap: .45rem;
+		margin-bottom: 1rem;
+	}
+	.settings-quicknav a {
+		padding: .42rem .7rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		text-decoration: none;
+	}
+	.settings-category-kicker {
+		margin: 0 0 .85rem;
+		padding: .65rem .8rem;
+		border-left: 4px solid var(--primary);
+		background: rgba(79, 107, 237, .07);
+		border-radius: .35rem;
+	}
+	@media (max-width: 980px) {
+		.settings-category-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	}
+	@media (max-width: 560px) {
+		.settings-category-tabs { grid-template-columns: 1fr; }
+		.settings-category-tabs small { display: inline; }
+	}
+</style>
+
+<p class="settings-page-intro">Выберите раздел или прокрутите страницу: все настройки остаются доступны в одной форме сохранения.</p>
+<nav class="settings-category-tabs" aria-label="Основные разделы настроек">
+	<a href="#hosts"><span aria-hidden="true">🖥️</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
+	<a href="#payment-settings"><span aria-hidden="true">💳</span><span>Платежи<small>Способы оплаты и подписка</small></span></a>
+	<a href="#bot-settings"><span aria-hidden="true">🤖</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
+	<a href="#panel-settings"><span aria-hidden="true">🛡️</span><span>Безопасность<small>Доступ к веб-панели</small></span></a>
+	<a href="#backup"><span aria-hidden="true">💾</span><span>Резервные копии<small>Экспорт и восстановление</small></span></a>
+</nav>
+
 {% macro pay_rules_section(context_key, host_plans, pay_rules) %}
 {%- set ml = [
   ('yookassa',   '🏦 YooKassa'),
@@ -79,6 +164,7 @@
 
 <div class="settings-container">
 	<div class="settings-column-left">
+		<p class="settings-category-kicker"><strong>Серверы и тарифы</strong><br><small>VPN/VLESS, Telegram-прокси, промокоды и правила оплаты для тарифов.</small></p>
 		<div class="service-divider">
 			<span>VPN / VLESS</span>
 		</div>
@@ -140,7 +226,7 @@
 				<div class="promo-card-head">
 					<div>
 						<h3>Промокоды на глобальную подписку</h3>
-						<p class="promo-card-note">Промокод выдаёт VPN-подписку на все активные серверы. Срок добавляется к текущей платной подписке или trial; один пользователь применяет один код только один раз.</p>
+						<p class="promo-card-note">Промокод выдаёт VPN-подписку на все активные серверы. Срок добавляется к текущей платной или пробной подписке; один пользователь применяет один код только один раз.</p>
 					</div>
 					<form action="{{ url_for('toggle_promo_codes_feature_route') }}" method="post" class="promo-toggle-form">
 						<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -239,18 +325,18 @@
 					{% endif %}
 					<div class="form-group">
 						<label for="host_name">Название хоста:</label>
-						<input type="text" id="host_name" name="host_name" required maxlength="26" placeholder="RigaLatvia" title="Short display name" value="{{ edit_host.host_name if edit_host else '' }}" />
-						<small class="field-hint">Short name shown to users (ASCII recommended).</small>
+						<input type="text" id="host_name" name="host_name" required maxlength="26" placeholder="RigaLatvia" title="Короткое отображаемое название" value="{{ edit_host.host_name if edit_host else '' }}" />
+						<small class="field-hint">Короткое имя, которое увидят пользователи; рекомендуется использовать латиницу.</small>
 					</div>
 					<div class="form-group">
 						<label for="host_url">URL панели XUI:</label>
 						<input type="url" id="host_url" name="host_url" placeholder="http://123.45.67.89:54321" required value="{{ edit_host.host_url if edit_host else '' }}" />
-						<small class="field-hint">Example: http://123.45.67.89:54321</small>
+						<small class="field-hint">Пример: http://123.45.67.89:54321</small>
 					</div>
 					<div class="form-group">
 						<label for="host_username">Логин XUI:</label>
 						<input type="text" id="host_username" name="host_username" required placeholder="admin" value="{{ edit_host.host_username if edit_host else '' }}" />
-						<small class="field-hint">XUI panel login.</small>
+						<small class="field-hint">Логин администратора панели XUI.</small>
 					</div>
 					<div class="form-group">
 						<label for="host_pass">Пароль XUI {% if edit_host %}(оставьте пустым, чтобы не менять){% endif %}:</label>
@@ -260,10 +346,10 @@
 						</div>
 					</div>
 					<div class="form-group">
-						<label for="api_token">API Token XUI (опционально):</label>
+						<label for="api_token">API-токен XUI (необязательно):</label>
 						<div class="password-wrapper">
 							<input type="password" id="api_token" name="api_token"
-								placeholder="Bearer token из Settings → Security → API Token"
+								placeholder="Bearer-токен из Настройки → Безопасность → API-токен"
 								value="" />
 							<button type="button" class="toggle-password">👁️</button>
 						</div>
@@ -272,7 +358,7 @@
 					<div class="form-group">
 						<label for="host_inbound_id">ID входящего подключения:</label>
 						<input type="number" id="host_inbound_id" name="host_inbound_id" required placeholder="1" value="{{ edit_host.host_inbound_id if edit_host else '' }}" />
-						<small class="field-hint">Inbound ID from 3x-ui panel.</small>
+						<small class="field-hint">ID входящего подключения из панели 3x-ui.</small>
 					</div>
 					<button type="submit" class="button button-primary">{% if edit_host %}Сохранить изменения{% else
 						%}Добавить{% endif %}</button>
@@ -355,11 +441,11 @@
 
 		{# ── MTG Proxy Hosts ────────────────────────────────────────────── #}
 		<div class="service-divider service-divider-alt">
-			<span>Telegram Proxy</span>
+			<span>Telegram-прокси</span>
 		</div>
 		<section class="settings-section service-section service-section-alt" id="mtg-hosts">
-			<h2>MTG Proxy хосты</h2>
-			<p class="section-description">Управление серверами Telegram MTProto Proxy. Отдельная сущность, не связанная с VPN подписками.</p>
+			<h2>Хосты MTG Proxy</h2>
+			<p class="section-description">Управление серверами Telegram MTProto Proxy. Это отдельная сущность, не связанная с VPN-подписками.</p>
 
 			<div class="host-card">
 				<h4>{% if edit_mtg_host is defined and edit_mtg_host %}Редактировать MTG-хост{% else %}Добавить MTG Proxy хост{% endif %}</h4>
@@ -379,7 +465,7 @@
 						<label for="mtg_host_url">URL MTG панели:</label>
 						<input type="url" id="mtg_host_url" name="host_url" placeholder="http://123.45.67.89:3000" required
 							value="{{ edit_mtg_host.host_url if (edit_mtg_host is defined and edit_mtg_host) else '' }}" />
-						<small class="field-hint">Адрес вашей MTG AdminPanel.</small>
+						<small class="field-hint">Адрес вашей панели управления MTG.</small>
 					</div>
 					<div class="form-group">
 						<label for="mtg_host_username">Логин MTG панели:</label>
@@ -468,12 +554,13 @@
 			</div>
 			{% endfor %}
 			{% else %}
-			<p>MTG Proxy хосты не добавлены.</p>
+			<p>Хосты MTG Proxy не добавлены.</p>
 			{% endif %}
 		</section>
 	</div>
 
 	<div class="settings-column-right">
+		<p class="settings-category-kicker"><strong>Управление ботом и панелью</strong><br><small>Резервные копии, безопасность, платежи, уведомления и тексты интерфейса.</small></p>
 		<section class="settings-section backup-card" id="backup">
 			<div class="backup-header">
 				<div>
@@ -513,33 +600,30 @@
 
 		<form action="{{ url_for('settings_page') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-			<nav class="settings-quicknav">
-				<a href="#panel-settings">Панель</a>
-				<a href="#bot-settings">Бот</a>
+			<nav class="settings-quicknav" aria-label="Подразделы настроек бота">
+				<a href="#panel-settings">Безопасность панели</a>
+				<a href="#bot-settings">Telegram-бот</a>
 				<a href="#support-settings">Поддержка</a>
-				<a href="#ref-settings">Рефералка</a>
-				<a href="#trial-settings">Триал</a>
+				<a href="#content-settings">Контент</a>
+				<a href="#ref-settings">Реферальная программа</a>
+				<a href="#trial-settings">Пробный период</a>
 				<a href="#payment-yookassa">YooKassa</a>
 				<a href="#payment-p2p">P2P</a>
-				<a href="#payment-stars">Stars</a>
+				<a href="#payment-stars">Telegram Stars</a>
 				<a href="#payment-crypto">CryptoBot</a>
-				<a href="#content-settings">Контент</a>
-				<a href="#backup">Бэкап</a>
-				<a href="#hosts">Хосты</a>
-				<a href="#promo-codes">Промокоды</a>
 			</nav>
 			<section class="settings-section" id="panel-settings">
 				<h2>Настройки Панели</h2>
 				<div class="form-group">
 					<label for="panel_login">Логин для входа в панель:</label>
 					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}" placeholder="admin" required />
-					<small class="field-hint">Admin login for the web panel.</small>
+					<small class="field-hint">Логин администратора для входа в веб-панель.</small>
 				</div>
 				<div class="form-group">
 					<label for="admin_ip_allowlist">Доверенные IP/CIDR:</label>
 					<textarea id="admin_ip_allowlist" name="admin_ip_allowlist" rows="3"
 						placeholder="94.183.234.189 79.139.250.224">{{ settings.admin_ip_allowlist or "" }}</textarea>
-					<small class="field-hint">Эти адреса не попадают под внутренний лимит неверных входов и неверных subscription-токенов.</small>
+					<small class="field-hint">Эти адреса не попадают под внутренний лимит неверных входов и неверных токенов подписки.</small>
 				</div>
 				<div class="form-group">
 					<label for="panel_password">Новый пароль (оставьте пустым, чтобы не менять):</label>
@@ -547,7 +631,7 @@
 						<input type="password" id="panel_password" name="panel_password" placeholder="new-password" />
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
-					<small class="field-hint">Leave empty to keep current password.</small>
+					<small class="field-hint">Оставьте поле пустым, чтобы сохранить текущий пароль.</small>
 				</div>
 			</section>
 
@@ -560,17 +644,17 @@
 						<button type="button" class="copy-button" data-copy-target="telegram_bot_token">📋</button>
 						<button type="button" class="toggle-password">👁️</button>
 					</div>
-					<small class="field-hint">Keep this token secret.</small>
+					<small class="field-hint">Не передавайте этот токен посторонним.</small>
 				</div>
 				<div class="form-group">
-					<label for="telegram_bot_username">Username бота (без @):</label>
+					<label for="telegram_bot_username">Имя пользователя бота (без @):</label>
 					<input type="text" id="telegram_bot_username" name="telegram_bot_username" placeholder="myvpn_bot" value="{{ settings.telegram_bot_username or '' }}" required />
-					<small class="field-hint">Without @. Example: myvpn_bot.</small>
+					<small class="field-hint">Без символа @. Пример: myvpn_bot.</small>
 				</div>
 				<div class="form-group">
-					<label for="admin_telegram_id">Admin Telegram ID:</label>
+					<label for="admin_telegram_id">Telegram ID администратора:</label>
 					<input type="text" id="admin_telegram_id" name="admin_telegram_id" placeholder="123456789" value="{{ settings.admin_telegram_id or '' }}" required />
-					<small class="field-hint">Numeric ID for admin notifications.</small>
+					<small class="field-hint">Числовой Telegram ID для уведомлений администратора.</small>
 				</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_admin_payment_notifications" value="false" />
@@ -594,7 +678,7 @@
 						value="{{ settings.support_user or '' }}" />
 				</div>
 				<div class="form-group">
-					<label for="support_bot_token">Токен Support-бота (если используется):</label>
+					<label for="support_bot_token">Токен бота поддержки (если используется):</label>
 					<div class="password-wrapper">
 						<input type="password" id="support_bot_token" name="support_bot_token"
 							value="" placeholder="{% if settings.support_bot_token_configured %}Токен сохранён, оставьте пустым чтобы не менять{% endif %}" />
@@ -603,8 +687,7 @@
 					</div>
 				</div>
 				<div class="form-group">
-					<label for="support_group_id">ID Группы поддержки (должна быть включена функция форума
-						(Topics)):</label>
+					<label for="support_group_id">ID группы поддержки (в группе должны быть включены темы форума):</label>
 					<input type="text" id="support_group_id" name="support_group_id"
 						value="{{ settings.support_group_id or '' }}" />
 				</div>
@@ -674,7 +757,7 @@
 							<input type="text" id="receipt_email" name="receipt_email"
 								value="{{ settings.receipt_email or '' }}" />
 							<p class="field-help">
-								Используется как fallback, если запрос email перед оплатой YooKassa выключен или пользователь пропустил ввод.
+							Используется как запасной адрес, если запрос email перед оплатой YooKassa выключен или пользователь пропустил ввод.
 							</p>
 					</div>
 					<div class="form-group">
@@ -739,7 +822,7 @@
 				</div>
 				<div class="toggle-section" data-toggle-section="cryptobot_enabled">
 					<div class="form-group">
-						<label for="cryptobot_token">CryptoBot Token:</label>
+					<label for="cryptobot_token">Токен CryptoBot:</label>
 						<div class="password-wrapper">
 							<input type="password" id="cryptobot_token" name="cryptobot_token"
 								value="" placeholder="{% if settings.cryptobot_token_configured %}Токен сохранён, оставьте пустым чтобы не менять{% endif %}" />
@@ -748,7 +831,7 @@
 						</div>
 					</div>
 					<div class="form-group">
-						<label for="cryptobot_webhook_secret">CryptoBot Webhook Secret (legacy fallback):</label>
+					<label for="cryptobot_webhook_secret">Секрет вебхука CryptoBot (резерв для старой схемы):</label>
 						<div class="password-wrapper">
 							<input type="password" id="cryptobot_webhook_secret" name="cryptobot_webhook_secret"
 								autocomplete="off" value=""
@@ -780,7 +863,7 @@
 				</div>
 				<div class="toggle-section" data-toggle-section="happ_routing_enabled">
 					<div class="form-group">
-						<label for="happ_routing_rules">Happ routing link:</label>
+						<label for="happ_routing_rules">Ссылка маршрутизации Happ:</label>
 						<textarea id="happ_routing_rules" name="happ_routing_rules" rows="4"
 							placeholder="happ://routing/onadd/...">{{ settings.happ_routing_rules or "" }}</textarea>
 						<small class="field-hint">Эта строка добавляется после VPN-серверов в тело подписки.</small>

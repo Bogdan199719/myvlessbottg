@@ -67,20 +67,27 @@ content %}
 </div>
 
 <div class="table-toolbar">
+    <form class="table-tools" method="get" action="{{ url_for('keys_page') }}">
+        <input class="search-input" type="search" name="q" value="{{ list_query }}" placeholder="Поиск по ID, хосту или email" />
+        <input type="hidden" name="status" value="{{ selected_status }}">
+        <select name="per_page" class="form-control" aria-label="Строк на странице">
+            {% for size in [25, 50, 100] %}
+            <option value="{{ size }}" {{ 'selected' if pagination.per_page == size else '' }}>{{ size }} на странице</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="button button-small button-primary">Найти</button>
+        {% if list_query %}<a class="button button-small button-secondary" href="{{ url_for('keys_page', status=selected_status, per_page=pagination.per_page) }}">Сбросить поиск</a>{% endif %}
+    </form>
     <div class="table-tools">
-        <input id="keysSearch" class="search-input" type="text" placeholder="Поиск по ID, хосту или email" />
         <div class="filter-group">
-            <button type="button" class="filter-chip is-active" data-key-filter="all">Все</button>
-            <button type="button" class="filter-chip" data-key-filter="active">Активные</button>
-            <button type="button" class="filter-chip" data-key-filter="expiring">Скоро истекают</button>
-            <button type="button" class="filter-chip" data-key-filter="expired">Просроченные</button>
-            <button type="button" class="filter-chip" data-key-filter="trial">Пробные</button>
-            <button type="button" class="filter-chip" data-key-filter="global">Глобальные</button>
+            {% for value, label in [('all', 'Все'), ('active', 'Активные'), ('expiring', 'Скоро истекают'), ('expired', 'Просроченные'), ('trial', 'Пробные'), ('global', 'Глобальные')] %}
+            <a class="filter-chip {{ 'is-active' if selected_status == value else '' }}" href="{{ url_for('keys_page', q=list_query, status=value, per_page=pagination.per_page) }}">{{ label }}</a>
+            {% endfor %}
         </div>
     </div>
     <div class="table-tools">
         <a class="button button-small button-secondary" href="{{ url_for('export_keys_csv') }}">Экспорт CSV</a>
-        <div class="count-pill">Показано: <span id="keysCount"></span></div>
+        <div class="count-pill">Найдено: {{ pagination.total_items }}</div>
     </div>
 </div>
 
@@ -99,28 +106,23 @@ content %}
                 </tr>
             </thead>
             <tbody>
-                {% for user in grouped_users %}
+                {% for row in key_rows %}
+                {% set user = row.user %}
+                {% set key = row.key %}
+                {% set global_keys = row.global_keys %}
+                {% if row.show_group_header %}
                 <tr class="key-user-group-row" data-group-row="{{ user.user_id }}">
                     <td colspan="7" class="key-user-group-cell">
                         <strong class="key-user-name">
-                            <a href="{{ url_for('users_page') }}#user-{{ user.user_id }}">{{ user.username }}</a>
+                            <a href="{{ url_for('users_page', q=user.user_id) }}#user-{{ user.user_id }}">{{ user.username }}</a>
                         </strong>
                         <small class="key-user-id">ID: {{ user.user_id }}</small>
                     </td>
                 </tr>
+                {% endif %}
 
-                {% set global_keys = [] %}
-                {% set regular_keys = [] %}
-                {% for key in user.user_keys %}
-                    {% if key.is_global %}
-                        {% set _ = global_keys.append(key) %}
-                    {% else %}
-                        {% set _ = regular_keys.append(key) %}
-                    {% endif %}
-                {% endfor %}
-
-                {% if global_keys %}
-                {% set first_key = global_keys[0] %}
+                {% if row.kind == 'global' %}
+                {% set first_key = key %}
                 <tr class="key-row-global" data-key-row="1" data-group="{{ user.user_id }}" data-key-type="global"
                     data-key-trial="{{ '1' if user.is_trial else '0' }}"
                     data-key-status="{{ first_key.expiry_status.filter }}"
@@ -145,19 +147,20 @@ content %}
                     </td>
                     <td><small>Multi-link</small></td>
                     <td class="key-link-cell">
-                        {% if user.subscription_link %}
+                        {% if user.has_subscription_link %}
                         <div class="key-copy-tools">
                             <button type="button" class="button button-small button-primary js-toggle-secret"
-                                data-target="secret-global-{{ user.user_id }}">
+                                data-target="secret-global-{{ user.user_id }}"
+                                data-secret-url="{{ url_for('user_subscription_secret_route', user_id=user.user_id) }}">
                                 Показать
                             </button>
                             <button type="button" class="button button-small button-secondary js-copy-secret"
-                                data-copy="{{ user.subscription_link }}">
+                                data-secret-url="{{ url_for('user_subscription_secret_route', user_id=user.user_id) }}">
                                 Копировать
                             </button>
                         </div>
                         <div id="secret-global-{{ user.user_id }}" class="secret-value" hidden>
-                            <code>{{ user.subscription_link }}</code>
+                            <code></code>
                         </div>
                         <small class="secret-hint">Subscription URL пользователя</small>
                         {% else %}
@@ -192,7 +195,7 @@ content %}
                 </tr>
                 {% endif %}
 
-                {% for key in regular_keys %}
+                {% if row.kind == 'regular' %}
                 <tr data-key-row="1" data-group="{{ user.user_id }}" data-key-type="regular"
                     data-key-trial="{{ '1' if key.is_trial else '0' }}"
                     data-key-status="{{ key.expiry_status.filter }}"
@@ -214,20 +217,20 @@ content %}
                     </td>
                     <td><small>{{ key.key_email }}</small></td>
                     <td class="key-link-cell">
-                        {% set secret_value = key.copy_value if key.has_copy_value else user.subscription_link %}
-                        {% if secret_value %}
+                        {% if key.has_copy_value or user.has_subscription_link %}
                         <div class="key-copy-tools">
                             <button type="button" class="button button-small button-primary js-toggle-secret"
-                                data-target="secret-key-{{ key.key_id }}">
+                                data-target="secret-key-{{ key.key_id }}"
+                                data-secret-url="{{ url_for('key_secret_route', key_id=key.key_id) }}">
                                 Показать
                             </button>
                             <button type="button" class="button button-small button-secondary js-copy-secret"
-                                data-copy="{{ secret_value }}">
+                                data-secret-url="{{ url_for('key_secret_route', key_id=key.key_id) }}">
                                 Копировать
                             </button>
                         </div>
                         <div id="secret-key-{{ key.key_id }}" class="secret-value" hidden>
-                            <code>{{ secret_value }}</code>
+                            <code></code>
                         </div>
                         <small class="secret-hint">{{ key.copy_kind if key.has_copy_value else 'Subscription URL пользователя' }}</small>
                         {% else %}
@@ -277,12 +280,27 @@ content %}
                         {% endif %}
                     </td>
                 </tr>
-                {% endfor %}
+                {% endif %}
+                {% else %}
+                <tr><td colspan="7"><p class="empty-state">Ключи по заданным условиям не найдены.</p></td></tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
 </section>
+
+{% if pagination.total_pages > 1 %}
+<div class="table-toolbar" aria-label="Пагинация ключей">
+    <div class="table-tools">
+        {% if pagination.has_previous %}<a class="button button-small button-secondary" href="{{ url_for('keys_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=pagination.previous_page) }}">← Назад</a>{% endif %}
+        {% for page_number in pagination.pages %}
+        <a class="button button-small {{ 'button-primary' if page_number == pagination.page else 'button-secondary' }}" href="{{ url_for('keys_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=page_number) }}">{{ page_number }}</a>
+        {% endfor %}
+        {% if pagination.has_next %}<a class="button button-small button-secondary" href="{{ url_for('keys_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=pagination.next_page) }}">Вперёд →</a>{% endif %}
+    </div>
+    <div class="count-pill">Страница {{ pagination.page }} из {{ pagination.total_pages }}</div>
+</div>
+{% endif %}
 
 <script nonce="{{ csp_nonce() }}">
     function checkChanges(form) {
@@ -331,17 +349,50 @@ content %}
 
         setInterval(refreshTaskStatuses, 5000);
 
+        const secretCache = new Map();
+
+        async function loadSecret(button) {
+            const url = button.getAttribute('data-secret-url');
+            if (!url) throw new Error('Secret URL is missing');
+            if (secretCache.has(url)) return secretCache.get(url);
+            const response = await fetch(url, {
+                credentials: 'same-origin',
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+            });
+            if (!response.ok) throw new Error('Secret is unavailable');
+            const payload = await response.json();
+            if (!payload.value) throw new Error('Secret is empty');
+            secretCache.set(url, payload.value);
+            return payload.value;
+        }
+
         document.querySelectorAll('.js-toggle-secret').forEach(button => {
-            button.addEventListener('click', () => {
+            button.addEventListener('click', async () => {
                 const targetId = button.getAttribute('data-target');
                 const block = document.getElementById(targetId);
                 if (!block) return;
                 const isHidden = block.hasAttribute('hidden');
                 if (isHidden) {
-                    block.removeAttribute('hidden');
-                    button.textContent = 'Скрыть';
+                    const originalText = button.textContent;
+                    button.disabled = true;
+                    button.textContent = 'Загрузка...';
+                    try {
+                        const value = await loadSecret(button);
+                        const code = block.querySelector('code');
+                        if (code) code.textContent = value;
+                        block.removeAttribute('hidden');
+                        button.textContent = 'Скрыть';
+                    } catch (_) {
+                        button.textContent = 'Недоступно';
+                        window.setTimeout(() => { button.textContent = originalText; }, 1600);
+                    } finally {
+                        button.disabled = false;
+                    }
                 } else {
                     block.setAttribute('hidden', '');
+                    const code = block.querySelector('code');
+                    if (code) code.textContent = '';
                     button.textContent = 'Показать';
                 }
             });
@@ -349,10 +400,10 @@ content %}
 
         document.querySelectorAll('.js-copy-secret').forEach(button => {
             button.addEventListener('click', async () => {
-                const value = button.getAttribute('data-copy');
-                if (!value) return;
                 const originalText = button.textContent;
+                button.disabled = true;
                 try {
+                    const value = await loadSecret(button);
                     await navigator.clipboard.writeText(value);
                     button.textContent = 'Скопировано';
                 } catch (_) {
@@ -360,6 +411,7 @@ content %}
                 }
                 window.setTimeout(() => {
                     button.textContent = originalText;
+                    button.disabled = false;
                 }, 1600);
             });
         });

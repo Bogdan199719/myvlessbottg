@@ -25,46 +25,51 @@
 		<small>сегодня: {{ "%.0f"|format(summary.today_revenue) }} ₽</small>
 	</div>
 	<div class="analytics-kpi-card">
-		<span class="kpi-label">Выручка за всё время</span>
-		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
-		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных промокодов: {{ summary.all_time_free_promos }}</small>
-	</div>
-	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
-		<span class="kpi-label">Активные оплаченные подписки</span>
-		<strong>{{ summary.active_paid_subscriptions }}</strong>
-		<small>активных клиентов; оплатили всего: {{ summary.paid_transaction_users }}</small>
-	</a>
-	<div class="analytics-kpi-card">
-		<span class="kpi-label">Оплаченные заказы {{ analytics.period_label }}</span>
+		<span class="kpi-label">Заказы {{ analytics.period_label }}</span>
 		<strong>{{ summary.period_orders }}</strong>
 		<small>сегодня: {{ summary.today_orders }}, клиентов: {{ summary.period_paid_transaction_users }}, промокодов: {{ summary.period_free_promos }}</small>
 	</div>
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+		<span class="kpi-label">Активные оплаченные подписки</span>
+		<strong>{{ summary.active_paid_subscriptions }}</strong>
+		<small>активных клиентов; уникальных оплативших за всю историю: {{ summary.paid_transaction_users }}</small>
+	</a>
+	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Пользователи</span>
 		<strong>{{ summary.total_users }}</strong>
-		<small>новых {{ analytics.period_label }}: {{ summary.period_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
-	</a>
-	<div class="analytics-kpi-card">
-		<span class="kpi-label">Оплатившие клиенты</span>
-		<strong>{{ summary.paid_transaction_users }}</strong>
-		<small>по paid-транзакциям за всю историю</small>
-	</div>
-	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
-		<span class="kpi-label">Всего пользователей</span>
-		<strong>{{ summary.total_users }}</strong>
-		<small>пробник взяли: {{ summary.trial_used_users }}, оплатили: {{ summary.paid_transaction_users }}</small>
+		<small>новых {{ analytics.period_label }}: {{ summary.period_users }}, пробник взяли: {{ summary.trial_used_users }}</small>
 	</a>
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Средний чек</span>
 		<strong>{{ "%.0f"|format(summary.avg_order) }} ₽</strong>
 		<small>конверсия в оплату: {{ summary.conversion_percent }}%</small>
 	</div>
+	<div class="analytics-kpi-card">
+		<span class="kpi-label">За всё время</span>
+		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
+		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных промокодов: {{ summary.all_time_free_promos }}</small>
+	</div>
 </section>
 
-<section class="profit-panel">
-	<div class="section-head">
+{% if stats.problem_users_count > 0 %}
+<aside class="flash flash-danger" role="alert" aria-labelledby="problem-users-alert-title">
+	<strong id="problem-users-alert-title">Требуют проверки: {{ stats.problem_users_count }} пользователей.</strong>
+	<a class="button button-small button-warning" href="#problem-users">Открыть список</a>
+</aside>
+{% endif %}
+
+<details class="profit-panel">
+	<summary class="section-head">
 		<div>
 			<h2>Делёж прибыли</h2>
+			<span class="panel-note">К распределению: {{ "%.0f"|format(profit.slices.unsettled.revenue_rub) }} ₽ выручки; Богдан {{ "%.0f"|format(profit.slices.unsettled.bogdan_profit_rub) }} ₽, Влад {{ "%.0f"|format(profit.slices.unsettled.vlad_net_rub) }} ₽.</span>
+		</div>
+		<span class="button button-small button-secondary">Показать расчёты и управление</span>
+	</summary>
+
+	<div class="section-head">
+		<div>
+			<h3>Параметры расчёта</h3>
 			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, затем минус серверы и делёж прибыли: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
 		</div>
 		<form class="profit-settings-form" action="{{ url_for('update_profit_settings_route') }}" method="post">
@@ -219,7 +224,7 @@
 		</div>
 	</div>
 	{% endif %}
-</section>
+</details>
 
 <div class="analytics-layout">
 	<section class="analytics-panel analytics-panel-wide">
@@ -407,9 +412,9 @@
 		{% endif %}
 	</section>
 
-	<section class="analytics-panel">
+	<section id="problem-users" class="analytics-panel {{ 'flash-danger' if stats.problem_users_count > 0 else '' }}" aria-labelledby="problem-users-title">
 		<div class="section-head">
-			<h2>Проблемные пользователи</h2>
+			<h2 id="problem-users-title">Проблемные пользователи</h2>
 			<span class="panel-note">{{ stats.problem_users_count }}</span>
 		</div>
 		{% if problem_users %}

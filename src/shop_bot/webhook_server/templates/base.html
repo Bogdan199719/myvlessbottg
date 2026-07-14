@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 	<title>{% block title %}Панель управления Ботом{% endblock %}</title>
 	<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
-	<script nonce="{{ csp_nonce() }}" src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+	<script nonce="{{ csp_nonce() }}" src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
 </head>
 
 <body>
@@ -36,54 +36,61 @@
 						class="nav-link {% if request.endpoint == 'updates_page' %}active{% endif %}">Обновления</a>
 				</nav>
 
-				<!-- Right side: bot controls + logout + burger -->
+				<!-- Right side: compact system controls + logout + burger -->
 				<div class="header-right">
-					<!-- Bot controls -->
-					<div class="header-controls">
-						<div class="bot-control">
-							<span class="bot-control-name">Shop</span>
-							{% if bot_status.shop_bot_running %}
-							<p class="status-running"><strong>Запущен</strong></p>
-							<form action="{{ url_for('stop_shop_bot_route') }}" method="post">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-stop button-small">Стоп</button>
-							</form>
-							{% else %}
-							<p class="status-stopped"><strong>Остановлен</strong></p>
-							{% if all_settings_ok %}
-							<form action="{{ url_for('start_shop_bot_route') }}" method="post">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-start button-small">Старт</button>
-							</form>
-							{% else %}
-							<button class="button button-disabled button-small" disabled
-								title="Заполните обязательные настройки Telegram">Старт</button>
-							{% endif %}
-							{% endif %}
-						</div>
+					<details class="bot-system-menu">
+						<summary class="button button-secondary button-small">
+							<span>Боты</span>
+							<span class="status-badge {{ 'status-active' if bot_status.shop_bot_running else 'status-stopped' }}">Shop {{ 'работает' if bot_status.shop_bot_running else 'остановлен' }}</span>
+							<span class="status-badge {{ 'status-active' if bot_status.support_bot_running else 'status-stopped' }}">Support {{ 'работает' if bot_status.support_bot_running else 'остановлен' }}</span>
+						</summary>
 
-						<div class="bot-control">
-							<span class="bot-control-name">Support</span>
-							{% if bot_status.support_bot_running %}
-							<p class="status-running"><strong>Запущен</strong></p>
-							<form action="{{ url_for('stop_support_bot_route') }}" method="post">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-stop button-small">Стоп</button>
-							</form>
-							{% else %}
-							<p class="status-stopped"><strong>Остановлен</strong></p>
-							{% if support_settings_ok %}
-							<form action="{{ url_for('start_support_bot_route') }}" method="post">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-start button-small">Старт</button>
-							</form>
-							{% else %}
-							<button class="button button-disabled button-small" disabled
-								title="Заполните токен Support-бота и ID группы поддержки">Старт</button>
-							{% endif %}
-							{% endif %}
+						<div class="header-controls" aria-label="Системное управление ботами">
+							<div class="bot-control">
+								<span class="bot-control-name">Shop</span>
+								{% if bot_status.shop_bot_running %}
+								<p class="status-running"><strong>Запущен</strong></p>
+								<form action="{{ url_for('stop_shop_bot_route') }}" method="post" data-confirm="Остановить Shop-бота? Пока он остановлен, пользователи не смогут пользоваться магазином.">
+									<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+									<button type="submit" class="button button-stop button-small">Остановить</button>
+								</form>
+								{% else %}
+								<p class="status-stopped"><strong>Остановлен</strong></p>
+								{% if all_settings_ok %}
+								<form action="{{ url_for('start_shop_bot_route') }}" method="post">
+									<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+									<button type="submit" class="button button-start button-small">Старт</button>
+								</form>
+								{% else %}
+								<button class="button button-disabled button-small" disabled
+									title="Заполните обязательные настройки Telegram">Старт</button>
+								{% endif %}
+								{% endif %}
+							</div>
+
+							<div class="bot-control">
+								<span class="bot-control-name">Support</span>
+								{% if bot_status.support_bot_running %}
+								<p class="status-running"><strong>Запущен</strong></p>
+								<form action="{{ url_for('stop_support_bot_route') }}" method="post" data-confirm="Остановить Support-бота? Новые обращения не будут обрабатываться до повторного запуска.">
+									<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+									<button type="submit" class="button button-stop button-small">Остановить</button>
+								</form>
+								{% else %}
+								<p class="status-stopped"><strong>Остановлен</strong></p>
+								{% if support_settings_ok %}
+								<form action="{{ url_for('start_support_bot_route') }}" method="post">
+									<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+									<button type="submit" class="button button-start button-small">Старт</button>
+								</form>
+								{% else %}
+								<button class="button button-disabled button-small" disabled
+									title="Заполните токен Support-бота и ID группы поддержки">Старт</button>
+								{% endif %}
+								{% endif %}
+							</div>
 						</div>
-					</div>
+					</details>
 
 					<!-- Logout -->
 					<div class="user-session-controls">
@@ -105,7 +112,7 @@
 		{% with messages = get_flashed_messages(with_categories=true) %}
 		{% if messages %}
 		{% for category, message in messages %}
-		<div class="flash flash-{{ category }}">{{ message }}</div>
+		<div class="flash flash-{{ category }}" role="{{ 'alert' if category in ['danger', 'warning'] else 'status' }}" aria-live="{{ 'assertive' if category in ['danger', 'warning'] else 'polite' }}">{{ message }}</div>
 		{% endfor %}
 		{% endif %}
 		{% endwith %}

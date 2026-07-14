@@ -2,6 +2,9 @@ document.addEventListener('DOMContentLoaded', function () {
 	function initializePasswordToggles() {
 		const togglePasswordButtons = document.querySelectorAll('.toggle-password')
 		togglePasswordButtons.forEach(button => {
+			if (!button.getAttribute('aria-label')) {
+				button.setAttribute('aria-label', 'Показать или скрыть значение')
+			}
 			button.addEventListener('click', function () {
 				const parent =
 					this.closest('.form-group') || this.closest('.password-wrapper')
@@ -27,7 +30,8 @@ document.addEventListener('DOMContentLoaded', function () {
 		)
 
 		controlForms.forEach(form => {
-			form.addEventListener('submit', function () {
+			form.addEventListener('submit', function (event) {
+				if (event.defaultPrevented) return
 				const button = form.querySelector('button[type="submit"]')
 				if (button) {
 					button.disabled = true
@@ -49,7 +53,17 @@ document.addEventListener('DOMContentLoaded', function () {
 		confirmationForms.forEach(form => {
 			form.addEventListener('submit', function (event) {
 				const message = form.getAttribute('data-confirm')
-				if (!confirm(message)) {
+				const expectedText = form.getAttribute('data-confirm-text')
+				let confirmed = false
+				if (expectedText) {
+					const enteredText = prompt(
+						`${message}\n\nДля подтверждения введите ID: ${expectedText}`
+					)
+					confirmed = enteredText !== null && enteredText.trim() === expectedText
+				} else {
+					confirmed = confirm(message)
+				}
+				if (!confirmed) {
 					event.preventDefault()
 				}
 			})
@@ -101,6 +115,9 @@ document.addEventListener('DOMContentLoaded', function () {
 		}
 
 		copyButtons.forEach(button => {
+			if (!button.getAttribute('aria-label')) {
+				button.setAttribute('aria-label', 'Копировать значение поля')
+			}
 			button.addEventListener('click', async function () {
 				const targetId = button.getAttribute('data-copy-target')
 				if (!targetId) return
@@ -135,6 +152,15 @@ document.addEventListener('DOMContentLoaded', function () {
 		}
 
 		if (typeof Chart === 'undefined') {
+			;[trendChartCanvas, paymentChartCanvas].filter(Boolean).forEach(canvas => {
+				canvas.hidden = true
+				const fallback = document.createElement('p')
+				fallback.className = 'empty-state chart-fallback'
+				fallback.setAttribute('role', 'status')
+				fallback.textContent =
+					'График временно недоступен. Числовые показатели выше остаются актуальными.'
+				canvas.insertAdjacentElement('afterend', fallback)
+			})
 			return
 		}
 
@@ -623,8 +649,8 @@ document.addEventListener('DOMContentLoaded', function () {
 	}
 
 	initializePasswordToggles()
-	setupBotControlForms()
 	setupConfirmationForms()
+	setupBotControlForms()
 	setupToggleSections()
 	setupCopyButtons()
 	initializeDashboardCharts()

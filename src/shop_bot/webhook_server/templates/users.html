@@ -54,25 +54,27 @@
 	</div>
 
 	<div class="table-toolbar">
+		<form class="table-tools" method="get" action="{{ url_for('users_page') }}">
+			<input class="search-input" type="search" name="q" value="{{ list_query }}" placeholder="Поиск по ID, username или email" />
+			<input type="hidden" name="status" value="{{ selected_status }}">
+			<select name="per_page" class="form-control" aria-label="Строк на странице">
+				{% for size in [25, 50, 100] %}
+				<option value="{{ size }}" {{ 'selected' if pagination.per_page == size else '' }}>{{ size }} на странице</option>
+				{% endfor %}
+			</select>
+			<button type="submit" class="button button-small button-primary">Найти</button>
+			{% if list_query %}<a class="button button-small button-secondary" href="{{ url_for('users_page', status=selected_status, per_page=pagination.per_page) }}">Сбросить поиск</a>{% endif %}
+		</form>
 		<div class="table-tools">
-			<input id="usersSearch" class="search-input" type="text" placeholder="Поиск по ID или username" />
 			<div class="filter-group">
-				<button type="button" class="filter-chip is-active" data-user-filter="all">Все</button>
-				<button type="button" class="filter-chip" data-user-filter="paid">Платные</button>
-				<button type="button" class="filter-chip" data-user-filter="paid_expired">Платные истекли</button>
-				<button type="button" class="filter-chip" data-user-filter="free">Бесплатный доступ</button>
-				<button type="button" class="filter-chip" data-user-filter="trial">Пробные</button>
-				<button type="button" class="filter-chip" data-user-filter="trial_expired">Пробные истекли</button>
-				<button type="button" class="filter-chip" data-user-filter="payment_pending">Счёт не оплачен</button>
-				<button type="button" class="filter-chip" data-user-filter="free_expired">Бесплатный доступ истёк</button>
-				<button type="button" class="filter-chip" data-user-filter="support_only">Поддержка без подписки</button>
-				<button type="button" class="filter-chip" data-user-filter="no_subscription">Без подписки</button>
-				<button type="button" class="filter-chip" data-user-filter="banned">Забаненные</button>
+				{% for value, label in [('all', 'Все'), ('paid', 'Платные'), ('paid_expired', 'Платные истекли'), ('free', 'Бесплатный доступ'), ('trial', 'Пробные'), ('trial_expired', 'Пробные истекли'), ('payment_pending', 'Счёт не оплачен'), ('free_expired', 'Бесплатный доступ истёк'), ('support_only', 'Поддержка без подписки'), ('no_subscription', 'Без подписки'), ('banned', 'Забаненные')] %}
+				<a class="filter-chip {{ 'is-active' if selected_status == value else '' }}" href="{{ url_for('users_page', q=list_query, status=value, per_page=pagination.per_page) }}">{{ label }}</a>
+				{% endfor %}
 			</div>
 		</div>
 		<div class="table-tools">
 			<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Экспорт CSV</a>
-			<div class="count-pill">Показано: <span id="usersCount"></span></div>
+			<div class="count-pill">Найдено: {{ pagination.total_items }}</div>
 		</div>
 	</div>
 
@@ -148,6 +150,9 @@
 								Выдать
 							</button>
 
+							<details class="row-actions-menu">
+								<summary class="button button-secondary button-small" aria-label="Дополнительные действия с пользователем {{ user.telegram_id }}">Ещё</summary>
+								<div class="row-actions-menu-content">
 							{% if user.is_banned %}
 							<form action="{{ url_for('unban_user_route', user_id=user.telegram_id) }}" method="post"
 								style="display:inline;">
@@ -168,6 +173,7 @@
 							{% endif %}
 							<form action="{{ url_for('delete_user_route', user_id=user.telegram_id) }}" method="post"
 								data-confirm="ВНИМАНИЕ! Это действие полностью удалит пользователя и все его данные (включая оплаты/историю) и попытается удалить ключи с серверов. Продолжить?"
+								data-confirm-text="{{ user.telegram_id }}"
 								style="display:inline;">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<button type="submit" class="button button-danger button-small">
@@ -184,19 +190,35 @@
 								</button>
 							</form>
 							{% endif %}
+								</div>
+							</details>
 						</div>
 					</td>
 				</tr>
+				{% else %}
+				<tr><td colspan="6"><p class="empty-state">Пользователи по заданным условиям не найдены.</p></td></tr>
 				{% endfor %}
 			</tbody>
 		</table>
 	</div>
+	{% if pagination.total_pages > 1 %}
+	<div class="table-toolbar" aria-label="Пагинация пользователей">
+		<div class="table-tools">
+			{% if pagination.has_previous %}<a class="button button-small button-secondary" href="{{ url_for('users_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=pagination.previous_page) }}">← Назад</a>{% endif %}
+			{% for page_number in pagination.pages %}
+			<a class="button button-small {{ 'button-primary' if page_number == pagination.page else 'button-secondary' }}" href="{{ url_for('users_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=page_number) }}">{{ page_number }}</a>
+			{% endfor %}
+			{% if pagination.has_next %}<a class="button button-small button-secondary" href="{{ url_for('users_page', q=list_query, status=selected_status, per_page=pagination.per_page, page=pagination.next_page) }}">Вперёд →</a>{% endif %}
+		</div>
+		<div class="count-pill">Страница {{ pagination.page }} из {{ pagination.total_pages }}</div>
+	</div>
+	{% endif %}
 </section>
 
 <!-- Issue Key Modal -->
 <div id="issueKeyModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="issueKeyModalTitle" hidden>
 	<div class="modal-content" tabindex="-1">
-		<button type="button" class="modal-close" aria-label="Закрыть" onclick="closeIssueModal()">&times;</button>
+		<button type="button" class="modal-close js-close-issue-modal" aria-label="Закрыть">&times;</button>
 		<h2 id="issueKeyModalTitle">Выдать подписку</h2>
 		<p class="modal-user-line">Пользователь: <span id="modalUsername"></span> <small>ID: <span id="modalUserIdDisplay"></span></small></p>
 
@@ -232,7 +254,7 @@
 
 			<div class="form-actions">
 				<button type="submit" class="button button-success">Выдать</button>
-				<button type="button" class="button button-secondary" onclick="closeIssueModal()">Отмена</button>
+				<button type="button" class="button button-secondary js-close-issue-modal">Отмена</button>
 			</div>
 		</form>
 	</div>
@@ -278,20 +300,38 @@
 		});
 	});
 
+	document.querySelectorAll(".js-close-issue-modal").forEach(function (button) {
+		button.addEventListener("click", closeIssueModal);
+	});
+
 	// Close modal if clicked outside
 	window.addEventListener("click", function (event) {
 		var modal = document.getElementById("issueKeyModal");
 		if (event.target == modal) {
-			modal.style.display = "none";
-			modal.setAttribute("hidden", "");
+			closeIssueModal();
 		}
 	});
 
 	document.addEventListener("keydown", function (event) {
+		var modal = document.getElementById("issueKeyModal");
+		if (!modal || modal.hasAttribute("hidden")) return;
 		if (event.key === "Escape") {
-			var modal = document.getElementById("issueKeyModal");
-			if (modal && !modal.hasAttribute("hidden")) {
-				closeIssueModal();
+			closeIssueModal();
+			return;
+		}
+		if (event.key === "Tab") {
+			var focusable = Array.from(modal.querySelectorAll(
+				'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+			));
+			if (!focusable.length) return;
+			var first = focusable[0];
+			var last = focusable[focusable.length - 1];
+			if (event.shiftKey && document.activeElement === first) {
+				event.preventDefault();
+				last.focus();
+			} else if (!event.shiftKey && document.activeElement === last) {
+				event.preventDefault();
+				first.focus();
 			}
 		}
 	});
