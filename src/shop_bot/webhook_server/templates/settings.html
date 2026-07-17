@@ -652,9 +652,9 @@
 					<small class="field-hint">Без символа @. Пример: myvpn_bot.</small>
 				</div>
 				<div class="form-group">
-					<label for="admin_telegram_id">Telegram ID администратора:</label>
-					<input type="text" id="admin_telegram_id" name="admin_telegram_id" placeholder="123456789" value="{{ settings.admin_telegram_id or '' }}" required />
-					<small class="field-hint">Числовой Telegram ID для уведомлений администратора.</small>
+					<label for="admin_telegram_id">Telegram ID администраторов:</label>
+					<input type="text" id="admin_telegram_id" name="admin_telegram_id" placeholder="123456789, 987654321" value="{{ settings.admin_telegram_id or '' }}" required />
+					<small class="field-hint">Один или несколько числовых Telegram ID через запятую. Все указанные пользователи получат права администратора и уведомления.</small>
 				</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_admin_payment_notifications" value="false" />

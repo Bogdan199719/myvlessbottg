@@ -17,6 +17,7 @@ from aiosend import CryptoPay
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, InvalidOperation
 from typing import Dict
 from shop_bot.utils import time_utils
+from shop_bot.utils.admin_ids import is_admin_telegram_id, parse_admin_telegram_ids
 from aiogram import Bot, Router, F, types, html
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.types import BufferedInputFile
@@ -96,6 +97,25 @@ from shop_bot.config import (
 
 TELEGRAM_BOT_USERNAME = None
 ADMIN_ID = None
+
+
+def _get_admin_ids() -> tuple[int, ...]:
+    return parse_admin_telegram_ids(get_setting("admin_telegram_id"))
+
+
+def _is_admin(user_id: object) -> bool:
+    return is_admin_telegram_id(user_id, get_setting("admin_telegram_id"))
+
+
+async def _send_to_admins(bot: Bot, text: str, **kwargs) -> int:
+    sent_count = 0
+    for admin_id in _get_admin_ids():
+        try:
+            await bot.send_message(admin_id, text, **kwargs)
+            sent_count += 1
+        except Exception:
+            logger.exception("Failed to send a Telegram message to an administrator.")
+    return sent_count
 
 
 class _BestEffortProcessingMessage:
@@ -624,7 +644,7 @@ async def show_main_menu(message: types.Message, edit_message: bool = False):
     trial_available = not (
         user_db_data and user_db_data.get("trial_used")
     ) and not has_ever_purchased_vpn_subscription(user_id)
-    is_admin = str(user_id) == str(get_setting("admin_telegram_id") or "")
+    is_admin = _is_admin(user_id)
 
     text = "🏠 <b>Главное меню</b>"
     keyboard = keyboards.create_main_menu_keyboard(user_keys, trial_available, is_admin)
@@ -1090,8 +1110,7 @@ def get_user_router() -> Router:
     @user_router.callback_query(F.data == "start_broadcast")
     @registration_required
     async def start_broadcast_handler(callback: types.CallbackQuery, state: FSMContext):
-        admin_id = get_setting("admin_telegram_id")
-        if not admin_id or str(callback.from_user.id) != str(admin_id):
+        if not _is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав.", show_alert=True)
             return
 
@@ -1332,14 +1351,13 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
-        admin_id_str = get_setting("admin_telegram_id")
-        if not admin_id_str:
+        admin_ids = _get_admin_ids()
+        if not admin_ids:
             await message.answer(
                 "❌ Ошибка: Администратор не настроен. Обратитесь в поддержку."
             )
             await state.clear()
             return
-        admin_id = int(admin_id_str)
         text = (
             f"💸 <b>Заявка на вывод реферальных средств</b>\n"
             f"👤 Пользователь: @{user.get('username', 'N/A')} (ID: <code>{user_id}</code>)\n"
@@ -1348,16 +1366,12 @@ def get_user_router() -> Router:
             f"/approve_withdraw_{user_id} /decline_withdraw_{user_id}"
         )
         await message.answer("Ваша заявка отправлена администратору. Ожидайте ответа.")
-        await message.bot.send_message(admin_id, text, parse_mode="HTML")
+        await _send_to_admins(message.bot, text, parse_mode="HTML")
         await state.clear()
 
     @user_router.message(F.text.regexp(r"^/approve_withdraw_\d+(?:@\w+)?$"))
     async def approve_withdraw_handler(message: types.Message):
-        admin_id_str = get_setting("admin_telegram_id")
-        if not admin_id_str:
-            return
-        admin_id = int(admin_id_str)
-        if message.from_user.id != admin_id:
+        if not _is_admin(message.from_user.id):
             return
         try:
             user_id = _extract_withdraw_command_user_id(
@@ -1385,11 +1399,7 @@ def get_user_router() -> Router:
 
     @user_router.message(F.text.regexp(r"^/decline_withdraw_\d+(?:@\w+)?$"))
     async def decline_withdraw_handler(message: types.Message):
-        admin_id_str = get_setting("admin_telegram_id")
-        if not admin_id_str:
-            return
-        admin_id = int(admin_id_str)
-        if message.from_user.id != admin_id:
+        if not _is_admin(message.from_user.id):
             return
         try:
             user_id = _extract_withdraw_command_user_id(
@@ -2232,6 +2242,8 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>📖 Инструкция по подключению</b>\n\n"
             "<b>Рекомендуемое приложение:</b> <a href='https://www.happ.su/main/ru'>Happ</a>\n\n"
+            "<b>Если Happ недоступен:</b> используйте <a href='https://incy.cc'>Incy</a>. "
+            "Версии для поддерживаемых платформ собраны в <a href='https://github.com/INCY-DEV/incy-platforms'>официальном репозитории Incy</a>.\n\n"
             "<b>Что вы получаете в боте:</b>\n"
             "1. <code>vless://...</code> — один ключ доступа.\n"
             "2. <code>https://.../sub/...</code> — ссылка подписки со всеми серверами.\n\n"
@@ -2242,6 +2254,8 @@ def get_user_router() -> Router:
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
             "5. Выберите сервер и включите подключение.\n\n"
             "<b>Запасной способ:</b> скопируйте ключ или ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
+            "<b>Подключение через Incy:</b> скопируйте ссылку подписки <code>https://.../sub/...</code>, "
+            "откройте Incy и добавьте подписку по URL. После импорта выберите сервер и включите подключение.\n\n"
             "Выберите платформу ниже:",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
@@ -2259,7 +2273,10 @@ def get_user_router() -> Router:
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
             "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится список серверов.",
+            "Для подписки <code>/sub/</code> в Happ появится список серверов.\n\n"
+            "<b>Если Happ недоступен:</b> установите <a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Incy из Google Play</a> "
+            "или скачайте <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>APK с официального GitHub</a>. "
+            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2276,7 +2293,10 @@ def get_user_router() -> Router:
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
             "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится готовый список серверов.",
+            "Для подписки <code>/sub/</code> в Happ появится готовый список серверов.\n\n"
+            "<b>Если Happ удалён из App Store:</b> установите <a href='https://apps.apple.com/ru/app/incy/id6756943388'>Incy из App Store</a>. "
+            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL. "
+            "Подробнее — на <a href='https://incy.cc'>официальном сайте Incy</a>.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2293,7 +2313,10 @@ def get_user_router() -> Router:
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
             "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.",
+            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
+            "<b>Если Happ недоступен:</b> установите Incy из <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> "
+            "или скачайте сборку для macOS из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
+            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2310,7 +2333,9 @@ def get_user_router() -> Router:
             "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
             "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
             "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.",
+            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
+            "<b>Если Happ недоступен:</b> скачайте Incy для Windows из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов на GitHub</a>. "
+            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2331,7 +2356,10 @@ def get_user_router() -> Router:
             "5. <b>Обновите подписку</b> (Server/Subscription Update).\n"
             "6. Включите <b>TUN Mode</b>.\n"
             "7. <b>Выберите сервер</b> и нажмите «Подключить».\n"
-            "8. <b>Проверьте IP</b> на <a href='https://whatismyipaddress.com/'>WhatIsMyIPAddress</a>.",
+            "8. <b>Проверьте IP</b> на <a href='https://whatismyipaddress.com/'>WhatIsMyIPAddress</a>.\n\n"
+            "<b>Резервный вариант — Incy:</b> если основной клиент установить не получается, "
+            "скачайте подходящую сборку из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
+            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -3460,7 +3488,6 @@ def get_user_router() -> Router:
     @user_router.callback_query(F.data.startswith("p2p_paid_"))
     async def notify_admin_paid(callback: types.CallbackQuery, state: FSMContext):
         request_id = callback.data.replace("p2p_paid_", "")
-        admin_id = int(get_setting("admin_telegram_id"))
         user = get_user(callback.from_user.id)
 
         pending = get_p2p_request(request_id)
@@ -3513,8 +3540,8 @@ def get_user_router() -> Router:
         builder.button(text="❌ Отклонить", callback_data=f"p2p_decline_{request_id}")
         builder.adjust(2)
 
-        await callback.bot.send_message(
-            admin_id,
+        await _send_to_admins(
+            callback.bot,
             (
                 "💳 <b>Новая P2P-заявка на оплату</b>\n\n"
                 f"👤 Пользователь: @{user.get('username','-')} (<code>{callback.from_user.id}</code>)\n"
@@ -3529,8 +3556,7 @@ def get_user_router() -> Router:
     async def admin_approve_p2p_handler(
         message: types.Message, bot: Bot, command: CommandObject
     ):
-        admin_id = int(get_setting("admin_telegram_id"))
-        if message.from_user.id != admin_id:
+        if not _is_admin(message.from_user.id):
             return
         request_id = _p2p_request_id_from_command(message, command)
         if not request_id:
@@ -3555,8 +3581,7 @@ def get_user_router() -> Router:
     async def admin_decline_p2p_handler(
         message: types.Message, command: CommandObject
     ):
-        admin_id = int(get_setting("admin_telegram_id"))
-        if message.from_user.id != admin_id:
+        if not _is_admin(message.from_user.id):
             return
         request_id = _p2p_request_id_from_command(message, command)
         if not request_id:
@@ -3577,8 +3602,7 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data.startswith("p2p_approve_"))
     async def admin_approve_p2p_callback(callback: types.CallbackQuery, bot: Bot):
-        admin_id = int(get_setting("admin_telegram_id"))
-        if callback.from_user.id != admin_id:
+        if not _is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав для этого действия.", show_alert=True)
             return
 
@@ -3607,8 +3631,7 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data.startswith("p2p_decline_"))
     async def admin_decline_p2p_callback(callback: types.CallbackQuery):
-        admin_id = int(get_setting("admin_telegram_id"))
-        if callback.from_user.id != admin_id:
+        if not _is_admin(callback.from_user.id):
             await callback.answer("У вас нет прав для этого действия.", show_alert=True)
             return
 
@@ -3687,14 +3710,11 @@ async def notify_admin_of_purchase(bot: Bot, metadata: dict):
     if get_setting("enable_admin_payment_notifications") == "false":
         return
 
-    admin_id_str = get_setting("admin_telegram_id")
-    if not admin_id_str:
+    if not _get_admin_ids():
         logger.warning(
             "Admin notification skipped: admin_telegram_id is not set in settings."
         )
         return
-
-    admin_id = int(admin_id_str)
 
     try:
         user_id = metadata.get("user_id")
@@ -3729,7 +3749,7 @@ async def notify_admin_of_purchase(bot: Bot, metadata: dict):
             f"💳 <b>Способ оплаты:</b> {safe_payment_method}"
         )
 
-        await bot.send_message(chat_id=admin_id, text=message_text, parse_mode="HTML")
+        await _send_to_admins(bot, message_text, parse_mode="HTML")
         logger.info(f"Admin notification sent for a new purchase by user {user_id}.")
 
     except Exception as e:
@@ -3744,12 +3764,10 @@ async def notify_admin_of_trial(
     if get_setting("enable_admin_trial_notifications") == "false":
         return
 
-    admin_id_str = get_setting("admin_telegram_id")
-    if not admin_id_str:
+    if not _get_admin_ids():
         return
 
     try:
-        admin_id = int(admin_id_str)
         user_info = get_user(user_id)
         username = user_info.get("username", "N/A") if user_info else "N/A"
 
@@ -3763,7 +3781,7 @@ async def notify_admin_of_trial(
             f"⏳ <b>Срок:</b> {duration_days} дн."
         )
 
-        await bot.send_message(chat_id=admin_id, text=message_text, parse_mode="HTML")
+        await _send_to_admins(bot, message_text, parse_mode="HTML")
         logger.info(f"Admin notification sent for TRIAL by user {user_id}.")
     except Exception as e:
         logger.error(f"Failed to send admin notification for trial: {e}", exc_info=True)

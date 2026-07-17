@@ -469,6 +469,34 @@ document.addEventListener('DOMContentLoaded', function () {
 		})
 	}
 
+	function loadDashboardCharts() {
+		if (!document.getElementById('chart-data')) return
+		if (typeof Chart !== 'undefined') {
+			initializeDashboardCharts()
+			return
+		}
+
+		const script = document.createElement('script')
+		script.src = 'https://cdn.jsdelivr.net/npm/chart.js'
+		script.async = true
+		let finished = false
+
+		function finish(loaded) {
+			if (finished) return
+			finished = true
+			clearTimeout(timeoutId)
+			script.onload = null
+			script.onerror = null
+			if (!loaded) script.remove()
+			initializeDashboardCharts()
+		}
+
+		script.onload = () => finish(true)
+		script.onerror = () => finish(false)
+		const timeoutId = setTimeout(() => finish(false), 3000)
+		document.head.appendChild(script)
+	}
+
 	function setupUserTableFilters() {
 		const searchInput = document.getElementById('usersSearch')
 		const countEl = document.getElementById('usersCount')
@@ -653,7 +681,7 @@ document.addEventListener('DOMContentLoaded', function () {
 	setupBotControlForms()
 	setupToggleSections()
 	setupCopyButtons()
-	initializeDashboardCharts()
+	loadDashboardCharts()
 	setupUserTableFilters()
 	setupKeyTableFilters()
 	setupMobileNavigation()

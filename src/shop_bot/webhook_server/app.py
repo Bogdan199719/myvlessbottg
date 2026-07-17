@@ -20,6 +20,7 @@ from collections import defaultdict
 from hmac import compare_digest
 from datetime import datetime, timedelta
 from shop_bot.utils import time_utils, update_manager
+from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
 from shop_bot.version import APP_VERSION
 from functools import wraps
@@ -924,9 +925,9 @@ def create_webhook_app(bot_controller_instance):
             "default-src 'self'; "
             f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
             "script-src-attr 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
-            "font-src 'self' data: https://fonts.gstatic.com; "
+            "font-src 'self' data:; "
             "connect-src 'self'; "
             "frame-ancestors 'none'; "
             "base-uri 'self'; "
@@ -3403,6 +3404,17 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def settings_page():
         if request.method == "POST":
+            admin_ids_value = request.form.get("admin_telegram_id")
+            if admin_ids_value is not None:
+                try:
+                    admin_ids_value = normalize_admin_telegram_ids(admin_ids_value)
+                except ValueError:
+                    flash(
+                        "Telegram ID администраторов должны быть положительными числами через запятую.",
+                        "danger",
+                    )
+                    return redirect(url_for("settings_page"))
+
             if "panel_password" in request.form and request.form.get("panel_password"):
                 update_setting(
                     "panel_password",
@@ -3450,6 +3462,8 @@ def create_webhook_app(bot_controller_instance):
                     continue
                 value = request.form.get(key)
                 if value is not None:
+                    if key == "admin_telegram_id":
+                        value = admin_ids_value
                     if key in SECRET_SETTINGS_KEYS and not value.strip():
                         continue
                     update_setting(key, value)

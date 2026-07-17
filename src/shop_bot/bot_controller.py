@@ -12,6 +12,7 @@ from shop_bot.bot.handlers import get_user_router
 from shop_bot.bot.middlewares import BanMiddleware, SafeCallbackMiddleware
 from shop_bot.bot import handlers, support_handlers
 from shop_bot.bot.support_handlers import get_support_router
+from shop_bot.utils.admin_ids import parse_admin_telegram_ids
 
 logger = logging.getLogger(__name__)
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
@@ -165,7 +166,7 @@ class BotController:
         bot_username = database.get_setting("telegram_bot_username")
         admin_id = database.get_setting("admin_telegram_id")
 
-        if not token or not admin_id:
+        if not token or not parse_admin_telegram_ids(admin_id):
             return {
                 "status": "error",
                 "message": "Невозможно запустить: не все обязательные настройки Telegram заполнены (токен и ID админа).",
