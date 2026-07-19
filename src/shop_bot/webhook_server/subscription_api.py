@@ -6,7 +6,6 @@ import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime
 from flask import Blueprint, Response, request, abort, current_app
 from werkzeug.exceptions import HTTPException
 from shop_bot.data_manager.database import (
@@ -16,14 +15,8 @@ from shop_bot.data_manager.database import (
     get_all_settings,
     get_user_by_token,
     get_all_hosts,
-    add_new_key,
     get_missing_keys,
     get_setting,
-    get_key_by_email,
-    update_key_by_email,
-    host_slug as _host_slug,
-    get_global_plan_ids,
-    is_global_xui_key,
 )
 from shop_bot.modules import xui_api
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
@@ -40,7 +33,6 @@ _SUBSCRIPTION_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
-_DEFAULT_PROVISION_TIMEOUT_SECONDS = 45
 _INVALID_TOKEN_WINDOW_SECONDS = 60
 _INVALID_TOKEN_MAX_PER_WINDOW = 30
 _INVALID_TOKEN_LOG_INTERVAL_SECONDS = 60
@@ -186,15 +178,6 @@ def redirect_to_happ(token):
     return Response(status=302, headers={"Location": deeplink_url})
 
 
-def _provision_timeout_seconds() -> int:
-    raw = get_setting("provision_timeout_seconds")
-    try:
-        timeout = int(raw) if raw is not None else _DEFAULT_PROVISION_TIMEOUT_SECONDS
-    except (TypeError, ValueError):
-        timeout = _DEFAULT_PROVISION_TIMEOUT_SECONDS
-    return max(10, min(timeout, 180))
-
-
 def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
     try:
         future = _SUBSCRIPTION_EXECUTOR.submit(func, *args, **kwargs)
@@ -210,34 +193,6 @@ def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
             exc_info=True,
         )
         return None
-
-
-def _get_global_plan_ids() -> set[int]:
-    try:
-        return get_global_plan_ids()
-    except Exception as e:
-        logger.error(f"Failed to load global plan ids: {e}")
-        return set()
-
-
-def _is_global_key(key: dict, global_plan_ids: set[int]) -> bool:
-    return is_global_xui_key(key, global_plan_ids)
-
-
-def _is_trial_key(key: dict) -> bool:
-    try:
-        return int(key.get("plan_id") or 0) == 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _min_active_expiry(keys: list[dict]) -> datetime | None:
-    expiries = []
-    for key in keys:
-        parsed = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-        if parsed:
-            expiries.append(parsed)
-    return min(expiries) if expiries else None
 
 
 def _maybe_sync_xtls_for_hosts(host_names: set[str]) -> None:
@@ -381,9 +336,6 @@ def get_subscription(token):
 
         logger.info(f"Enabled hosts: {enabled_hosts}")
 
-        # Determine global plan ids to support global subscription behavior
-        global_plan_ids = _get_global_plan_ids()
-
         # Keys that are actually usable right now
         available_paid_keys = [
             k
@@ -392,136 +344,29 @@ def get_subscription(token):
             and k.get("key_email") not in missing_emails
         ]
 
-        provision_timeout = _provision_timeout_seconds()
-
-        # Auto-provision missing hosts for active global subscriptions.
-        # Trial is intentionally handled like global access too: if initial
-        # issuance partially failed, the subscription endpoint can self-heal
-        # missing hosts while the trial is still active.
-        active_global_keys = [
-            k for k in active_paid_keys if _is_global_key(k, global_plan_ids)
-        ]
-        active_trial_keys = [k for k in active_paid_keys if _is_trial_key(k)]
-        provisioning_source_keys = active_global_keys or active_trial_keys
-        provisioning_plan_id = 0
-
-        if provisioning_source_keys:
-            # Deterministic plan selection for stable writes across workers/restarts.
-            # If the current global plans were recreated, legacy global keys may
-            # only be detectable by their email; fall back to their stored plan_id.
-            if active_global_keys:
-                if global_plan_ids:
-                    provisioning_plan_id = int(min(global_plan_ids))
-                else:
-                    legacy_plan_ids = set()
-                    for key in active_global_keys:
-                        try:
-                            candidate_plan_id = int(key.get("plan_id") or 0)
-                        except (TypeError, ValueError):
-                            candidate_plan_id = 0
-                        if candidate_plan_id > 0:
-                            legacy_plan_ids.add(candidate_plan_id)
-                    provisioning_plan_id = (
-                        int(min(legacy_plan_ids)) if legacy_plan_ids else 0
-                    )
-
-            # Target expiry based on the soonest-expiring global key
-            try:
-                min_expiry_dt = _min_active_expiry(provisioning_source_keys)
-                remaining_seconds = (
-                    int((min_expiry_dt - now).total_seconds()) if min_expiry_dt else 0
-                )
-            except Exception:
-                min_expiry_dt = None
-                remaining_seconds = 0
-
-            if remaining_seconds > 0 and min_expiry_dt:
-                target_expiry_ms = time_utils.get_timestamp_ms(min_expiry_dt)
-                existing_hosts = {k.get("host_name") for k in available_paid_keys}
-                logger.info(
-                    f"Global access detected. Existing hosts: {existing_hosts}. Remaining seconds: {remaining_seconds}"
-                )
-
-                for host in get_all_hosts(only_enabled=True):
-                    host_name = host.get("host_name")
-                    if not host_name or host_name == "ALL":
-                        logger.debug(
-                            f"Skipping host '{host_name}' (not a regular host)"
-                        )
-                        continue
-                    if host_name in existing_hosts:
-                        logger.debug(f"Host '{host_name}' already has a key")
-                        continue
-
-                    email = f"user{user_id}-global-{_host_slug(host_name)}"
-                    logger.info(
-                        f"Auto-provisioning key for host '{host_name}' with email '{email}'"
-                    )
-
-                    # Run async provisioning via the shared bot event loop
-                    # (same pattern as app.py routes — avoids creating a new loop per request).
-                    async def _provision():
-                        return await asyncio.wait_for(
-                            xui_api.create_or_update_key_on_host_absolute_expiry(
-                                host_name=host_name,
-                                email=email,
-                                target_expiry_ms=target_expiry_ms,
-                                telegram_id=str(user_id),
-                            ),
-                            timeout=provision_timeout,
-                        )
-
-                    res = _run_on_event_loop(
-                        _provision(),
-                        timeout_seconds=provision_timeout + 5,
-                        operation=f"global auto-provision for host '{host_name}'",
-                    )
-                    if res:
-                        try:
-                            existing_key = get_key_by_email(res["email"])
-                            if existing_key:
-                                update_key_by_email(
-                                    key_email=res["email"],
-                                    host_name=host_name,
-                                    xui_client_uuid=res["client_uuid"],
-                                    expiry_timestamp_ms=res["expiry_timestamp_ms"],
-                                    connection_string=res.get("connection_string"),
-                                    plan_id=provisioning_plan_id,
-                                )
-                            else:
-                                add_new_key(
-                                    user_id=user_id,
-                                    host_name=host_name,
-                                    xui_client_uuid=res["client_uuid"],
-                                    key_email=res["email"],
-                                    expiry_timestamp_ms=res["expiry_timestamp_ms"],
-                                    connection_string=res.get("connection_string"),
-                                    plan_id=provisioning_plan_id,
-                                )
-                            # Update local cache so that newly created keys appear in the same response
-                            new_key = {
-                                "host_name": host_name,
-                                "key_email": res["email"],
-                                "expiry_date": time_utils.from_timestamp_ms(
-                                    res["expiry_timestamp_ms"]
-                                ).isoformat(),
-                                "connection_string": res.get("connection_string"),
-                                "plan_id": provisioning_plan_id,
-                            }
-                            active_paid_keys.append(new_key)
-                            available_paid_keys.append(new_key)
-                            logger.info(
-                                f"Successfully added global key for host '{host_name}'"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to persist new global key for host {host_name}: {e}"
-                            )
-                    else:
-                        logger.error(f"Failed to create key on host '{host_name}'")
-        else:
-            if global_plan_ids and not active_global_keys:
-                logger.debug("Global plan IDs found but no active global keys")
+        # Never contact XUI panels while serving a subscription. A failed host
+        # must not delay access to healthy hosts or trigger a retry stampede
+        # when many clients refresh at once. The scheduler reconciles missing
+        # global/trial keys in the background with per-host failure backoff.
+        existing_hosts = {
+            k.get("host_name") for k in available_paid_keys if k.get("host_name")
+        }
+        missing_hosts = enabled_hosts - existing_hosts
+        has_reconcilable_global_access = any(
+            k.get("service_type", "xui") == "xui"
+            and (
+                str(k.get("plan_id") or 0).strip() == "0"
+                or "-global-" in str(k.get("key_email") or "").lower()
+            )
+            for k in active_paid_keys
+        )
+        if has_reconcilable_global_access and missing_hosts:
+            logger.info(
+                "User %s subscription is missing hosts %s; returning available "
+                "configs immediately while background reconciliation handles them.",
+                user_id,
+                sorted(missing_hosts),
+            )
 
         # Filter out disabled hosts and missing keys
         filtered_keys = []
