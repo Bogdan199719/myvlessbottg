@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HANDLERS = ROOT / "src" / "shop_bot" / "bot" / "handlers.py"
+WEBHOOK_APP = ROOT / "src" / "shop_bot" / "webhook_server" / "app.py"
 
 
 def _load_tree() -> tuple[str, ast.Module]:
@@ -159,6 +160,7 @@ def main() -> int:
     source, tree = _load_tree()
     functions = _functions(tree)
     failures: list[str] = []
+    webhook_source = WEBHOOK_APP.read_text(encoding="utf-8")
 
     process_fn = functions.get("process_successful_payment")
     execute_fn = functions.get("_execute_payment_for_hosts")
@@ -209,6 +211,20 @@ def main() -> int:
 
     if not _p2p_handlers_parse_command_args(source, functions):
         failures.append("P2P slash commands must parse CommandObject args")
+
+    cryptobot_finalize_guard = """
+                        if not finalized:
+                            logger.error(
+                                "CryptoBot webhook: failed to finalize reserved transaction %s after processing=%s",
+                                payment_id,
+                                processed_ok,
+                            )
+                            return "Service Unavailable", 503
+"""
+    if cryptobot_finalize_guard not in webhook_source:
+        failures.append(
+            "CryptoBot webhook must request a retry when transaction finalization fails"
+        )
 
     if not isinstance(stars_complete_fn, ast.FunctionDef):
         failures.append("_stars_complete_transaction is missing")

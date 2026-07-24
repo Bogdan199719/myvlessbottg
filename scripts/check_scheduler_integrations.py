@@ -14,6 +14,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from shop_bot.data_manager import scheduler  # noqa: E402
 
 
+def check_client_state_reconciliation_interval() -> None:
+    assert scheduler._CLIENT_STATE_ENFORCE_INTERVAL_SECONDS == 300
+    source = (ROOT / "src/shop_bot/data_manager/scheduler.py").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "current_time - last_client_state_enforce_time"
+        "\n                >= _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS" in source
+    ), "full XUI reconciliation must be interval-gated"
+
+
 async def check_xui_snapshot_does_not_block_loop() -> None:
     original_get_hosts = scheduler.database.get_all_hosts
     original_loader = scheduler._load_xui_panel_snapshot
@@ -181,6 +192,7 @@ async def check_mtg_login_is_single_flight() -> None:
 
 
 async def main() -> None:
+    check_client_state_reconciliation_interval()
     await check_xui_snapshot_does_not_block_loop()
     await check_mtg_concurrency_and_backoff()
     await check_mtg_login_is_single_flight()

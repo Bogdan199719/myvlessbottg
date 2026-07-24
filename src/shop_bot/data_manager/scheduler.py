@@ -4,7 +4,7 @@ import logging
 import math
 import time
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from shop_bot.utils import time_utils
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -18,9 +18,10 @@ from shop_bot.data_manager.database import host_slug as _host_slug
 from shop_bot.modules import xui_api
 from shop_bot.modules import mtg_api
 from shop_bot.modules import host_health
-from shop_bot.bot import handlers, keyboards
+from shop_bot.bot import handlers
 
 CHECK_INTERVAL_SECONDS = 60
+_CLIENT_STATE_ENFORCE_INTERVAL_SECONDS = 300
 PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}
 TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}
 ONBOARDING_IDLE_NOTIFY_HOURS = (3, 24, 72)
@@ -2016,11 +2017,20 @@ async def periodic_subscription_check(bot_controller: BotController):
     last_xtls_sync_time = 0
     last_host_health_time = 0
     last_ip_limit_time = 0
+    last_client_state_enforce_time = 0
 
     while True:
         try:
-            # Always enforce access state by DB even if panel_sync_enabled is disabled.
-            await enforce_clients_state_from_db()
+            current_time = time.time()
+            # Expiry is already stored in Xray. This pass is a reconciliation
+            # safety net, so five minutes avoids repeatedly loading every panel
+            # without delaying the actual server-side expiry.
+            if (
+                current_time - last_client_state_enforce_time
+                >= _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS
+            ):
+                await enforce_clients_state_from_db()
+                last_client_state_enforce_time = time.time()
 
             # Enforce MTG proxy states (start active, stop expired)
             await enforce_mtg_proxies_state()

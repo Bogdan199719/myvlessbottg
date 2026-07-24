@@ -17,8 +17,6 @@ from shop_bot.data_manager.database import (
     get_key_by_email,
     get_keys_for_host,
     update_key_by_email,
-    update_key_connection_string,
-    purge_missing_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -1827,10 +1825,10 @@ def update_or_create_client_on_panel(
         if absolute_expiry_ms is not None:
             try:
                 target_expiry_ms = int(absolute_expiry_ms)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Invalid absolute_expiry_ms value: {absolute_expiry_ms}"
-                )
+                ) from exc
             if target_expiry_ms <= 0:
                 raise ValueError(
                     f"absolute_expiry_ms must be positive, got: {target_expiry_ms}"
@@ -2914,17 +2912,8 @@ def _sync_xtls_for_host(host_info: dict) -> dict:
 
             # Determine expected XTLS config
             expected_flow = ""
-            expected_security = "none"
-
-            if protocol == "vless":
-                if network == "tcp" and security == "reality":
-                    expected_flow = "xtls-rprx-vision"
-                    expected_security = "reality"
-                elif network == "tcp" and security == "tls":
-                    expected_security = "tls"
-                elif network == "grpc":
-                    # gRPC doesn't use XTLS flow
-                    expected_security = security
+            if protocol == "vless" and network == "tcp" and security == "reality":
+                expected_flow = "xtls-rprx-vision"
 
             # Check if fix needed
             needs_fix = False

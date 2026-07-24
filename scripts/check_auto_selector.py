@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
+import sys
 
-from shop_bot.modules.host_selector import (
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from shop_bot.modules.host_selector import (  # noqa: E402
     AUTO_SELECTOR_TITLE,
     replace_config_title,
     select_automatic_host,
 )
-from shop_bot.utils import time_utils
+from shop_bot.utils import time_utils  # noqa: E402
 
 
 def _health(
@@ -93,6 +99,26 @@ def main() -> int:
     )
     assert grouped and grouped["eligible_hosts"] == 2
     assert grouped["eligible_groups"] == 1
+
+    unequal_configs = {
+        "quiet": "vless://44444444-4444-4444-4444-444444444444@quiet.example:443?security=reality#Quiet",
+        "loaded": "vless://55555555-5555-5555-5555-555555555555@loaded.example:443?security=reality#Loaded",
+    }
+    unequal_health = [
+        _health("quiet", cpu=5, memory=5, online=1, latency=10),
+        _health("loaded", cpu=80, memory=80, online=100, latency=1000),
+    ]
+    selections = {"quiet": 0, "loaded": 0}
+    for number in range(1000):
+        result = select_automatic_host(
+            unequal_configs, unequal_health, f"weighted-user-{number}"
+        )
+        assert result is not None
+        selections[result["host_name"]] += 1
+    assert selections["quiet"] > 900, (
+        "eligible hosts with very different load must not be distributed equally: "
+        f"{selections}"
+    )
 
     print("OK: automatic selector is safe, stable and health-aware.")
     return 0

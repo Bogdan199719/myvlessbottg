@@ -13,11 +13,24 @@ import argparse
 import json
 import sqlite3
 from collections import defaultdict
+from urllib.parse import urlsplit
 
 
 def _rows(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[dict]:
     conn.row_factory = sqlite3.Row
     return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def _masked_host_url(value: str | None) -> str:
+    """Show a panel endpoint without credentials, secret path or query."""
+    try:
+        parsed = urlsplit(str(value or ""))
+        if not parsed.scheme or not parsed.hostname:
+            return "[masked]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname}{port}/…"
+    except (TypeError, ValueError):
+        return "[masked]"
 
 
 def _global_plan_ids(conn: sqlite3.Connection) -> set[int]:
@@ -79,6 +92,11 @@ def _format_user(user_id: int, username: str | None, show_identities: bool) -> s
 
 
 def main() -> int:
+    assert (
+        _masked_host_url("https://user:password@example.com:8443/secret/path?token=x")
+        == "https://example.com:8443/…"
+    ), "panel URL masking must hide credentials, path and query"
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="users.db", help="Path to SQLite DB")
     parser.add_argument(
@@ -115,7 +133,7 @@ def main() -> int:
     if duplicate_urls:
         print("\nDuplicate host URLs:")
         for row in duplicate_urls:
-            print(f"  - {row['host_url']}: {row['hosts']}")
+            print(f"  - {_masked_host_url(row['host_url'])}: {row['hosts']}")
 
     trial_by_user: dict[tuple[int, str | None], set[str]] = defaultdict(set)
     paid_global_by_user: dict[tuple[int, str | None], set[str]] = defaultdict(set)

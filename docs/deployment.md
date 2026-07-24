@@ -94,6 +94,11 @@ python3 scripts/check_callbacks.py
 python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
 python3 scripts/check_profit_accounting.py
+python3 scripts/check_auto_selector.py
+python3 scripts/check_happ_subscription_metadata.py
+python3 scripts/check_ip_limit_rules.py
+python3 scripts/check_proxy_keyboard.py
+python3 scripts/check_scheduler_integrations.py
 python3 scripts/check_subscription_consistency.py
 python3 scripts/check_xui_connection_equivalence.py
 python3 scripts/check_settings_defaults.py
@@ -103,7 +108,7 @@ git diff --check
 docker compose build
 ```
 
-`scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа.
+`scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа. В выводе остаются только схема, домен и порт; учётные данные, секретный path и query маскируются.
 
 `scripts/check_subscription_business_rules.py` работает на временной SQLite и проверяет resumable-выдачу промокода и разделение paid/trial/free статусов. Продовые данные он не изменяет.
 По умолчанию скрипт маскирует Telegram ID и usernames в выводе, чтобы CI/аудиторские логи не раскрывали персональные данные. Для ручной локальной диагностики конкретных пользователей добавьте `--show-identities`.

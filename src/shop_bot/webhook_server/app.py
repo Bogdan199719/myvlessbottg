@@ -10,7 +10,6 @@ import sqlite3
 import tempfile
 import zipfile
 import shutil
-import sys
 import threading
 import csv
 import io
@@ -59,7 +58,6 @@ from shop_bot.webhook_server.restore_manager import (
     stage_pending_restore,
     validate_sqlite_database,
 )
-from shop_bot.data_manager import scheduler
 from shop_bot.data_manager.database import (
     get_all_settings,
     update_setting,
@@ -74,8 +72,6 @@ from shop_bot.data_manager.database import (
     get_user_count,
     get_total_keys_count,
     get_total_spent_sum,
-    get_daily_stats_for_charts,
-    get_recent_transactions,
     get_paginated_transactions,
     get_all_users,
     get_user_keys,
@@ -84,27 +80,17 @@ from shop_bot.data_manager.database import (
     delete_user_everywhere,
     get_setting,
     DB_FILE,
-    register_user_if_not_exists,
     get_next_key_number,
     get_key_by_id,
     update_key_info,
-    set_terms_agreed,
     get_plan_by_id,
-    log_transaction,
-    get_referral_count,
-    add_to_referral_balance,
-    create_pending_transaction,
     reserve_pending_transaction,
     finalize_reserved_transaction,
-    run_migration,
-    set_referral_balance,
-    set_referral_balance_all,
     get_all_keys_with_usernames,
     update_key_connection_string,
     get_host,
     update_host,
     toggle_host_status,
-    get_keys_for_host,
     add_new_key,
     get_user,
     update_user_stats,
@@ -1628,7 +1614,6 @@ def create_webhook_app(bot_controller_instance):
                 "active_paid_users_without_payment": 0,
                 "active_trial_users": 0,
                 "expired_paid_users": 0,
-                "expired_trial_users": 0,
                 "conversion_percent": 0.0,
                 "avg_order": 0.0,
             },
@@ -2022,11 +2007,11 @@ def create_webhook_app(bot_controller_instance):
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         try:
             return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
+        except concurrent.futures.TimeoutError as exc:
             future.cancel()
             raise TimeoutError(
                 f"Операция с XUI-панелью превысила лимит ожидания ({timeout}с). Проверьте доступность сервера."
-            )
+            ) from exc
 
     def _run_auto_provision_for_global_users(context_host_name: str) -> bool:
         """Run global users auto-provisioning from admin host actions."""
@@ -3757,7 +3742,6 @@ def create_webhook_app(bot_controller_instance):
                 return paid_match or trial_match
 
             issued_count = 0
-            primary_key_id = None
 
             if plan["host_name"] == "ALL":
                 # Global Plan
@@ -3903,7 +3887,6 @@ def create_webhook_app(bot_controller_instance):
                             if not result:
                                 issued_count = 0
                             else:
-                                primary_key_id = existing_key_db["key_id"]
                                 issued_count += 1
                     else:
                         # Create new
@@ -3931,7 +3914,6 @@ def create_webhook_app(bot_controller_instance):
                                 plan_id=plan["plan_id"],
                             )
                             if new_key_id is not None:
-                                primary_key_id = new_key_id
                                 issued_count += 1
 
                     if issued_count > 0:
@@ -4879,6 +4861,7 @@ def create_webhook_app(bot_controller_instance):
                                 payment_id,
                                 processed_ok,
                             )
+                            return "Service Unavailable", 503
                     if processed_ok:
                         if external_invoice_id:
                             _set_webhook_processed(

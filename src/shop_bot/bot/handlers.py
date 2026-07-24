@@ -3,16 +3,14 @@ import uuid
 import qrcode
 import aiohttp
 import re
-import hashlib
 import json
-import base64
 import asyncio
 import sqlite3
 
 from functools import wraps
 from yookassa import Payment
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import timedelta
 from aiosend import CryptoPay
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, InvalidOperation
 from typing import Dict
@@ -58,13 +56,11 @@ from shop_bot.data_manager.database import (
     mark_pending_transaction_status,
     get_all_users,
     set_referral_balance,
-    set_referral_balance_all,
     DB_FILE,
     get_user_paid_keys,
     get_user_trial_keys,
     has_paid_vpn_transaction,
     set_pending_payment,
-    clear_all_pending_payments,
     get_or_create_subscription_token,
     get_all_mtg_hosts,
     get_payment_rules_for_context,
@@ -84,10 +80,6 @@ from shop_bot.data_manager.database import (
 )
 
 from shop_bot.config import (
-    get_profile_text,
-    get_vpn_active_text,
-    VPN_INACTIVE_TEXT,
-    VPN_NO_DATA_TEXT,
     CHOOSE_PAYMENT_METHOD_MESSAGE,
     get_purchase_success_text,
     get_proxy_purchase_success_text,
@@ -2701,7 +2693,6 @@ def get_user_router() -> Router:
 
         price = Decimal(str(plan["price"]))
         final_price = price
-        discount_applied = False
         message_text = CHOOSE_PAYMENT_METHOD_MESSAGE
 
         if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
@@ -3842,7 +3833,6 @@ async def _create_mtg_proxy_after_payment(
         get_key_by_id,
         update_key_info,
         update_key_plan_id,
-        get_or_create_subscription_token,
     )
 
     days = months * 30
@@ -4446,9 +4436,6 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         key_id = int(metadata["key_id"])
         host_name = metadata["host_name"]
         plan_id = int(metadata["plan_id"])
-        customer_email = metadata.get("customer_email")
-        payment_method = metadata.get("payment_method")
-
         chat_id_to_delete = metadata.get("chat_id")
         message_id_to_delete = metadata.get("message_id")
 
@@ -4815,7 +4802,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             ]
             if failed_hosts:
                 final_text += (
-                    f"\n\n❌ <b>Внимание:</b> Не удалось создать ключи на следующих серверах (свяжитесь с админом):\n- "
+                    "\n\n❌ <b>Внимание:</b> Не удалось создать ключи на следующих серверах (свяжитесь с админом):\n- "
                     + "\n- ".join(failed_hosts)
                 )
 

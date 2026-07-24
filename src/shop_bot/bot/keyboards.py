@@ -458,7 +458,7 @@ def create_proxy_keys_keyboard(mtg_keys: list) -> InlineKeyboardMarkup:
         proxy_link = key.get("connection_string", "")
         expiry_date = time_utils.parse_iso_to_msk(key.get("expiry_date"))
         is_active = expiry_date and expiry_date > now
-        if proxy_link:
+        if is_active and proxy_link:
             # Connect button (full width, most used action)
             connect_url = make_t_me_proxy_url(proxy_link)
             builder.row(

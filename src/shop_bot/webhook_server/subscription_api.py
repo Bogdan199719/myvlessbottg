@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 import logging
 import re
 import time
@@ -10,10 +9,8 @@ from urllib.parse import urlparse
 from flask import Blueprint, Response, request, abort, current_app
 from werkzeug.exceptions import HTTPException
 from shop_bot.data_manager.database import (
-    get_user,
     get_user_paid_keys,
     get_user_trial_keys,
-    get_all_settings,
     get_user_by_token,
     get_all_hosts,
     get_all_xui_host_health,
@@ -306,7 +303,6 @@ def _resolve_connection_string(key: dict, allow_fallback_fetch: bool) -> str | N
         return cached_config
 
     host_name = key.get("host_name")
-    key_email = key.get("key_email")
     if not allow_fallback_fetch:
         logger.warning(
             "Subscription key on host %s has no cached connection_string; fallback disabled.",

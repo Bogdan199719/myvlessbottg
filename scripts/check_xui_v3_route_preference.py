@@ -168,7 +168,7 @@ def main() -> int:
         legacy_endpoints
         == [
             "panel/api/inbounds/addClient",
-            f"panel/api/inbounds/updateClient/raw-auth",
+            "panel/api/inbounds/updateClient/raw-auth",
             "panel/api/inbounds/7/delClient/raw-auth",
         ],
         "raw-client legacy fallback changed",

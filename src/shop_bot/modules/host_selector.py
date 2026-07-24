@@ -141,7 +141,9 @@ def select_automatic_host(
             f"{subscription_token}|group|{candidate['group_key']}".encode("utf-8")
         ).digest()
         uniform = (int.from_bytes(digest[:8], "big") + 1) / ((1 << 64) + 1)
-        capacity_weight = max(0.02, (1.0 - min(load_score, 0.98)) ** 2)
+        capacity_weight = max(
+            0.02, (1.0 - min(candidate["load_score"], 0.98)) ** 2
+        )
         candidate["weighted_rank"] = -math.log(uniform) / capacity_weight
 
     selected = min(

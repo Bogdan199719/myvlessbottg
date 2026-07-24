@@ -132,7 +132,7 @@ def main() -> int:
     global_callbacks: set[str] = set()
     statefilter_guards: set[str] = set()
 
-    for state, callback, starts, args in _extract_callback_decorators(text):
+    for state, callback, starts, _args in _extract_callback_decorators(text):
         if callback:
             if state and state.startswith("StateFilter("):
                 statefilter_guards.add(f"{state}:{callback}")

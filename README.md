@@ -67,6 +67,8 @@ python3 scripts/check_profit_accounting.py
 python3 scripts/check_auto_selector.py
 python3 scripts/check_happ_subscription_metadata.py
 python3 scripts/check_ip_limit_rules.py
+python3 scripts/check_proxy_keyboard.py
+python3 scripts/check_scheduler_integrations.py
 python3 scripts/check_subscription_business_rules.py
 python3 scripts/check_subscription_consistency.py
 python3 scripts/check_xui_connection_equivalence.py
