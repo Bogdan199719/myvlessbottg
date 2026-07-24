@@ -64,6 +64,8 @@ from shop_bot.data_manager.database import (
     get_all_settings,
     update_setting,
     get_all_hosts,
+    get_all_xui_host_health,
+    get_xui_ip_limit_events,
     get_plans_for_host,
     create_host,
     delete_host,
@@ -760,6 +762,15 @@ ALL_SETTINGS_KEYS = [
     "enable_admin_payment_notifications",
     "enable_admin_trial_notifications",
     "subscription_name",
+    "subscription_update_interval_hours",
+    "subscription_announce",
+    "auto_selector_enabled",
+    "auto_selector_max_cpu_percent",
+    "auto_selector_max_memory_percent",
+    "auto_selector_health_max_age_seconds",
+    "ip_limit_enabled",
+    "ip_limit_max_ips",
+    "ip_limit_warning_grace_hours",
     "subscription_live_sync",
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
@@ -2059,8 +2070,47 @@ def create_webhook_app(bot_controller_instance):
     def _load_settings_page_context() -> dict:
         current_settings = get_all_settings()
         hosts = get_all_hosts()
+        health_by_host = {
+            row["host_name"]: row for row in get_all_xui_host_health()
+        }
+        health_max_age = 900
+        try:
+            health_max_age = max(
+                60,
+                min(
+                    int(
+                        current_settings.get(
+                            "auto_selector_health_max_age_seconds", "900"
+                        )
+                    ),
+                    3600,
+                ),
+            )
+        except (TypeError, ValueError):
+            pass
+        now = time_utils.get_msk_now()
         for host in hosts:
             host["plans"] = get_plans_for_host(host["host_name"], service_type="xui")
+            health = health_by_host.get(host["host_name"])
+            host["health"] = health
+            host["health_state"] = "unknown"
+            if health:
+                checked_at = time_utils.parse_iso_to_msk(health.get("checked_at"))
+                host["health_checked_label"] = (
+                    checked_at.strftime("%d.%m %H:%M") if checked_at else "неизвестно"
+                )
+                is_fresh = bool(
+                    checked_at
+                    and -60
+                    <= (now - checked_at).total_seconds()
+                    <= health_max_age
+                )
+                if not is_fresh:
+                    host["health_state"] = "stale"
+                elif health.get("is_available") and health.get("xray_running"):
+                    host["health_state"] = "healthy"
+                else:
+                    host["health_state"] = "unhealthy"
             if host.get("api_token"):
                 host["api_token_configured"] = True
                 host["api_token"] = ""
@@ -2078,6 +2128,7 @@ def create_webhook_app(bot_controller_instance):
         return {
             "settings": safe_settings,
             "hosts": hosts,
+            "ip_limit_events": get_xui_ip_limit_events(100),
             "global_plans": get_plans_for_host("ALL", service_type="xui"),
             "mtg_hosts": mtg_hosts,
             "payment_rules": get_all_payment_rules(),
@@ -3415,6 +3466,48 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return redirect(url_for("settings_page"))
 
+            subscription_update_interval = request.form.get(
+                "subscription_update_interval_hours"
+            )
+            if subscription_update_interval not in {"1", "3", "6", "12", "24"}:
+                flash(
+                    "Интервал обновления Happ должен быть 1, 3, 6, 12 или 24 часа.",
+                    "danger",
+                )
+                return redirect(url_for("settings_page"))
+
+            try:
+                auto_cpu = float(
+                    request.form.get("auto_selector_max_cpu_percent", "90")
+                )
+                auto_memory = float(
+                    request.form.get("auto_selector_max_memory_percent", "90")
+                )
+                if not 50 <= auto_cpu <= 100 or not 50 <= auto_memory <= 100:
+                    raise ValueError
+            except (TypeError, ValueError):
+                flash(
+                    "Порог CPU и памяти для автовыбора должен быть от 50 до 100%.",
+                    "danger",
+                )
+                return redirect(url_for("settings_page"))
+
+            try:
+                ip_limit_max = int(request.form.get("ip_limit_max_ips", "10"))
+                ip_limit_grace = int(
+                    request.form.get("ip_limit_warning_grace_hours", "24")
+                )
+                if not 1 <= ip_limit_max <= 100:
+                    raise ValueError
+                if not 1 <= ip_limit_grace <= 168:
+                    raise ValueError
+            except (TypeError, ValueError):
+                flash(
+                    "Лимит IP должен быть от 1 до 100, время предупреждения — от 1 до 168 часов.",
+                    "danger",
+                )
+                return redirect(url_for("settings_page"))
+
             if "panel_password" in request.form and request.form.get("panel_password"):
                 update_setting(
                     "panel_password",
@@ -3436,6 +3529,8 @@ def create_webhook_app(bot_controller_instance):
                 "email_prompt_enabled",
                 "enable_promo_codes",
                 "happ_routing_enabled",
+                "auto_selector_enabled",
+                "ip_limit_enabled",
             ]:
                 values = request.form.getlist(checkbox_key)
                 value = values[-1] if values else "false"
@@ -3458,6 +3553,8 @@ def create_webhook_app(bot_controller_instance):
                     "email_prompt_enabled",
                     "enable_promo_codes",
                     "happ_routing_enabled",
+                    "auto_selector_enabled",
+                    "ip_limit_enabled",
                 ]:
                     continue
                 value = request.form.get(key)

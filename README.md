@@ -8,6 +8,8 @@ Telegram-бот для продажи VPN и Telegram Proxy с веб-админ
 - отдельный support-бот с forum topics в группе поддержки;
 - Flask-админка с авторизацией, статистикой, управлением пользователями, хостами, тарифами и платежами;
 - единая VPN-подписка `ALL` со ссылкой `/sub/...` на все активные XUI-хосты;
+- виртуальный сервер `⚡ Автовыбор` с распределением пользователей по здоровым XUI-хостам;
+- предупреждение и автоматический IP-лимит 3x-ui с настраиваемым порогом для защиты от передачи подписки;
 - trial-период для VPN в логике глобальной подписки с общей `/sub/...` ссылкой и самовосстановлением недостающих хостов;
 - Telegram Proxy через MTG-хосты;
 - оплаты через YooKassa, Telegram Stars, CryptoBot и ручной P2P;
@@ -62,6 +64,9 @@ python3 scripts/check_fsm_transitions.py
 python3 scripts/check_host_cleanup.py
 python3 scripts/check_payment_safety.py
 python3 scripts/check_profit_accounting.py
+python3 scripts/check_auto_selector.py
+python3 scripts/check_happ_subscription_metadata.py
+python3 scripts/check_ip_limit_rules.py
 python3 scripts/check_subscription_business_rules.py
 python3 scripts/check_subscription_consistency.py
 python3 scripts/check_xui_connection_equivalence.py

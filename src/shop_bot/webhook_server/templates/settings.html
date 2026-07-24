@@ -8,22 +8,31 @@
 	   anchor, so navigation remains usable when JavaScript is unavailable. */
 	.settings-category-tabs {
 		display: grid;
-		grid-template-columns: repeat(5, minmax(9rem, 1fr));
-		gap: .65rem;
-		margin: 0 0 1.25rem;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: .75rem;
+		margin: 0 0 1.5rem;
 	}
 	.settings-category-tabs a {
 		display: flex;
 		align-items: center;
-		gap: .55rem;
-		min-height: 2.75rem;
-		padding: .7rem .85rem;
+		gap: .75rem;
+		min-height: 4rem;
+		padding: .85rem 1rem;
 		border: 1px solid var(--border);
-		border-radius: .65rem;
+		border-radius: var(--radius-md);
 		background: var(--bg-card);
 		color: inherit;
 		font-weight: 650;
 		text-decoration: none;
+	}
+	.settings-category-tabs a > span:first-child {
+		display: grid;
+		place-items: center;
+		flex: 0 0 2.15rem;
+		width: 2.15rem;
+		height: 2.15rem;
+		border-radius: .6rem;
+		background: rgba(79, 107, 237, .12);
 	}
 	.settings-category-tabs a:hover,
 	.settings-category-tabs a:focus-visible {
@@ -52,16 +61,133 @@
 		outline-offset: 3px;
 	}
 	.settings-quicknav {
-		display: flex;
-		flex-wrap: wrap;
-		gap: .45rem;
+		position: sticky;
+		top: .5rem;
+		z-index: 20;
 		margin-bottom: 1rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-md);
+		background: rgba(17, 21, 28, .94);
+		backdrop-filter: blur(12px);
+	}
+	.settings-quicknav > summary {
+		display: flex;
+		align-items: center;
+		gap: .6rem;
+		padding: .8rem 1rem;
+		font-weight: 700;
+		cursor: pointer;
+		list-style: none;
+	}
+	.settings-quicknav > summary::-webkit-details-marker { display: none; }
+	.settings-quicknav > summary::after {
+		content: "⌄";
+		margin-left: auto;
+		color: var(--muted);
+		transition: transform .18s;
+	}
+	.settings-quicknav[open] > summary::after { transform: rotate(180deg); }
+	.settings-quicknav-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: .55rem;
+		padding: 0 .75rem .75rem;
+		border-top: 1px solid var(--border);
 	}
 	.settings-quicknav a {
-		padding: .42rem .7rem;
-		border: 1px solid var(--border);
-		border-radius: 999px;
+		display: block;
+		margin-top: .55rem;
+		padding: .65rem .75rem;
+		border: 1px solid transparent;
+		border-radius: var(--radius-xs);
+		background: var(--bg-surface);
 		text-decoration: none;
+		color: var(--text-dim);
+	}
+	.settings-quicknav a:hover,
+	.settings-quicknav a:focus-visible {
+		color: var(--text);
+		border-color: var(--primary);
+	}
+	.settings-column-right .settings-section {
+		padding: 1.25rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		background: var(--bg-card);
+		box-shadow: 0 10px 28px rgba(0, 0, 0, .12);
+	}
+	.settings-column-right .settings-section > h2 {
+		margin: 0 0 .35rem;
+		font-size: 1.12rem;
+	}
+	.settings-column-right .settings-sub-h {
+		margin: 1.5rem 0 .75rem;
+		padding: .7rem .8rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-xs);
+		background: rgba(255, 255, 255, .035);
+	}
+	.settings-section-intro {
+		margin: 0 0 1.2rem;
+		color: var(--text-dim);
+		font-size: .86rem;
+		line-height: 1.5;
+	}
+	.settings-section-accent {
+		border-color: rgba(77, 163, 255, .42) !important;
+		background:
+			linear-gradient(145deg, rgba(77, 163, 255, .08), transparent 42%),
+			var(--bg-card) !important;
+	}
+	.settings-status-row {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: .65rem;
+		margin: 1rem 0 1.15rem;
+	}
+	.settings-status-card {
+		padding: .8rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-md);
+		background: rgba(8, 12, 18, .35);
+	}
+	.settings-status-card small {
+		display: block;
+		margin-bottom: .25rem;
+		color: var(--muted);
+	}
+	.settings-status-card strong {
+		display: block;
+		font-size: 1.05rem;
+	}
+	.settings-input-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0 1rem;
+	}
+	.settings-empty-state {
+		margin: .5rem 0 0;
+		padding: .9rem 1rem;
+		border: 1px dashed var(--border-strong);
+		border-radius: var(--radius-md);
+		color: var(--text-dim);
+		background: rgba(34, 181, 115, .055);
+	}
+	.settings-save-bar {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+		padding: 1rem 0 .15rem;
+	}
+	.settings-save-bar p {
+		flex: 1;
+		margin: 0;
+		color: var(--text-dim);
+		font-size: .82rem;
+	}
+	.settings-save-bar .button {
+		width: auto;
+		min-width: 14rem;
 	}
 	.settings-category-kicker {
 		margin: 0 0 .85rem;
@@ -70,22 +196,53 @@
 		background: rgba(79, 107, 237, .07);
 		border-radius: .35rem;
 	}
+	.host-health {
+		display: flex;
+		flex-wrap: wrap;
+		gap: .45rem;
+		margin: .7rem 0;
+	}
+	.health-chip {
+		padding: .32rem .55rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		background: rgba(127, 127, 127, .08);
+		font-size: .82rem;
+	}
+	.health-chip.is-healthy {
+		border-color: rgba(35, 160, 90, .45);
+		background: rgba(35, 160, 90, .1);
+	}
+	.health-chip.is-unhealthy {
+		border-color: rgba(220, 65, 65, .45);
+		background: rgba(220, 65, 65, .1);
+	}
+	.health-chip.is-stale {
+		border-color: rgba(220, 150, 35, .45);
+		background: rgba(220, 150, 35, .1);
+	}
 	@media (max-width: 980px) {
 		.settings-category-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 	}
 	@media (max-width: 560px) {
 		.settings-category-tabs { grid-template-columns: 1fr; }
 		.settings-category-tabs small { display: inline; }
+		.settings-quicknav-grid,
+		.settings-status-row,
+		.settings-input-grid { grid-template-columns: 1fr; }
+		.settings-save-bar { align-items: stretch; flex-direction: column; }
+		.settings-save-bar .button { width: 100%; min-width: 0; }
 	}
 </style>
 
 <p class="settings-page-intro">Выберите раздел или прокрутите страницу: все настройки остаются доступны в одной форме сохранения.</p>
 <nav class="settings-category-tabs" aria-label="Основные разделы настроек">
 	<a href="#hosts"><span aria-hidden="true">🖥️</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
-	<a href="#payment-settings"><span aria-hidden="true">💳</span><span>Платежи<small>Способы оплаты и подписка</small></span></a>
+	<a href="#subscription-settings"><span aria-hidden="true">🔗</span><span>Подписка<small>Happ, автовыбор и обновление</small></span></a>
+	<a href="#ip-limit-settings"><span aria-hidden="true">🛡️</span><span>Лимит IP<small>Настройка и журнал событий</small></span></a>
+	<a href="#payment-settings"><span aria-hidden="true">💳</span><span>Платежи<small>YooKassa, P2P, Stars и CryptoBot</small></span></a>
 	<a href="#bot-settings"><span aria-hidden="true">🤖</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
-	<a href="#panel-settings"><span aria-hidden="true">🛡️</span><span>Безопасность<small>Доступ к веб-панели</small></span></a>
-	<a href="#backup"><span aria-hidden="true">💾</span><span>Резервные копии<small>Экспорт и восстановление</small></span></a>
+	<a href="#panel-settings"><span aria-hidden="true">🔐</span><span>Панель и бэкапы<small>Доступ, экспорт и восстановление</small></span></a>
 </nav>
 
 {% macro pay_rules_section(context_key, host_plans, pay_rules) %}
@@ -408,6 +565,25 @@
 					{% if not host.is_enabled %} <span class="host-disabled-label">(ОТКЛЮЧЕН)</span>{% endif
 					%}
 				</p>
+				<div class="host-health" aria-label="Состояние сервера">
+					{% if host.health_state == 'healthy' %}
+					<span class="health-chip is-healthy">● Доступен для автовыбора</span>
+					{% elif host.health_state == 'unhealthy' %}
+					<span class="health-chip is-unhealthy">● Недоступен для автовыбора</span>
+					{% elif host.health_state == 'stale' %}
+					<span class="health-chip is-stale">● Данные устарели</span>
+					{% else %}
+					<span class="health-chip">● Ожидается проверка</span>
+					{% endif %}
+					{% if host.health %}
+						{% if host.health.cpu_percent is not none %}<span class="health-chip">CPU {{ host.health.cpu_percent|round(0)|int }}%</span>{% endif %}
+						{% if host.health.memory_percent is not none %}<span class="health-chip">RAM {{ host.health.memory_percent|round(0)|int }}%</span>{% endif %}
+						{% if host.health.active_connections is not none %}<span class="health-chip">Соединения {{ host.health.active_connections }}</span>{% endif %}
+						{% if host.health.latency_ms is not none %}<span class="health-chip">Панель {{ host.health.latency_ms|round(0)|int }} мс</span>{% endif %}
+						{% if host.health.network_up_bps is not none and host.health.network_down_bps is not none %}<span class="health-chip">Сеть ↑ {{ (host.health.network_up_bps / 1048576)|round(1) }} / ↓ {{ (host.health.network_down_bps / 1048576)|round(1) }} МБ/с</span>{% endif %}
+						<span class="health-chip">Проверено {{ host.health_checked_label }}</span>
+					{% endif %}
+				</div>
 				<div class="plans-section">
 					<h4>Тарифы:</h4>
 					{% if host.plans %}
@@ -600,20 +776,24 @@
 
 		<form action="{{ url_for('settings_page') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-			<nav class="settings-quicknav" aria-label="Подразделы настроек бота">
-				<a href="#panel-settings">Безопасность панели</a>
-				<a href="#bot-settings">Telegram-бот</a>
-				<a href="#support-settings">Поддержка</a>
-				<a href="#content-settings">Контент</a>
-				<a href="#ref-settings">Реферальная программа</a>
-				<a href="#trial-settings">Пробный период</a>
-				<a href="#payment-yookassa">YooKassa</a>
-				<a href="#payment-p2p">P2P</a>
-				<a href="#payment-stars">Telegram Stars</a>
-				<a href="#payment-crypto">CryptoBot</a>
-			</nav>
+			<details class="settings-quicknav">
+				<summary><span aria-hidden="true">☰</span> Быстрый переход к настройке</summary>
+				<nav class="settings-quicknav-grid" aria-label="Подразделы настроек бота">
+					<a href="#subscription-settings">Подписка Happ</a>
+					<a href="#ip-limit-settings">Лимит IP и события</a>
+					<a href="#payment-settings">Способы оплаты</a>
+					<a href="#bot-settings">Telegram-бот</a>
+					<a href="#support-settings">Поддержка</a>
+					<a href="#trial-settings">Пробный период</a>
+					<a href="#ref-settings">Реферальная программа</a>
+					<a href="#content-settings">Тексты и ссылки</a>
+					<a href="#panel-settings">Доступ к панели</a>
+					<a href="#backup">Резервные копии</a>
+				</nav>
+			</details>
 			<section class="settings-section" id="panel-settings">
-				<h2>Настройки Панели</h2>
+				<h2>🔐 Доступ к панели</h2>
+				<p class="settings-section-intro">Логин, пароль и доверенные адреса администраторов.</p>
 				<div class="form-group">
 					<label for="panel_login">Логин для входа в панель:</label>
 					<input type="text" id="panel_login" name="panel_login" value="{{ settings.panel_login or '' }}" placeholder="admin" required />
@@ -636,7 +816,8 @@
 			</section>
 
 			<section class="settings-section" id="bot-settings">
-				<h2>Настройка Бота</h2>
+				<h2>🤖 Telegram-бот</h2>
+				<p class="settings-section-intro">Основной бот, список администраторов и служебные уведомления.</p>
 				<div class="form-group">
 					<label for="telegram_bot_token">Токен бота:</label>
 					<div class="password-wrapper">
@@ -671,7 +852,8 @@
 				</div>
 			</section>
 			<section class="settings-section" id="support-settings">
-				<h2>Настройки Поддержки и Бота-Саппорта</h2>
+				<h2>💬 Поддержка</h2>
+				<p class="settings-section-intro">Контакты поддержки, отдельный бот и группа с обращениями пользователей.</p>
 				<div class="form-group">
 					<label for="support_user">URL поддержки или Бота-Саппорта:</label>
 					<input type="text" id="support_user" name="support_user"
@@ -693,7 +875,8 @@
 				</div>
 			</section>
 			<section class="settings-section" id="ref-settings">
-				<h2>Настройки Реферальной программы</h2>
+				<h2>🎁 Реферальная программа</h2>
+				<p class="settings-section-intro">Вознаграждения за приглашения и скидка нового пользователя.</p>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="enable_referrals" value="false" />
 					<input type="checkbox" id="enable_referrals" name="enable_referrals" value="true" {% if
@@ -717,7 +900,8 @@
 				</div>
 			</section>
 			<section class="settings-section" id="trial-settings">
-				<h2>Настройки пробного периода VPN</h2>
+				<h2>🧪 Пробный период VPN</h2>
+				<p class="settings-section-intro">Условия единственного пробного доступа к глобальной подписке.</p>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="trial_enabled" value="false" />
 					<input type="checkbox" id="trial_enabled" name="trial_enabled" value="true" {% if
@@ -737,7 +921,8 @@
 				</div>
 			</section>
 			<section class="settings-section" id="payment-settings">
-				<h2>Настройки Платежных Систем</h2>
+				<h2>💳 Способы оплаты</h2>
+				<p class="settings-section-intro">Каждый способ включается отдельно. Скрытые реквизиты не изменятся, если оставить поле пустым.</p>
 				<div class="settings-sub-h" id="payment-yookassa">💳 YooKassa</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="yookassa_enabled" value="false" />
@@ -842,6 +1027,11 @@
 						</div>
 					</div>
 				</div>
+			</section>
+
+			<section class="settings-section settings-section-accent" id="subscription-settings">
+				<h2>🔗 Подписка Happ</h2>
+				<p class="settings-section-intro">Название и информация, которую видит пользователь, а также период автоматического обновления списка серверов.</p>
 				<div class="form-group">
 					<label for="domain">Ваш домен (например, my-shop.com):</label>
 					<input type="text" id="domain" name="domain" placeholder="example.com" value="{{ settings.domain or '' }}" />
@@ -854,6 +1044,145 @@
 						value="{{ settings.subscription_name or 'AresVPN' }}" placeholder="Например: AresVPN" />
 					<small class="field-hint">Это имя будет отображаться при импорте
 						подписки.</small>
+				</div>
+				<div class="form-group">
+					<label for="subscription_update_interval_hours">Автообновление подписки в Happ:</label>
+					<select id="subscription_update_interval_hours" name="subscription_update_interval_hours">
+						{% set update_interval = settings.subscription_update_interval_hours or '6' %}
+						{% for hours, label in [('1', 'Каждый час'), ('3', 'Каждые 3 часа'), ('6', 'Каждые 6 часов — рекомендуется'), ('12', 'Каждые 12 часов'), ('24', 'Раз в сутки')] %}
+						<option value="{{ hours }}" {% if update_interval == hours %}selected{% endif %}>{{ label }}</option>
+						{% endfor %}
+					</select>
+					<small class="field-hint">Happ постарается обновлять список серверов и срок подписки с выбранным интервалом. Если фоновое обновление пропущено, оно выполнится при следующем запуске приложения.</small>
+				</div>
+				<div class="form-group">
+					<label for="subscription_announce">Информационная строка Happ:</label>
+					<input type="text" id="subscription_announce" name="subscription_announce"
+						value="{{ settings.subscription_announce or '' }}"
+						placeholder="🔥 Безлимитный VPN. Продление и поддержка — в Telegram." />
+					<small class="field-hint">Показывается под сроком действия подписки. Оставьте поле пустым, чтобы скрыть строку.</small>
+				</div>
+			</section>
+
+			<section class="settings-section settings-section-accent" id="ip-limit-settings">
+				<h2>🛡️ Лимит IP и подозрительная активность</h2>
+				<p class="settings-section-intro">Сначала пользователь получает предупреждение. Ограничение включается только после указанного льготного периода.</p>
+				<div class="settings-status-row" aria-label="Текущее состояние защиты подписок">
+					<div class="settings-status-card">
+						<small>Контроль</small>
+						<strong>{{ 'Включён' if settings.ip_limit_enabled == 'true' else 'Выключен' }}</strong>
+					</div>
+					<div class="settings-status-card">
+						<small>Разрешено IP</small>
+						<strong>{{ settings.ip_limit_max_ips or '10' }}</strong>
+					</div>
+					<div class="settings-status-card">
+						<small>Событий в журнале</small>
+						<strong>{{ ip_limit_events|length }}</strong>
+					</div>
+				</div>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="ip_limit_enabled" value="false" />
+					<input type="checkbox" id="ip_limit_enabled" name="ip_limit_enabled" value="true" {% if
+						settings.ip_limit_enabled=='true' %}checked{% endif %}>
+					<label for="ip_limit_enabled">Контролировать количество одновременных IP</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="ip_limit_enabled">
+					<div class="settings-input-grid">
+						<div class="form-group">
+							<label for="ip_limit_max_ips">Разрешённое количество IP:</label>
+							<input type="number" id="ip_limit_max_ips" name="ip_limit_max_ips"
+								min="1" max="100" step="1"
+								value="{{ settings.ip_limit_max_ips or '10' }}" />
+							<small class="field-hint">Применяется к существующим клиентам и автоматически учитывается на новых хостах.</small>
+						</div>
+						<div class="form-group">
+							<label for="ip_limit_warning_grace_hours">Время после предупреждения:</label>
+							<input type="number" id="ip_limit_warning_grace_hours"
+								name="ip_limit_warning_grace_hours" min="1" max="168" step="1"
+								value="{{ settings.ip_limit_warning_grace_hours or '24' }}" />
+							<small class="field-hint">В часах. До окончания этого времени подключения не ограничиваются.</small>
+						</div>
+					</div>
+					<p class="field-help">
+						Проверка выполняется каждые 5 минут. IP-адреса остаются на VPN-панелях:
+						бот хранит только количество. После предупреждения и льготного периода 3x-ui
+						отключает только подключения сверх лимита. Ограничение считается для каждой
+						VPN-конфигурации на сервере и не является точным счётчиком физических устройств.
+					</p>
+				</div>
+				{% if ip_limit_events %}
+				<div class="form-group">
+					<h3>Превышения и подозрительная активность</h3>
+					<div class="table-scroll">
+						<table class="users-table">
+							<thead>
+								<tr>
+									<th>Пользователь</th>
+									<th>Сервер</th>
+									<th>IP</th>
+									<th>Состояние</th>
+									<th>Последнее превышение</th>
+								</tr>
+							</thead>
+							<tbody>
+								{% for event in ip_limit_events %}
+								<tr>
+									<td>
+										{% if event.username %}@{{ event.username }}<br>{% endif %}
+										<small>ID {{ event.user_id }}</small>
+									</td>
+									<td>{{ event.host_name }}</td>
+									<td><strong>{{ event.observed_ip_count }}</strong> / {{ event.limit_count }}</td>
+									<td>
+										{% if event.state == 'enforced' %}
+										<span class="status-badge status-stopped">Ограничение активно</span>
+										{% elif event.state == 'warning' %}
+										<span class="status-badge status-warning">Предупреждён</span>
+										{% else %}
+										<span class="status-badge status-active">Нормализовано</span>
+										{% endif %}
+										{% if event.notification_error %}
+										<br><small>Telegram: сообщение не доставлено</small>
+										{% endif %}
+									</td>
+									<td>{{ event.last_exceeded_at }}</td>
+								</tr>
+								{% endfor %}
+							</tbody>
+						</table>
+					</div>
+				</div>
+				{% else %}
+				<p class="settings-empty-state">✓ Превышений пока не зафиксировано. Когда появится событие, таблица будет показана здесь автоматически.</p>
+				{% endif %}
+			</section>
+
+			<section class="settings-section" id="automation-settings">
+				<h2>⚡ Автовыбор и маршрутизация</h2>
+				<p class="settings-section-intro">Правила формирования списка серверов Happ. Ручной выбор стран при этом остаётся доступным.</p>
+				<div class="form-group form-group-checkbox">
+					<input type="hidden" name="auto_selector_enabled" value="false" />
+					<input type="checkbox" id="auto_selector_enabled" name="auto_selector_enabled" value="true" {% if
+						settings.auto_selector_enabled=='true' %}checked{% endif %}>
+					<label for="auto_selector_enabled">Добавлять сервер «⚡ Автовыбор»</label>
+				</div>
+				<div class="toggle-section" data-toggle-section="auto_selector_enabled">
+					<p class="section-description">Автовыбор использует только включённые серверы со свежей успешной проверкой. Обычные страны остаются в списке.</p>
+					<div class="form-group">
+						<label for="auto_selector_max_cpu_percent">Исключать сервер при CPU выше:</label>
+						<input type="number" id="auto_selector_max_cpu_percent"
+							name="auto_selector_max_cpu_percent" min="50" max="100" step="1"
+							value="{{ settings.auto_selector_max_cpu_percent or '90' }}" />
+						<small class="field-hint">Рекомендуется 90%. Сервер с большей загрузкой не попадёт в автовыбор.</small>
+					</div>
+					<div class="form-group">
+						<label for="auto_selector_max_memory_percent">Исключать сервер при RAM выше:</label>
+						<input type="number" id="auto_selector_max_memory_percent"
+							name="auto_selector_max_memory_percent" min="50" max="100" step="1"
+							value="{{ settings.auto_selector_max_memory_percent or '90' }}" />
+						<small class="field-hint">Рекомендуется 90%. Выбор также учитывает онлайн-подключения и задержку панели.</small>
+					</div>
 				</div>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="happ_routing_enabled" value="false" />
@@ -872,7 +1201,8 @@
 			</section>
 
 			<section class="settings-section" id="content-settings">
-				<h2>Настройки Контента</h2>
+				<h2>📝 Тексты и ссылки</h2>
+				<p class="settings-section-intro">Содержимое разделов бота, документы и обязательная подписка на канал.</p>
 				<div class="form-group form-group-checkbox">
 					<input type="hidden" name="show_about_menu_item" value="false" />
 					<input type="checkbox" id="show_about_menu_item" name="show_about_menu_item" value="true" {% if
@@ -914,8 +1244,9 @@
 			</section>
 
 			<div class="settings-save-bar">
+				<p>После сохранения новые значения начнут использоваться автоматически.</p>
 				<button type="submit" class="button button-primary">
-					Сохранить все настройки
+					Сохранить изменения
 				</button>
 			</div>
 		</form>

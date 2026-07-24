@@ -1,6 +1,7 @@
 import uuid
 import time
 import json
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
@@ -387,7 +388,31 @@ def _normalize_inbound_payload(data: dict) -> dict:
     for field_name in ("settings", "streamSettings", "sniffing"):
         if field_name in normalized:
             normalized[field_name] = _json_string_to_dict(normalized[field_name])
+    # Recent 3x-ui versions may serialize disabled sniffing as JSON null,
+    # while py3xui's Inbound model requires a Sniffing object.
+    if normalized.get("sniffing") is None:
+        normalized["sniffing"] = {"enabled": False}
     return normalized
+
+
+def _validate_inbound_payload(data: dict) -> Inbound:
+    """Validate an inbound while retaining transports unknown to py3xui.
+
+    py3xui 0.4.x drops newer stream settings such as ``xhttpSettings`` from
+    its Pydantic model.  Keep the normalized raw stream payload on the model so
+    share-link generation can still include the server's transport parameters.
+    """
+    normalized = _normalize_inbound_payload(data)
+    inbound = Inbound.model_validate(normalized)
+    raw_stream_settings = normalized.get("streamSettings")
+    stream_settings = getattr(inbound, "stream_settings", None)
+    if isinstance(raw_stream_settings, dict) and stream_settings is not None:
+        object.__setattr__(
+            stream_settings,
+            "_shop_bot_raw_stream_settings",
+            raw_stream_settings,
+        )
+    return inbound
 
 
 def _get_inbound_list_compat(api: Api) -> list[Inbound]:
@@ -399,10 +424,7 @@ def _get_inbound_list_compat(api: Api) -> list[Inbound]:
         {"Accept": "application/json"},
     )
     inbounds_json = response.json().get("obj") or []
-    return [
-        Inbound.model_validate(_normalize_inbound_payload(data))
-        for data in inbounds_json
-    ]
+    return [_validate_inbound_payload(data) for data in inbounds_json]
 
 
 def _get_inbound_by_id_compat(api: Api, inbound_id: int) -> Inbound | None:
@@ -416,7 +438,35 @@ def _get_inbound_by_id_compat(api: Api, inbound_id: int) -> Inbound | None:
     inbound_json = response.json().get("obj")
     if not inbound_json:
         return None
-    return Inbound.model_validate(_normalize_inbound_payload(inbound_json))
+    return _validate_inbound_payload(inbound_json)
+
+
+def _update_inbound_compat(api: Api, inbound_id: int, inbound: Inbound) -> None:
+    """Update an inbound without dropping stream fields unknown to py3xui."""
+    raw_stream_settings = getattr(
+        getattr(inbound, "stream_settings", None),
+        "_shop_bot_raw_stream_settings",
+        None,
+    )
+    if not isinstance(raw_stream_settings, dict):
+        api.inbound.update(inbound_id, inbound)
+        return
+
+    payload = inbound.to_json()
+    modeled_stream_settings = _json_string_to_dict(payload.get("streamSettings"))
+    merged_stream_settings = dict(raw_stream_settings)
+    if isinstance(modeled_stream_settings, dict):
+        merged_stream_settings.update(modeled_stream_settings)
+    payload["streamSettings"] = json.dumps(
+        merged_stream_settings,
+        separators=(",", ":"),
+    )
+    _raw_api_request(
+        api,
+        requests.post,
+        f"panel/api/inbounds/update/{inbound_id}",
+        payload,
+    )
 
 
 def login_to_host(
@@ -852,6 +902,112 @@ def _raw_api_request(
     return result
 
 
+def _ip_value_from_panel_record(value) -> str | None:
+    if isinstance(value, dict):
+        raw = value.get("ip") or value.get("address")
+    else:
+        raw = value
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    # Current 3x-ui returns values such as "203.0.113.10 (24.07.2026 12:00)".
+    return text.split(" (", 1)[0].strip() or None
+
+
+def get_client_ip_counts_for_host(
+    host_name: str, expected_emails: set[str] | None = None
+) -> dict:
+    """Return per-client unique IP counts without returning or logging IP values."""
+    host_data = get_host(host_name)
+    if not host_data:
+        raise ValueError(f"Host '{host_name}' not found")
+
+    api, inbound = login_to_host(
+        host_url=host_data["host_url"],
+        username=host_data["host_username"],
+        password=host_data["host_pass"],
+        inbound_id=host_data["host_inbound_id"],
+        api_token=host_data.get("api_token"),
+    )
+    if not api or not inbound:
+        raise ConnectionError(f"Could not connect to host '{host_name}'")
+
+    wanted = set(expected_emails or ())
+    try:
+        payload = _raw_api_request(
+            api, requests.get, "panel/api/server/clientIps"
+        )
+        rows = payload.get("obj") or []
+        counts: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            email = str(row.get("clientEmail") or row.get("email") or "").strip()
+            if not email or (wanted and email not in wanted):
+                continue
+            unique_ips = {
+                ip
+                for ip in (
+                    _ip_value_from_panel_record(value)
+                    for value in (row.get("ips") or [])
+                )
+                if ip
+            }
+            counts[email] = len(unique_ips)
+        if wanted:
+            for email in wanted:
+                counts.setdefault(email, 0)
+        return {
+            "host": host_name,
+            "counts": counts,
+            "fail2ban": get_host_fail2ban_status_from_api(api),
+        }
+    except Exception as bulk_error:
+        if not _is_endpoint_not_found_error(bulk_error):
+            raise
+
+    # Compatibility path for older panels. It is intentionally bounded to the
+    # keys expected on this physical panel.
+    counts = {}
+    for email in sorted(wanted):
+        values = api.client.get_ips(email) or []
+        unique_ips = {
+            ip
+            for ip in (_ip_value_from_panel_record(value) for value in values)
+            if ip
+        }
+        counts[email] = len(unique_ips)
+    return {
+        "host": host_name,
+        "counts": counts,
+        "fail2ban": get_host_fail2ban_status_from_api(api),
+    }
+
+
+def get_host_fail2ban_status_from_api(api: Api) -> dict:
+    try:
+        payload = _raw_api_request(
+            api, requests.get, "panel/api/server/fail2banStatus"
+        )
+        status = payload.get("obj") or {}
+        return {
+            "enabled": bool(status.get("enabled")),
+            "installed": bool(status.get("installed")),
+            "usable": bool(status.get("usable")),
+        }
+    except Exception as e:
+        logger.warning("Could not read 3x-ui Fail2ban status: %s", e)
+        return {"enabled": False, "installed": False, "usable": False}
+
+
+async def get_client_ip_counts(
+    host_name: str, expected_emails: set[str] | None = None
+) -> dict:
+    return await asyncio.to_thread(
+        get_client_ip_counts_for_host, host_name, expected_emails
+    )
+
+
 def _is_endpoint_not_found_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "404" in message and "not found" in message
@@ -1229,7 +1385,7 @@ def _set_client_enabled_state(
         if _update_client_direct(api, inbound_id, client):
             return True
 
-        api.inbound.update(inbound_id, inbound_fresh)
+        _update_inbound_compat(api, inbound_id, inbound_fresh)
         return True
     except Exception as e:
         logger.warning(
@@ -1472,6 +1628,37 @@ def _get_vless_connection_string(
     # Common parameters
     base_link = f"vless://{user_uuid}@{hostname}:{port}?type={network}&encryption=none"
 
+    raw_stream_settings = getattr(
+        stream_settings, "_shop_bot_raw_stream_settings", {}
+    )
+    if not isinstance(raw_stream_settings, dict):
+        raw_stream_settings = {}
+
+    transport_settings = {}
+    if network in {"xhttp", "splithttp"}:
+        for field_name in ("xhttpSettings", "splithttpSettings"):
+            candidate = raw_stream_settings.get(field_name)
+            if isinstance(candidate, dict):
+                transport_settings = candidate
+                break
+
+    def _append_xhttp_params(link: str, fallback_host: str) -> str:
+        if network not in {"xhttp", "splithttp"}:
+            return link
+
+        path = str(transport_settings.get("path") or "/")
+        mode = str(transport_settings.get("mode") or "auto")
+        request_host = str(transport_settings.get("host") or fallback_host or hostname)
+        link += (
+            f"&path={quote(path, safe='')}"
+            f"&mode={quote(mode, safe='')}"
+            f"&host={quote(request_host, safe='')}"
+        )
+        extra = transport_settings.get("extra")
+        if isinstance(extra, dict) and extra:
+            link += f"&extra={quote(json.dumps(extra, separators=(',', ':')), safe='')}"
+        return link
+
     # Проверяем Reality настройки (основной случай)
     if (
         hasattr(stream_settings, "reality_settings")
@@ -1498,6 +1685,8 @@ def _get_vless_connection_string(
         short_id = short_ids[0]
         server_name = server_names[0]
         pqv = settings.get("mldsa65Verify") or ""
+
+        base_link = _append_xhttp_params(base_link, server_name)
 
         # Determine flow
         # XTLS-Vision flow is only valid for TCP + TLS/Reality
@@ -1539,6 +1728,8 @@ def _get_vless_connection_string(
         tls_settings = stream_settings.tls_settings.get("settings", {})
         server_name = tls_settings.get("serverName", hostname)
         fp = tls_settings.get("fingerprint", "chrome")
+
+        base_link = _append_xhttp_params(base_link, server_name)
 
         if network == "grpc":
             # Extract grpc serviceName
@@ -1755,7 +1946,7 @@ def update_or_create_client_on_panel(
                 # Update the already-loaded inbound as the primary path.
                 # This is more stable on panels that intermittently reject direct client.update
                 # with "record not found" for otherwise valid existing clients.
-                api.inbound.update(inbound_id, inbound_to_modify)
+                _update_inbound_compat(api, inbound_id, inbound_to_modify)
                 logger.info(
                     f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}"
                 )
@@ -1852,10 +2043,6 @@ def update_or_create_client_on_panel(
     except Exception as e:
         logger.error(f"Error in update_or_create_client_on_panel: {e}", exc_info=True)
         return None, None
-
-
-import asyncio
-
 
 async def create_or_update_key_on_host(
     host_name: str, email: str, days_to_add: int, telegram_id: str = None
@@ -2165,7 +2352,7 @@ def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bo
         except (ValueError, AttributeError):
             pass  # Field might not exist in some library versions, skip it
 
-        api.inbound.update(inbound.id, inbound_to_modify)
+        _update_inbound_compat(api, inbound.id, inbound_to_modify)
 
         logger.info(
             f"Successfully fixed parameters for client '{client_email}' on host '{host_name}'."
@@ -2308,7 +2495,7 @@ def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
                 pass
             updated += 1
 
-        api.inbound.update(inbound.id, inbound_to_modify)
+        _update_inbound_compat(api, inbound.id, inbound_to_modify)
         logger.info(f"Fixed parameters for {updated} clients on host '{host_name}'.")
         return updated
 
@@ -2341,6 +2528,7 @@ def _sync_clients_state_on_host_sync(
         "already_ok": 0,
         "not_found": 0,
         "traffic_fixed": 0,
+        "ip_limit_fixed": 0,
         "errors": 0,
     }
 
@@ -2393,10 +2581,12 @@ def _sync_clients_state_on_host_sync(
                     continue
 
                 changed = False
+                needs_traffic_reset = False
                 target_enabled = bool(state.get("enabled", True))
                 if bool(raw_client.get("enable", True)) != target_enabled:
                     raw_client["enable"] = target_enabled
                     changed = True
+                    needs_traffic_reset = True
 
                 target_expiry_ms = state.get("expiry_timestamp_ms")
                 if target_expiry_ms is not None:
@@ -2406,6 +2596,7 @@ def _sync_clients_state_on_host_sync(
                         if abs(current_expiry_ms - target_expiry_ms) > 1000:
                             raw_client["expiryTime"] = target_expiry_ms
                             changed = True
+                            needs_traffic_reset = True
                     except Exception:
                         result["errors"] += 1
 
@@ -2413,9 +2604,22 @@ def _sync_clients_state_on_host_sync(
                     if raw_client.get("totalGB", 0) != 0:
                         raw_client["totalGB"] = 0
                         changed = True
+                        needs_traffic_reset = True
                     if raw_client.get("reset", 0) != 0:
                         raw_client["reset"] = 0
                         changed = True
+                        needs_traffic_reset = True
+
+                target_ip_limit = state.get("ip_limit")
+                if target_ip_limit is not None:
+                    try:
+                        target_ip_limit = max(0, int(target_ip_limit))
+                        if int(raw_client.get("limitIp") or 0) != target_ip_limit:
+                            raw_client["limitIp"] = target_ip_limit
+                            changed = True
+                            result["ip_limit_fixed"] += 1
+                    except (TypeError, ValueError):
+                        result["errors"] += 1
 
                 client_identifier = raw_client.get("auth")
                 if not client_identifier:
@@ -2426,7 +2630,8 @@ def _sync_clients_state_on_host_sync(
                 if changed:
                     _update_raw_client(api, inbound.id, str(client_identifier), raw_client)
                     result["updated"] += 1
-                    _normalize_client_traffic_state(api, inbound.id, email)
+                    if needs_traffic_reset:
+                        _normalize_client_traffic_state(api, inbound.id, email)
                 else:
                     result["already_ok"] += 1
 
@@ -2458,6 +2663,7 @@ def _sync_clients_state_on_host_sync(
         # client.enable from inbound.update.
         emails_to_reset_stats: set[str] = set()
         reactivated_emails: set[str] = set()
+        ip_only_updates: list[Client] = []
         now_ms = time_utils.get_timestamp_ms(time_utils.get_msk_now())
 
         for email, state in desired_by_email.items():
@@ -2468,6 +2674,7 @@ def _sync_clients_state_on_host_sync(
                 continue
 
             changed = False
+            needs_traffic_reset = False
 
             target_enabled = bool(state.get("enabled", True))
             was_enabled = bool(getattr(client, "enable", True))
@@ -2476,6 +2683,7 @@ def _sync_clients_state_on_host_sync(
             if enable_state_changed:
                 client.enable = target_enabled
                 changed = True
+                needs_traffic_reset = True
 
             target_expiry_ms = state.get("expiry_timestamp_ms")
             if target_expiry_ms is not None:
@@ -2484,18 +2692,31 @@ def _sync_clients_state_on_host_sync(
                     if abs(current_expiry_ms - target_expiry_ms) > 1000:
                         client.expiry_time = target_expiry_ms
                         changed = True
+                        needs_traffic_reset = True
                 except Exception:
                     result["errors"] += 1
 
             if state.get("force_unlimited", False):
                 if _set_unlimited_traffic_fields(client):
                     changed = True
+                    needs_traffic_reset = True
+
+            target_ip_limit = state.get("ip_limit")
+            if target_ip_limit is not None:
+                try:
+                    target_ip_limit = max(0, int(target_ip_limit))
+                    if int(getattr(client, "limit_ip", 0) or 0) != target_ip_limit:
+                        client.limit_ip = target_ip_limit
+                        changed = True
+                        result["ip_limit_fixed"] += 1
+                except (TypeError, ValueError):
+                    result["errors"] += 1
 
             if target_enabled:
                 # Renewals can keep client.enable=true while only expiry/caps change.
                 # In that case 3x-ui may still show a stale exhausted badge until
                 # resetClientTraffic is called explicitly.
-                if changed:
+                if changed and needs_traffic_reset:
                     emails_to_reset_stats.add(email)
                     if current_expiry_ms <= now_ms or not was_enabled:
                         reactivated_emails.add(email)
@@ -2518,13 +2739,35 @@ def _sync_clients_state_on_host_sync(
                 emails_to_reset_stats.add(email)
 
             if changed:
-                result["updated"] += 1
-                any_changed = True
+                if needs_traffic_reset:
+                    result["updated"] += 1
+                    any_changed = True
+                else:
+                    ip_only_updates.append(client)
             else:
                 result["already_ok"] += 1
 
         if any_changed:
-            api.inbound.update(inbound.id, inbound_to_modify)
+            _update_inbound_compat(api, inbound.id, inbound_to_modify)
+
+        # A pure limitIp change can be applied to one client through the
+        # dedicated endpoint. Avoid rewriting/reloading the complete inbound,
+        # which keeps unrelated active connections untouched.
+        for client in ip_only_updates:
+            try:
+                client_identifier = _ensure_client_identifier_for_protocol(
+                    protocol, client, client.email
+                )
+                _update_client_compat(api, client_identifier, client)
+                result["updated"] += 1
+            except Exception as e:
+                result["errors"] += 1
+                logger.warning(
+                    "Could not update IP limit for client '%s' on host '%s': %s",
+                    getattr(client, "email", ""),
+                    host_name,
+                    e,
+                )
 
         # Reset traffic stats after inbound.update so 3x-ui clears stale
         # "исчерпано" state from clientTraffics for both renewals and expiries.
@@ -2715,7 +2958,7 @@ def _sync_xtls_for_host(host_info: dict) -> dict:
         # Apply all collected XTLS fixes in one inbound update instead of one per client.
         if fixed_count > 0:
             try:
-                api.inbound.update(inbound.id, inbound_fresh)
+                _update_inbound_compat(api, inbound.id, inbound_fresh)
                 logger.info(
                     f"Applied XTLS flow fix for {fixed_count} client(s) on inbound {inbound.id}"
                 )

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import math
 import time
@@ -16,6 +17,7 @@ from shop_bot.data_manager import database
 from shop_bot.data_manager.database import host_slug as _host_slug
 from shop_bot.modules import xui_api
 from shop_bot.modules import mtg_api
+from shop_bot.modules import host_health
 from shop_bot.bot import handlers, keyboards
 
 CHECK_INTERVAL_SECONDS = 60
@@ -35,6 +37,12 @@ _MTG_ENFORCE_MAX_CONCURRENCY = 8
 _MTG_ENFORCE_PER_HOST_CONCURRENCY = 2
 _MTG_FAILURE_BACKOFF_SECONDS = 15 * 60
 _mtg_failure_backoff: dict[str, float] = {}
+_HOST_HEALTH_INTERVAL_SECONDS = 5 * 60
+_HOST_HEALTH_TIMEOUT_SECONDS = 45
+_HOST_HEALTH_MAX_CONCURRENCY = 4
+_IP_LIMIT_INTERVAL_SECONDS = 5 * 60
+_IP_LIMIT_PANEL_TIMEOUT_SECONDS = 90
+_IP_LIMIT_MAX_CONCURRENCY = 4
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,15 @@ def _bool_setting(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_setting(key: str, default: int, minimum: int, maximum: int) -> int:
+    raw = database.get_setting(key)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
 
 
 def _provision_timeout_seconds() -> int:
@@ -756,9 +773,21 @@ async def enforce_clients_state_from_db() -> None:
     total_not_found = 0
     total_errors = 0
     total_traffic_fixed = 0
+    total_ip_limit_fixed = 0
     total_expired_preserved = 0
 
     now = time_utils.get_msk_now()
+    ip_limit_enabled = _bool_setting("ip_limit_enabled", default=True)
+    configured_ip_limit = _int_setting("ip_limit_max_ips", 10, 1, 100)
+    # Keep native blocking disabled until this key has received a warning and
+    # exhausted its grace period. The panel still records IP observations with
+    # limitIp=0; this behavior is verified by the bulk clientIps API.
+    warning_ip_limit = 0
+    enforced_key_ids = (
+        await asyncio.to_thread(database.get_enforced_xui_ip_limit_key_ids)
+        if ip_limit_enabled
+        else set()
+    )
 
     for host in all_hosts:
         host_name = host.get("host_name")
@@ -796,6 +825,13 @@ async def enforce_clients_state_from_db() -> None:
                 "enabled": expiry_date > now,
                 "expiry_timestamp_ms": time_utils.get_timestamp_ms(expiry_date),
                 "force_unlimited": True,
+                "ip_limit": (
+                    configured_ip_limit
+                    if db_key.get("key_id") in enforced_key_ids
+                    else warning_ip_limit
+                )
+                if ip_limit_enabled
+                else 0,
             }
 
         if desired_by_email:
@@ -824,15 +860,17 @@ async def enforce_clients_state_from_db() -> None:
             total_already_ok += int(host_result.get("already_ok", 0))
             total_not_found += int(host_result.get("not_found", 0))
             total_traffic_fixed += int(host_result.get("traffic_fixed", 0))
+            total_ip_limit_fixed += int(host_result.get("ip_limit_fixed", 0))
             total_errors += int(host_result.get("errors", 0))
 
     logger.info(
-        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s traffic_fixed=%s expired_preserved=%s errors=%s",
+        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s traffic_fixed=%s ip_limit_fixed=%s expired_preserved=%s errors=%s",
         total_checked,
         total_updated,
         total_already_ok,
         total_not_found,
         total_traffic_fixed,
+        total_ip_limit_fixed,
         total_expired_preserved,
         total_errors,
     )
@@ -1304,6 +1342,253 @@ async def auto_provision_new_hosts_for_global_users():
     )
 
 
+async def refresh_xui_host_health() -> dict:
+    """Refresh cached read-only load metrics without delaying subscriptions."""
+    hosts = await asyncio.to_thread(database.get_all_hosts, True)
+    hosts = [host for host in hosts if host.get("host_name")]
+    result = {"checked": 0, "healthy": 0, "failed": 0}
+    if not hosts:
+        return result
+
+    semaphore = asyncio.Semaphore(_HOST_HEALTH_MAX_CONCURRENCY)
+    host_groups: dict[str, list[dict]] = {}
+    for host in hosts:
+        host_groups.setdefault(str(host.get("host_url") or host["host_name"]), []).append(
+            host
+        )
+
+    async def _probe(group_hosts: list[dict]) -> None:
+        host_name = group_hosts[0]["host_name"]
+        result["checked"] += len(group_hosts)
+        try:
+            async with semaphore:
+                metrics = await asyncio.wait_for(
+                    host_health.collect_host_health(host_name),
+                    timeout=_HOST_HEALTH_TIMEOUT_SECONDS,
+                )
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        database.update_xui_host_health,
+                        group_host["host_name"],
+                        metrics,
+                    )
+                    for group_host in group_hosts
+                )
+            )
+            if metrics.get("is_available") and metrics.get("xray_running"):
+                result["healthy"] += len(group_hosts)
+            else:
+                result["failed"] += len(group_hosts)
+        except asyncio.TimeoutError:
+            result["failed"] += len(group_hosts)
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        database.record_xui_host_health_failure,
+                        group_host["host_name"],
+                        "health probe timed out",
+                    )
+                    for group_host in group_hosts
+                )
+            )
+            logger.warning(
+                "Scheduler: Health probe timed out for host '%s'.", host_name
+            )
+        except Exception as e:
+            result["failed"] += len(group_hosts)
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        database.record_xui_host_health_failure,
+                        group_host["host_name"],
+                        f"{type(e).__name__}: health probe failed",
+                    )
+                    for group_host in group_hosts
+                )
+            )
+            logger.warning(
+                "Scheduler: Health probe failed for host '%s': %s",
+                host_name,
+                e,
+            )
+
+    await asyncio.gather(*(_probe(group) for group in host_groups.values()))
+    logger.info(
+        "Scheduler: Host health refresh finished. checked=%s healthy=%s failed=%s",
+        result["checked"],
+        result["healthy"],
+        result["failed"],
+    )
+    return result
+
+
+async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
+    """Collect per-client IP counts once per physical panel and process breaches."""
+    result = {
+        "panels": 0,
+        "keys": 0,
+        "warnings": 0,
+        "enforced": 0,
+        "resolved": 0,
+        "errors": 0,
+    }
+    if not _bool_setting("ip_limit_enabled", default=True):
+        return result
+
+    limit_count = _int_setting("ip_limit_max_ips", 10, 1, 100)
+    grace_hours = _int_setting("ip_limit_warning_grace_hours", 24, 1, 168)
+    hosts = await asyncio.to_thread(database.get_all_hosts, True)
+    if not hosts:
+        return result
+
+    # Several logical locations may point to different inbounds on one panel.
+    # The bulk IP endpoint is panel-wide, so query each physical panel once.
+    host_groups: dict[str, list[dict]] = {}
+    for host in hosts:
+        group_key = str(host.get("host_url") or host.get("host_name") or "")
+        host_groups.setdefault(group_key, []).append(host)
+
+    now = time_utils.get_msk_now()
+    semaphore = asyncio.Semaphore(_IP_LIMIT_MAX_CONCURRENCY)
+    observations: list[dict] = []
+
+    async def _collect(group: list[dict]) -> None:
+        representative = group[0]
+        keys_by_email: dict[str, dict] = {}
+        for host in group:
+            host_name = host.get("host_name")
+            if not host_name:
+                continue
+            host_keys = await asyncio.to_thread(
+                database.get_keys_for_host, host_name
+            )
+            for key in host_keys:
+                email = key.get("key_email")
+                expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
+                if not email or not expiry or expiry <= now:
+                    continue
+                keys_by_email[str(email)] = key
+
+        if not keys_by_email:
+            return
+
+        try:
+            async with semaphore:
+                panel_result = await asyncio.wait_for(
+                    xui_api.get_client_ip_counts(
+                        representative["host_name"], set(keys_by_email)
+                    ),
+                    timeout=_IP_LIMIT_PANEL_TIMEOUT_SECONDS,
+                )
+        except Exception as e:
+            result["errors"] += 1
+            logger.warning(
+                "Scheduler: IP-limit collection failed for panel group '%s': %s",
+                representative.get("host_name"),
+                e,
+            )
+            return
+
+        result["panels"] += 1
+        fail2ban = panel_result.get("fail2ban") or {}
+        if not fail2ban.get("usable"):
+            result["errors"] += 1
+            logger.warning(
+                "Scheduler: IP limiting is not usable on panel group '%s'; "
+                "observations skipped to avoid promising unenforced limits.",
+                representative.get("host_name"),
+            )
+            return
+
+        counts = panel_result.get("counts") or {}
+        for email, key in keys_by_email.items():
+            observations.append(
+                {
+                    "key_id": key.get("key_id"),
+                    "user_id": key.get("user_id"),
+                    "host_name": key.get("host_name"),
+                    "key_email": email,
+                    "ip_count": int(counts.get(email, 0) or 0),
+                }
+            )
+
+    await asyncio.gather(*(_collect(group) for group in host_groups.values()))
+    result["keys"] = len(observations)
+    actions = await asyncio.to_thread(
+        database.process_xui_ip_limit_observations,
+        observations,
+        limit_count,
+        grace_hours,
+    )
+    result["warnings"] = len(actions["warnings"])
+    result["enforced"] = len(actions["enforced"])
+    result["resolved"] = len(actions["resolved"])
+
+    warnings_by_user: dict[int, list[dict]] = {}
+    for warning in actions["warnings"]:
+        warnings_by_user.setdefault(int(warning["user_id"]), []).append(warning)
+
+    for user_id, user_warnings in warnings_by_user.items():
+        if bot is None:
+            continue
+        details = "\n".join(
+            f"• <b>{html.escape(str(item['host_name']))}</b>: "
+            f"{item['ip_count']} IP при лимите {item['limit_count']}"
+            for item in user_warnings[:10]
+        )
+        message = (
+            "⚠️ <b>Предупреждение о подключениях</b>\n\n"
+            "Обнаружено превышение количества одновременно используемых "
+            f"IP-адресов:\n{details}\n\n"
+            "Сейчас доступ ещё не ограничен. Пожалуйста, отключите лишние "
+            f"устройства в течение {grace_hours} ч. После этого 3x-ui будет "
+            "автоматически отключать подключения сверх лимита.\n\n"
+            "Если это ваши устройства или мобильная сеть часто меняет IP, "
+            "напишите в поддержку."
+        )
+        try:
+            await bot.send_message(user_id, message, parse_mode="HTML")
+            for warning in user_warnings:
+                await asyncio.to_thread(
+                    database.mark_xui_ip_limit_warning_result,
+                    warning["key_id"],
+                    None,
+                )
+        except TelegramForbiddenError as e:
+            for warning in user_warnings:
+                await asyncio.to_thread(
+                    database.mark_xui_ip_limit_warning_result,
+                    warning["key_id"],
+                    f"Telegram delivery forbidden: {e}",
+                )
+        except Exception as e:
+            result["errors"] += 1
+            logger.warning(
+                "Scheduler: Could not send IP-limit warning for user %s (%s key(s)): %s",
+                user_id,
+                len(user_warnings),
+                e,
+            )
+
+    if actions["enforced"]:
+        logger.warning(
+            "Scheduler: IP limit moved to enforcement for %s key(s).",
+            len(actions["enforced"]),
+        )
+    logger.info(
+        "Scheduler: IP-limit monitor finished. panels=%s keys=%s warnings=%s "
+        "enforced=%s resolved=%s errors=%s",
+        result["panels"],
+        result["keys"],
+        result["warnings"],
+        result["enforced"],
+        result["resolved"],
+        result["errors"],
+    )
+    return result
+
+
 async def periodic_xtls_sync():
     """
     Periodically synchronize XTLS settings across all hosts.
@@ -1729,6 +2014,8 @@ async def periodic_subscription_check(bot_controller: BotController):
     # Track when XTLS sync was last performed (run every 5 min instead of every CHECK_INTERVAL)
     xtls_sync_interval = 300  # 5 minutes
     last_xtls_sync_time = 0
+    last_host_health_time = 0
+    last_ip_limit_time = 0
 
     while True:
         try:
@@ -1753,6 +2040,20 @@ async def periodic_subscription_check(bot_controller: BotController):
 
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
+            if (
+                current_time - last_host_health_time
+                >= _HOST_HEALTH_INTERVAL_SECONDS
+            ):
+                await refresh_xui_host_health()
+                last_host_health_time = time.time()
+
+            if current_time - last_ip_limit_time >= _IP_LIMIT_INTERVAL_SECONDS:
+                warning_bot = None
+                if bot_controller.get_status().get("is_running"):
+                    warning_bot = bot_controller.get_bot_instance()
+                await monitor_xui_ip_limits(warning_bot)
+                last_ip_limit_time = time.time()
+
             if (
                 _bool_setting("xtls_sync_enabled", default=False)
                 and current_time - last_xtls_sync_time >= xtls_sync_interval

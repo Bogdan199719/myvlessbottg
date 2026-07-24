@@ -100,6 +100,15 @@ CDN или дополнительный proxy нужно добавить явн
 - `subscription_live_stats`
 - `subscription_allow_fallback_host_fetch`
 - `subscription_auto_provision` (зарезервирована; текущие пути provisioning её не учитывают)
+- `subscription_update_interval_hours` — автообновление подписки Happ: `1`, `3`, `6`, `12` или `24` часа
+- `subscription_announce` — информационная строка под сроком подписки в Happ; передаётся как Base64 UTF-8
+- `auto_selector_enabled` — добавлять первым сервером `⚡ Автовыбор`
+- `ip_limit_enabled` — включить фоновый контроль IP и отложенное ограничение 3x-ui
+- `ip_limit_max_ips` — разрешённое количество одновременно наблюдаемых IP на одну VPN-конфигурацию; по умолчанию `10`
+- `ip_limit_warning_grace_hours` — время между Telegram-предупреждением и включением нативного лимита 3x-ui; по умолчанию `24`
+- `auto_selector_max_cpu_percent` — исключать из автовыбора хосты с CPU выше порога
+- `auto_selector_max_memory_percent` — исключать из автовыбора хосты с RAM выше порога
+- `auto_selector_health_max_age_seconds` — максимальный возраст успешной проверки хоста; по умолчанию 900 секунд
 - `happ_routing_enabled`
 - `happ_routing_rules`
 - `provision_timeout_seconds`

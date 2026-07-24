@@ -720,6 +720,21 @@ def get_user_router() -> Router:
         user_data = get_user(user_id)
 
         if user_data and user_data.get("agreed_to_terms"):
+            if command.args == "renew":
+                plans = get_plans_for_host("ALL", service_type="xui")
+                if not plans:
+                    await message.answer(
+                        "❌ Для глобальной подписки сейчас не настроены тарифы.",
+                        reply_markup=keyboards.main_reply_keyboard,
+                    )
+                    return
+                await message.answer(
+                    "🌍 Выберите тариф для продления VPN-подписки:",
+                    reply_markup=keyboards.create_plans_keyboard(
+                        plans, action="new", host_name="ALL", key_id=0
+                    ),
+                )
+                return
             await message.answer(
                 "Привет, солнышко ☀️",
                 reply_markup=keyboards.main_reply_keyboard,
