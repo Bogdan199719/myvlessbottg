@@ -1,145 +1,112 @@
 # Deployment
 
-## Локальный запуск через Docker
+## Требования
+
+- Docker Engine с Docker Compose;
+- домен с A/AAAA-записью на сервер;
+- открытые снаружи порты `80` и `443`;
+- токен Telegram-бота, Telegram ID администратора и учётные данные 3x-ui.
+
+Контейнер намеренно слушает только `127.0.0.1:1488`. Не открывайте этот порт во внешний интернет: используйте HTTPS reverse proxy.
+
+## Запуск
 
 ```bash
+git clone https://github.com/Bogdan199719/myvlessbottg.git
+cd myvlessbottg
 cp .env.example .env
-# обязательно задайте TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, DOMAIN
-# и сильный FLASK_SECRET_KEY, если .env создаётся вручную
+chmod 600 .env
 docker compose up -d --build
-docker compose logs -f
+docker compose logs -f bot
 ```
 
-Сервис:
+До запуска заполните в `.env` минимум `TELEGRAM_BOT_TOKEN`, `ADMIN_TELEGRAM_ID`, `DOMAIN`, `FLASK_SECRET_KEY`, `PANEL_LOGIN` и `PANEL_PASSWORD`. Для `FLASK_SECRET_KEY` используйте случайное значение длиной не менее 32 символов, например `openssl rand -hex 32`.
 
-- собирает образ из `Dockerfile`;
-- монтирует проект в контейнер как `/app/project`;
-- запускает `python3 -m shop_bot`;
-- слушает `1488`.
+Проверка локального сервиса:
 
-## Что происходит на старте
+```bash
+curl -fsS http://127.0.0.1:1488/healthz
+```
 
-- загружается `.env`;
-- инициализируется и мигрируется SQLite;
-- создаётся Flask app;
-- поднимается Waitress;
-- запускается основной бот, если в `bot_settings` есть `telegram_bot_token` и `admin_telegram_id`; username бота может быть получен автоматически через Bot API;
-- запускается support-бот, если в `bot_settings` есть `support_bot_token` и `support_group_id`;
-- стартует `periodic_subscription_check`.
+На первом старте приложение создаёт или мигрирует `users.db` и переносит стартовые настройки из `.env` в SQLite. После этого рабочие параметры хранятся в `bot_settings` и меняются через админку.
 
-## Переменные и состояние
+## Reverse proxy и HTTPS
 
-- `.env` используется как первичная конфигурация;
-- фактические рабочие настройки дальше живут в таблице `bot_settings`;
-- БД по умолчанию: `users.db` в корне проекта;
-- backup-файлы и `.env` считаются runtime-артефактами, не исходниками.
-- `.env` содержит секреты и должен иметь права `600`. `install.sh` выставляет эти права при генерации файла; при ручном создании используйте `chmod 600 .env`.
-- `FLASK_SECRET_KEY` должен быть случайным секретом длиной не меньше 32 символов. `install.sh` генерирует его автоматически; placeholder-значения из шаблона приложение не использует.
+Установите Nginx и Certbot, создайте `/etc/nginx/sites-available/myvlessbot`:
 
-## Backup и restore
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name vpn.example.com;
 
-В админке есть:
+    location / {
+        proxy_pass http://127.0.0.1:1488;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
 
-- создание zip-бэкапа с `users.db`, `metadata.json` и, при выборе в форме, `.env`;
-- импорт такого архива с проверкой checksum;
-- опциональное применение `.env` при restore через отдельный checkbox;
-- restore сначала сохраняется как pending и не меняет live-БД из web-потока;
-- процесс завершается после HTTP-ответа, а pending-БД применяется до запуска Flask,
-  ботов и планировщика с rollback-копиями БД и `.env`;
-- Docker с `restart: unless-stopped` запускает сервис автоматически; при ручном
-  запуске приложение после импорта нужно запустить снова.
+Замените `vpn.example.com` на значение `DOMAIN`, включите конфигурацию и получите сертификат:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/myvlessbot /etc/nginx/sites-enabled/myvlessbot
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d vpn.example.com --redirect
+```
+
+Проверьте `https://vpn.example.com/healthz`, затем войдите в админку по `https://vpn.example.com/login` с `PANEL_LOGIN` и `PANEL_PASSWORD`. Если перед Nginx есть CDN или другой proxy, добавьте его непосредственный CIDR в `TRUSTED_PROXY_CIDRS`; не доверяйте произвольному `X-Forwarded-For`.
+
+Альтернатива: `bash install.sh` автоматизирует установку Docker, Nginx и Let's Encrypt на Ubuntu/Debian. Запускайте его только на сервере, где домен уже резолвится на этот хост.
+
+## Состояние, backup и restore
+
+- `.env`, `users.db` и backup-файлы — runtime-данные, а не исходный код;
+- храните `.env` с правами `600` и делайте резервные копии вне сервера;
+- backup/import из админки включает `.env` только при явном выборе в форме;
+- restore сначала сохраняется как pending, а перед стартом Flask, ботов и scheduler применяется с rollback-копиями БД и `.env`.
 
 ## Обновление
 
-Есть два варианта:
-
-### Ручное
+Перед обновлением сделайте backup и убедитесь, что дерево Git чистое:
 
 ```bash
-git pull
+git pull --ff-only
 docker compose up -d --build
+docker compose ps
 ```
 
-Если образ уже собран отдельно через `docker compose build`, изменения всё равно не попадут в работающий контейнер до `docker compose up -d`.
-
-### Из админки
-
-Встроенный update-manager:
-
-- проверяет версию по GitHub Raw;
-- по умолчанию отключён в production и требует явного `ENABLE_WEB_UPDATES=true`;
-- делает `git fetch origin main`, если web-update включён;
-- проверяет, что рабочее дерево чистое;
-- только после этого делает `git reset --hard origin/main`;
-- выполняет `pip install -e .`;
-- завершает процесс, чтобы Docker его перезапустил.
-
-Это всё ещё агрессивная схема обновления, но теперь она не запускается при локальных незакоммиченных изменениях.
-
-Для Docker production предпочтителен ручной rebuild/redeploy через `docker compose up -d --build`, потому что зависимости устанавливаются при сборке образа.
-
-## Healthcheck
-
-`/healthz` используется Docker healthcheck-ом. Endpoint публично не требует авторизации, поэтому он должен возвращать только минимальный статус `ok/degraded`, без деталей о БД, event loop и ботах.
-
-После изменения кода `/healthz` старый подробный ответ будет сохраняться до пересоздания контейнера.
+Встроенный update-manager по умолчанию выключен (`ENABLE_WEB_UPDATES=false`). При включении он использует `git reset --hard origin/main`; для production предпочтительно ручное обновление выше.
 
 ## Проверки перед деплоем
 
+Если зависимости установлены только в контейнере, запускайте проверки так:
+
 ```bash
-python3 -m compileall -q src scripts
-python3 scripts/check_payment_safety.py
-python3 scripts/check_subscription_business_rules.py
-python3 scripts/check_callbacks.py
-python3 scripts/check_fsm_transitions.py
-python3 scripts/check_host_cleanup.py
-python3 scripts/check_profit_accounting.py
-python3 scripts/check_auto_selector.py
-python3 scripts/check_happ_subscription_metadata.py
-python3 scripts/check_ip_limit_rules.py
-python3 scripts/check_proxy_keyboard.py
-python3 scripts/check_scheduler_integrations.py
-python3 scripts/check_subscription_consistency.py
-python3 scripts/check_xui_connection_equivalence.py
-python3 scripts/check_settings_defaults.py
+docker compose exec -T bot python3 -m compileall -q src scripts
+docker compose exec -T bot python3 scripts/check_callbacks.py
+docker compose exec -T bot python3 scripts/check_fsm_transitions.py
+docker compose exec -T bot python3 scripts/check_host_cleanup.py
+docker compose exec -T bot python3 scripts/check_payment_safety.py
+docker compose exec -T bot python3 scripts/check_profit_accounting.py
+docker compose exec -T bot python3 scripts/check_auto_selector.py
+docker compose exec -T bot python3 scripts/check_happ_subscription_metadata.py
+docker compose exec -T bot python3 scripts/check_ip_limit_rules.py
+docker compose exec -T bot python3 scripts/check_proxy_keyboard.py
+docker compose exec -T bot python3 scripts/check_scheduler_integrations.py
+docker compose exec -T bot python3 scripts/check_subscription_business_rules.py
+docker compose exec -T bot python3 scripts/check_subscription_consistency.py
+docker compose exec -T bot python3 scripts/check_xui_connection_equivalence.py
+docker compose exec -T bot python3 scripts/check_settings_defaults.py
 bash -n install.sh
 docker compose config --quiet
 git diff --check
-docker compose build
 ```
 
-`scripts/check_subscription_consistency.py` сверяет live-БД с бизнес-правилом глобального VPN-доступа: каждый active trial и каждый active paid global пользователь должен иметь ключ на каждом включённом XUI-хосте. Скрипт также подсвечивает дублирующиеся `host_url`, потому что это часто означает несколько inbound на одной панели и требует особенно внимательной проверки API-доступа. В выводе остаются только схема, домен и порт; учётные данные, секретный path и query маскируются.
+`check_subscription_consistency.py` читает live-БД и проверяет, что каждый active trial и active paid global пользователь имеет ключ на каждом включённом XUI-хосте. По умолчанию скрипт маскирует идентификаторы; `--show-identities` предназначен только для доверенной локальной диагностики.
 
-`scripts/check_subscription_business_rules.py` работает на временной SQLite и проверяет resumable-выдачу промокода и разделение paid/trial/free статусов. Продовые данные он не изменяет.
-По умолчанию скрипт маскирует Telegram ID и usernames в выводе, чтобы CI/аудиторские логи не раскрывали персональные данные. Для ручной локальной диагностики конкретных пользователей добавьте `--show-identities`.
-
-`scripts/check_profit_accounting.py` работает на временной SQLite и проверяет расчёты выручки по MSK-окнам, пересечение периодов распределения прибыли и backend-связку формы редактирования фиксаций.
-
-`scripts/check_payment_analytics.py` работает на временной копии `users.db` и проверяет миграцию `transactions.paid_date`, backfill старых paid-платежей и дату фактической оплаты в dashboard/profit analytics.
-
-`scripts/check_xui_connection_equivalence.py` фиксирует правила сравнения ссылок 3x-ui. Панель может каждый раз отдавать новые `sid`/`spx` для Reality-ссылок, поэтому scheduler не должен считать такие ссылки рассинхроном, если стабильные параметры подключения не изменились.
-
-Если на host Python не установлены runtime-зависимости проекта, запускайте проверки внутри контейнера:
-
-```bash
-docker compose exec bot python3 scripts/check_xui_connection_equivalence.py
-```
-
-## Проверка 3x-ui хостов после обновления панели
-
-При добавлении или обновлении 3x-ui хоста админка выполняет write-preflight: логинится, находит inbound, создаёт отключённого тестового клиента и удаляет его. Это важно, потому что новая 3x-ui ветка может читать inbounds через старый API, но создавать клиентов только через новый `/panel/api/clients/*`.
-
-Если после обновления 3x-ui пользователи видят меньше серверов, проверьте:
-
-```bash
-python3 scripts/check_subscription_consistency.py
-docker compose logs --tail=300 bot
-```
-
-В норме все active global записи должны быть `OK ... 4/4` или с другим числом, равным количеству включённых XUI-хостов.
-
-Для очистки локальных cache-артефактов есть:
-
-```bash
-./scripts/cleanup.sh
-```
+`check_subscription_business_rules.py` и `check_profit_accounting.py` используют временную SQLite и не изменяют production-данные.

@@ -53,9 +53,7 @@ DEFAULT_BOT_SETTINGS = {
     "panel_login": os.getenv("PANEL_LOGIN", "admin"),
     "panel_password": os.getenv("PANEL_PASSWORD"),
     "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
-    "admin_ip_allowlist": os.getenv(
-        "ADMIN_IP_ALLOWLIST", "94.183.234.189 79.139.250.224"
-    ),
+    "admin_ip_allowlist": os.getenv("ADMIN_IP_ALLOWLIST", ""),
     "show_about_menu_item": "true",
     "about_text": None,
     "terms_url": None,
