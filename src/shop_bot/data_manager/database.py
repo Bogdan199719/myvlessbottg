@@ -2088,7 +2088,7 @@ def void_profit_distribution(distribution_id: int) -> bool:
                 """
                 UPDATE profit_distributions
                 SET status = 'void', updated_at = ?
-                WHERE distribution_id = ? AND status IN ('active', 'paid')
+                WHERE distribution_id = ? AND status = 'active'
                 """,
                 (_now_iso(), distribution_id),
             )
@@ -4398,6 +4398,7 @@ def delete_keys_by_ids(key_ids: list[int]) -> int:
 
 
 def delete_user_everywhere(user_id: int) -> bool:
+    """Delete an operational user profile while preserving the payment ledger."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -4406,7 +4407,8 @@ def delete_user_everywhere(user_id: int) -> bool:
                 "UPDATE users SET referred_by = NULL WHERE referred_by = ?", (user_id,)
             )
             cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            # Transactions are accounting records. Removing them would rewrite
+            # historical revenue and invalidate closed profit distributions.
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
             )

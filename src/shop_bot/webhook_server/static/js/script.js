@@ -70,6 +70,114 @@ document.addEventListener('DOMContentLoaded', function () {
 		})
 	}
 
+	function setupBulkActions() {
+		document.querySelectorAll('[data-bulk-form]').forEach(form => {
+			const items = Array.from(document.querySelectorAll(
+				`[data-bulk-item][form="${form.id}"], #${form.id} [data-bulk-item]`
+			))
+			// Key rows use a visual checkbox that can represent several server keys.
+			if (!items.length && form.id === 'bulkKeysForm') {
+				items.push(...document.querySelectorAll('.keys-table [data-bulk-item]'))
+			}
+			const table = form.parentElement.querySelector('.users-table')
+			const master = table ? table.querySelector('[data-bulk-select-all]') : null
+			const count = form.querySelector('[data-bulk-count]')
+			const submit = form.querySelector('[data-bulk-submit]')
+			const clear = form.querySelector('[data-bulk-clear]')
+			const action = form.querySelector('[name="bulk_action"]')
+
+			function selectedItems() {
+				return items.filter(item => item.checked)
+			}
+
+			function updateState() {
+				const selected = selectedItems()
+				if (count) count.textContent = String(selected.length)
+				if (submit) submit.disabled = selected.length === 0
+				if (clear) clear.disabled = selected.length === 0
+				if (master) {
+					master.checked = items.length > 0 && selected.length === items.length
+					master.indeterminate = selected.length > 0 && selected.length < items.length
+				}
+				items.forEach(item => {
+					const row = item.closest('tr')
+					if (row) row.classList.toggle('is-selected', item.checked)
+				})
+			}
+
+			items.forEach(item => item.addEventListener('change', updateState))
+			if (master) {
+				master.addEventListener('change', () => {
+					items.forEach(item => {
+						item.checked = master.checked
+					})
+					updateState()
+				})
+			}
+			if (clear) {
+				clear.addEventListener('click', () => {
+					items.forEach(item => {
+						item.checked = false
+					})
+					updateState()
+				})
+			}
+
+			form.addEventListener('submit', event => {
+				const selected = selectedItems()
+				const actionValue = action ? action.value : ''
+				if (!selected.length || !actionValue) {
+					event.preventDefault()
+					alert('Отметьте строки и выберите действие.')
+					return
+				}
+
+				const label = form.getAttribute('data-item-label') || 'элементов'
+				let confirmed = false
+				if (actionValue === 'delete') {
+					const entered = prompt(
+						`Будут удалены профили и доступы для ${selected.length} ${label}. Платёжный журнал сохранится для бухгалтерского учёта.\n\nДля подтверждения введите: УДАЛИТЬ`
+					)
+					confirmed = entered !== null && entered.trim().toUpperCase() === 'УДАЛИТЬ'
+				} else {
+					const actionLabel = action.options[action.selectedIndex].text
+					confirmed = confirm(
+						`${actionLabel}: ${selected.length} ${label}. Продолжить?`
+					)
+				}
+				if (!confirmed) {
+					event.preventDefault()
+					return
+				}
+
+				if (form.id === 'bulkKeysForm') {
+					form.querySelectorAll('[data-generated-key-id]').forEach(node => node.remove())
+					const keyIds = new Set()
+					selected.forEach(item => {
+						;(item.dataset.bulkValues || '').split(',').forEach(value => {
+							const normalized = value.trim()
+							if (normalized) keyIds.add(normalized)
+						})
+					})
+					keyIds.forEach(keyId => {
+						const input = document.createElement('input')
+						input.type = 'hidden'
+						input.name = 'key_ids'
+						input.value = keyId
+						input.setAttribute('data-generated-key-id', '1')
+						form.appendChild(input)
+					})
+				}
+				if (submit) {
+					submit.disabled = true
+					submit.textContent = 'Выполняется…'
+				}
+			})
+
+			updateState()
+		})
+	}
+
 	function setupToggleSections() {
 		const sections = document.querySelectorAll('[data-toggle-section]')
 		if (!sections.length) return
@@ -154,6 +262,8 @@ document.addEventListener('DOMContentLoaded', function () {
 		if (typeof Chart === 'undefined') {
 			;[trendChartCanvas, paymentChartCanvas].filter(Boolean).forEach(canvas => {
 				canvas.hidden = true
+				const chartShell = canvas.closest('.analytics-chart')
+				if (chartShell) chartShell.classList.add('is-fallback')
 				const fallback = document.createElement('p')
 				fallback.className = 'empty-state chart-fallback'
 				fallback.setAttribute('role', 'status')
@@ -633,6 +743,7 @@ document.addEventListener('DOMContentLoaded', function () {
 		toggle.addEventListener('click', () => {
 			const isOpen = nav.classList.toggle('is-open')
 			toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false')
+			toggle.textContent = isOpen ? 'Закрыть' : 'Меню'
 		})
 
 		nav.querySelectorAll('a').forEach(link => {
@@ -640,6 +751,7 @@ document.addEventListener('DOMContentLoaded', function () {
 				if (window.innerWidth <= 772) {
 					nav.classList.remove('is-open')
 					toggle.setAttribute('aria-expanded', 'false')
+					toggle.textContent = 'Меню'
 				}
 			})
 		})
@@ -678,6 +790,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
 	initializePasswordToggles()
 	setupConfirmationForms()
+	setupBulkActions()
 	setupBotControlForms()
 	setupToggleSections()
 	setupCopyButtons()

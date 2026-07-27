@@ -7,51 +7,57 @@
 	<h2>Список пользователей</h2>
 
 	<div class="admin-summary-grid">
-		<div class="admin-summary-card">
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='all') }}">
 			<span>Всего пользователей</span>
 			<strong>{{ user_metrics.total_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+		<a class="admin-summary-card metric-link is-positive" href="{{ url_for('users_page', status='paid') }}">
 			<span>Платные</span>
 			<strong>{{ user_metrics.paid_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+		<a class="admin-summary-card metric-link {{ 'has-attention' if user_metrics.paid_expired_users else '' }}" href="{{ url_for('users_page', status='paid_expired') }}">
 			<span>Платные истекли</span>
 			<strong>{{ user_metrics.paid_expired_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
-			<span>Бесплатный доступ</span>
-			<strong>{{ user_metrics.free_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='trial') }}">
 			<span>Пробные</span>
 			<strong>{{ user_metrics.trial_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+		<a class="admin-summary-card metric-link {{ 'has-attention' if user_metrics.trial_expired_users else '' }}" href="{{ url_for('users_page', status='trial_expired') }}">
 			<span>Пробные истекли</span>
 			<strong>{{ user_metrics.trial_expired_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
-			<span>Счёт не оплачен</span>
-			<strong>{{ user_metrics.payment_pending_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
-			<span>Бесплатный доступ истёк</span>
-			<strong>{{ user_metrics.free_expired_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
-			<span>Поддержка без подписки</span>
-			<strong>{{ user_metrics.support_only_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='no_subscription') }}">
 			<span>Без подписки</span>
 			<strong>{{ user_metrics.no_subscription_users }}</strong>
-		</div>
-		<div class="admin-summary-card">
+		</a>
+	</div>
+
+	<details class="secondary-metrics">
+		<summary>Остальные категории</summary>
+		<div class="admin-summary-grid">
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='free') }}">
+			<span>Бесплатный доступ</span>
+			<strong>{{ user_metrics.free_users }}</strong>
+		</a>
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='payment_pending') }}">
+			<span>Счёт не оплачен</span>
+			<strong>{{ user_metrics.payment_pending_users }}</strong>
+		</a>
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='free_expired') }}">
+			<span>Бесплатный доступ истёк</span>
+			<strong>{{ user_metrics.free_expired_users }}</strong>
+		</a>
+		<a class="admin-summary-card metric-link" href="{{ url_for('users_page', status='support_only') }}">
+			<span>Поддержка без подписки</span>
+			<strong>{{ user_metrics.support_only_users }}</strong>
+		</a>
+		<a class="admin-summary-card metric-link {{ 'has-attention' if user_metrics.banned_users else '' }}" href="{{ url_for('users_page', status='banned') }}">
 			<span>Забаненные</span>
 			<strong>{{ user_metrics.banned_users }}</strong>
+		</a>
 		</div>
-	</div>
+	</details>
 
 	<div class="table-toolbar">
 		<form class="table-tools" method="get" action="{{ url_for('users_page') }}">
@@ -78,10 +84,35 @@
 		</div>
 	</div>
 
+	<form id="bulkUsersForm" action="{{ url_for('bulk_users_route') }}" method="post"
+		class="bulk-action-form" data-bulk-form data-item-label="пользователей">
+		<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+		<label class="bulk-selection-count" aria-live="polite">
+			Выбрано: <strong data-bulk-count>0</strong>
+		</label>
+		<select name="bulk_action" class="form-control" aria-label="Массовое действие" required>
+			<option value="">Выберите действие</option>
+			<option value="ban">Заблокировать</option>
+			<option value="unban">Разблокировать</option>
+			<option value="revoke">Отозвать все ключи</option>
+			<option value="delete">Удалить профили</option>
+		</select>
+		<button type="submit" class="button button-small button-primary" disabled data-bulk-submit>
+			Применить
+		</button>
+		<button type="button" class="button button-small button-secondary" disabled data-bulk-clear>
+			Снять выбор
+		</button>
+		<small>Действие применяется только к отмеченным строкам на этой странице.</small>
+	</form>
+
 	<div class="table-scroll">
 		<table class="users-table">
 			<thead>
 				<tr>
+					<th class="selection-cell">
+						<input type="checkbox" data-bulk-select-all aria-label="Выбрать всех пользователей на странице">
+					</th>
 					<th>Telegram ID</th>
 					<th>Username</th>
 					<th>Email для чеков</th>
@@ -94,6 +125,11 @@
 				{% for user in users %}
 				{% set subscription = user.subscription_summary %}
 				<tr id="user-{{ user.telegram_id }}" data-status="{{ subscription.status }}" data-search="{{ user.telegram_id }} {{ user.username or '' }} {{ user.receipt_email or '' }} {{ subscription.label }}">
+					<td class="selection-cell">
+						<input type="checkbox" name="user_ids" value="{{ user.telegram_id }}"
+							form="bulkUsersForm" data-bulk-item
+							aria-label="Выбрать пользователя {{ user.telegram_id }}">
+					</td>
 					<td>{{ user.telegram_id }}</td>
 					<td>@{{ user.username or 'N/A' }}</td>
 					<td>{{ user.receipt_email or '—' }}</td>
@@ -172,7 +208,7 @@
 							</form>
 							{% endif %}
 							<form action="{{ url_for('delete_user_route', user_id=user.telegram_id) }}" method="post"
-								data-confirm="ВНИМАНИЕ! Это действие полностью удалит пользователя и все его данные (включая оплаты/историю) и попытается удалить ключи с серверов. Продолжить?"
+								data-confirm="ВНИМАНИЕ! Профиль и доступы пользователя будут удалены. Платёжный журнал сохранится для корректного бухгалтерского учёта. Продолжить?"
 								data-confirm-text="{{ user.telegram_id }}"
 								style="display:inline;">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -196,7 +232,7 @@
 					</td>
 				</tr>
 				{% else %}
-				<tr><td colspan="6"><p class="empty-state">Пользователи по заданным условиям не найдены.</p></td></tr>
+				<tr><td colspan="7"><p class="empty-state">Пользователи по заданным условиям не найдены.</p></td></tr>
 				{% endfor %}
 			</tbody>
 		</table>

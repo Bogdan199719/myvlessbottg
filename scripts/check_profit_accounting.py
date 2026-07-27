@@ -18,15 +18,28 @@ def main() -> int:
         encoding="utf-8"
     )
     required_fragments = (
-        'request.form.get("revenue_rub")',
-        "default_revenue = get_paid_revenue_between(period_start, period_end)",
+        "Revenue is always rebuilt from the paid transaction journal.",
+        "revenue = get_paid_revenue_between(period_start, period_end)",
         'revenue_rub=calculated["revenue_rub"]',
+        "Invalid partner shares in settings",
+        "vlad_net = profit_pool - bogdan_profit",
     )
     missing = [fragment for fragment in required_fragments if fragment not in app_source]
     if missing:
         print("Profit accounting checks FAILED:")
         for fragment in missing:
             print(f" - missing edit-route fragment: {fragment}")
+        return 1
+
+    database_source = (
+        root / "src/shop_bot/data_manager/database.py"
+    ).read_text(encoding="utf-8")
+    delete_user_source = database_source.split(
+        "def delete_user_everywhere(", 1
+    )[1].split("\ndef ", 1)[0]
+    if "DELETE FROM transactions" in delete_user_source:
+        print("Profit accounting checks FAILED:")
+        print(" - deleting a user still deletes immutable payment journal rows")
         return 1
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -38,6 +51,18 @@ def main() -> int:
         database.run_migration()
 
         with sqlite3.connect(database.DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO users (telegram_id, username) VALUES (?, ?)",
+                (999001, "ledger-delete-check"),
+            )
+            conn.execute(
+                """
+                INSERT INTO transactions
+                    (payment_id, user_id, status, amount_rub, created_date)
+                VALUES (?, ?, 'paid', ?, ?)
+                """,
+                ("deletion-ledger", 999001, 50.0, "2026-06-04 12:00:00"),
+            )
             conn.executemany(
                 """
                 INSERT INTO transactions
@@ -71,6 +96,23 @@ def main() -> int:
                     ),
                 ),
             )
+
+        if not database.delete_user_everywhere(999001):
+            print("Profit accounting checks FAILED:")
+            print(" - test user profile deletion failed")
+            return 1
+        with sqlite3.connect(database.DB_FILE) as conn:
+            deleted_user = conn.execute(
+                "SELECT 1 FROM users WHERE telegram_id = ?", (999001,)
+            ).fetchone()
+            preserved_payment = conn.execute(
+                "SELECT 1 FROM transactions WHERE payment_id = ?",
+                ("deletion-ledger",),
+            ).fetchone()
+        if deleted_user or not preserved_payment:
+            print("Profit accounting checks FAILED:")
+            print(" - profile deletion did not preserve the payment journal")
+            return 1
 
         revenue = database.get_paid_revenue_between(
             "2026-06-02 00:00:00", "2026-06-03 00:00:00"
@@ -120,6 +162,15 @@ def main() -> int:
                     f"{start_at!r} -> {end_at!r}: expected {expected}, got {actual}"
                 )
                 return 1
+
+        if not database.mark_profit_distribution_paid(distribution_id):
+            print("Profit accounting checks FAILED:")
+            print(" - failed to mark the test distribution as paid")
+            return 1
+        if database.void_profit_distribution(distribution_id):
+            print("Profit accounting checks FAILED:")
+            print(" - a paid distribution can still be voided")
+            return 1
 
     print("Profit accounting checks: OK")
     return 0

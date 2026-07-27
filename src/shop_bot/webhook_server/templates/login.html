@@ -10,7 +10,15 @@
 
 <body class="login-page">
 	<div class="login-container">
+		<div class="login-brand" aria-label="MyVlessBot">
+			<span class="header-brand-mark">MV</span>
+			<span>
+				<strong>MyVlessBot</strong>
+				<small>Управление сервисом</small>
+			</span>
+		</div>
 		<h1>Вход в панель</h1>
+		<p class="login-intro">Оплаты, подписки, ключи и состояние ботов в одном месте.</p>
 
 		{% with messages = get_flashed_messages(with_categories=true) %} {% if
 		messages %} {% for category, message in messages %}
@@ -31,6 +39,7 @@
 				Войти
 			</button>
 		</form>
+		<p class="login-security-note">Доступ только для администратора.</p>
 	</div>
 </body>
 

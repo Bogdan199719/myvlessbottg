@@ -237,20 +237,20 @@
 
 <p class="settings-page-intro">Выберите раздел или прокрутите страницу: все настройки остаются доступны в одной форме сохранения.</p>
 <nav class="settings-category-tabs" aria-label="Основные разделы настроек">
-	<a href="#hosts"><span aria-hidden="true">🖥️</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
-	<a href="#subscription-settings"><span aria-hidden="true">🔗</span><span>Подписка<small>Happ, автовыбор и обновление</small></span></a>
-	<a href="#ip-limit-settings"><span aria-hidden="true">🛡️</span><span>Лимит IP<small>Настройка и журнал событий</small></span></a>
-	<a href="#payment-settings"><span aria-hidden="true">💳</span><span>Платежи<small>YooKassa, P2P, Stars и CryptoBot</small></span></a>
-	<a href="#bot-settings"><span aria-hidden="true">🤖</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
-	<a href="#panel-settings"><span aria-hidden="true">🔐</span><span>Панель и бэкапы<small>Доступ, экспорт и восстановление</small></span></a>
+	<a href="#hosts"><span aria-hidden="true">01</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
+	<a href="#subscription-settings"><span aria-hidden="true">02</span><span>Подписка<small>Happ, автовыбор и обновление</small></span></a>
+	<a href="#ip-limit-settings"><span aria-hidden="true">03</span><span>Лимит IP<small>Настройка и журнал событий</small></span></a>
+	<a href="#payment-settings"><span aria-hidden="true">04</span><span>Платежи<small>YooKassa, P2P, Stars и CryptoBot</small></span></a>
+	<a href="#bot-settings"><span aria-hidden="true">05</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
+	<a href="#panel-settings"><span aria-hidden="true">06</span><span>Панель и бэкапы<small>Доступ, экспорт и восстановление</small></span></a>
 </nav>
 
 {% macro pay_rules_section(context_key, host_plans, pay_rules) %}
 {%- set ml = [
-  ('yookassa',   '🏦 YooKassa'),
-  ('stars',      '⭐ Stars'),
-  ('p2p',        '💳 P2P'),
-  ('cryptobot',  '🤖 CryptoBot'),
+  ('yookassa',   'YooKassa'),
+  ('stars',      'Stars'),
+  ('p2p',        'P2P'),
+  ('cryptobot',  'CryptoBot'),
 ] -%}
 <div class="payment-rules-section">
   <div class="payment-rules-head">

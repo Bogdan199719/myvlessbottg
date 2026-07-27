@@ -70,7 +70,7 @@
 	<div class="section-head">
 		<div>
 			<h3>Параметры расчёта</h3>
-			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, затем минус серверы и делёж прибыли: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
+				<span class="panel-note">Все деньги сначала получает Влад: налог {{ profit.settings.vlad_tax_percent|round(2) }}% удерживается со всей выручки, затем вычитаются серверы и остаток делится: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%.</span>
 		</div>
 		<form class="profit-settings-form" action="{{ url_for('update_profit_settings_route') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -79,7 +79,7 @@
 				<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ profit.settings.vlad_tax_percent }}">
 			</label>
 			<label>
-				<span>Серверы, ₽</span>
+				<span>Серверы по умолчанию при закрытии, ₽</span>
 				<input type="number" name="server_cost_rub" min="0" step="0.01" value="{{ profit.settings.server_cost_rub }}">
 			</label>
 			<button type="submit" class="button button-small button-secondary">Сохранить</button>
@@ -141,6 +141,10 @@
 				<span>Вручную по</span>
 				<input class="form-control" type="datetime-local" name="custom_period_end" value="{{ profit.now_input }}">
 			</label>
+			<label>
+				<span>Серверы за этот период, ₽</span>
+				<input class="form-control" type="number" name="server_cost_rub" min="0" step="0.01" value="{{ profit.settings.server_cost_rub }}">
+			</label>
 			<input class="form-control" type="text" name="note" placeholder="Заметка к фиксации">
 			<div class="profit-preview" id="profitDistributionPreview" aria-live="polite">
 				<div><span>Период</span><strong data-profit-preview="period">—</strong></div>
@@ -168,6 +172,7 @@
 						<th>Период</th>
 						<th>Статус</th>
 						<th>Выручка</th>
+						<th>Сверка с журналом</th>
 						<th>Богдан</th>
 						<th>Влад чистыми</th>
 						<th>Правка</th>
@@ -184,14 +189,25 @@
 							</td>
 							<td><span class="profit-status profit-status-{{ row.status }}">{{ row.status_label }}</span></td>
 							<td><strong>{{ "%.0f"|format(row.revenue_rub) }} ₽</strong></td>
+							<td>
+								{% if row.is_reconciled %}
+								<span class="profit-status profit-status-paid">сходится</span>
+								{% else %}
+								<span class="profit-status profit-status-void">расхождение {{ "%+.2f"|format(row.reconciliation_delta_rub) }} ₽</span>
+								<small>журнал: {{ "%.2f"|format(row.journal_revenue_rub) }} ₽</small>
+								{% endif %}
+							</td>
 						<td>{{ "%.0f"|format(row.bogdan_profit_rub) }} ₽</td>
 						<td>{{ "%.0f"|format(row.vlad_net_rub) }} ₽</td>
 						<td>
+							{% if row.status == 'active' %}
+							<details class="profit-row-edit">
+								<summary class="button button-tiny button-secondary">Изменить</summary>
 							<form class="profit-edit-form" action="{{ url_for('update_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<input type="text" name="period_start" value="{{ row.period_start or '' }}" placeholder="начало">
 								<input type="text" name="period_end" value="{{ row.period_end }}" placeholder="конец">
-								<input type="number" name="revenue_rub" min="0" step="0.01" value="{{ row.revenue_rub }}">
+								<span class="panel-note">Выручка пересчитывается из журнала оплат при сохранении.</span>
 								<input type="hidden" name="bogdan_share_percent" value="{{ row.bogdan_share_percent }}">
 								<input type="hidden" name="vlad_share_percent" value="{{ row.vlad_share_percent }}">
 								<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ row.vlad_tax_percent }}">
@@ -199,6 +215,10 @@
 								<input type="text" name="note" value="{{ row.note or '' }}" placeholder="заметка">
 								<button type="submit" class="button button-tiny button-secondary">Сохранить</button>
 							</form>
+							</details>
+							{% else %}
+							<span class="panel-note">закрыто</span>
+							{% endif %}
 						</td>
 						<td>
 							{% if row.status == 'active' %}
@@ -207,11 +227,6 @@
 								<button type="submit" class="button button-tiny button-success">Выплачено</button>
 							</form>
 							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить эту фиксацию? Платежи не удалятся, период снова попадёт в расчёт к распределению.">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-tiny button-warning">Отменить</button>
-							</form>
-							{% elif row.status == 'paid' %}
-							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить выплаченную фиксацию? Период снова попадёт в расчёт к распределению.">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<button type="submit" class="button button-tiny button-warning">Отменить</button>
 							</form>
@@ -435,4 +450,7 @@
 
 <script nonce="{{ csp_nonce() }}" id="chart-data" type="application/json">{{ analytics | tojson }}</script>
 
+{% endblock %}
+{% block page_scripts %}
+<script nonce="{{ csp_nonce() }}" src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
 {% endblock %}
