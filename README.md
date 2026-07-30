@@ -1,96 +1,100 @@
 # MyVlessBot
 
-Telegram-бот для продажи VPN и Telegram Proxy с веб-админкой, SQLite и автоматической выдачей доступов через 3x-ui и MTG AdminPanel.
+[![CI](https://github.com/Bogdan199719/myvlessbottg/actions/workflows/validate.yml/badge.svg)](https://github.com/Bogdan199719/myvlessbottg/actions/workflows/validate.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-## Что есть в проекте
+Telegram-бот для продажи VPN и Telegram Proxy: веб-админка, SQLite и автоматическая выдача доступов через 3x-ui и MTG AdminPanel.
 
-- основной Telegram-бот на `aiogram 3`;
-- отдельный support-бот с forum topics в группе поддержки;
-- Flask-админка с авторизацией, статистикой, управлением пользователями, хостами, тарифами и платежами;
+> Для production обязателен домен с HTTPS: subscription-ссылки и Happ deeplink используют ваш `DOMAIN`. Docker намеренно публикует приложение только на `127.0.0.1:1488`; наружу его должен отдавать reverse proxy.
+
+## Возможности
+
+- основной Telegram-бот на `aiogram 3` и отдельный support-бот с forum topics;
+- Flask-админка: пользователи, тарифы, хосты, платежи, резервные копии и статистика;
 - единая VPN-подписка `ALL` со ссылкой `/sub/...` на все активные XUI-хосты;
-- виртуальный сервер `⚡ Автовыбор` с распределением пользователей по здоровым XUI-хостам;
-- предупреждение и автоматический IP-лимит 3x-ui с настраиваемым порогом для защиты от передачи подписки;
-- trial-период для VPN в логике глобальной подписки с общей `/sub/...` ссылкой и самовосстановлением недостающих хостов;
-- Telegram Proxy через MTG-хосты;
-- оплаты через YooKassa, Telegram Stars, CryptoBot и ручной P2P;
-- фоновые проверки: уведомления об истечении, синхронизация с панелями, обслуживание ключей, авто-провижининг глобальных подписок.
+- `⚡ Автовыбор`, мониторинг здоровья хостов и настраиваемый IP-лимит 3x-ui;
+- VPN trial, Telegram Proxy через MTG, YooKassa, Telegram Stars, CryptoBot и ручной P2P;
+- фоновые уведомления, синхронизация с панелями и восстановление неполной выдачи доступа.
 
-## Стек
+## Как это устроено
 
-- Python `3.10+`
-- `aiogram`, `Flask`, `Waitress`
-- `SQLite`
-- `py3xui`
-- `aiohttp`
-- `docker compose`
+```mermaid
+flowchart LR
+    U[Пользователь Telegram] --> B[aiogram bot]
+    A[Администратор] --> P[HTTPS reverse proxy]
+    P --> W[Flask admin & subscription API]
+    B <--> D[(SQLite)]
+    W <--> D
+    B --> X[3x-ui]
+    B --> M[MTG AdminPanel]
+```
 
 ## Быстрый старт
 
+Требования: Docker Compose, домен с настроенной DNS-записью и доступные порты `80`/`443` для HTTPS.
+
+### Автоматическая установка на Ubuntu/Debian
+
+Скрипт установит зависимости, запросит конфигурацию, настроит Nginx и Let's Encrypt:
+
 ```bash
+git clone https://github.com/Bogdan199719/myvlessbottg.git
+cd myvlessbottg
+bash install.sh
+```
+
+Запускайте его на чистом сервере с правом `sudo`. Перед запуском убедитесь, что DNS домена уже указывает на сервер.
+
+### Ручной запуск
+
+```bash
+git clone https://github.com/Bogdan199719/myvlessbottg.git
+cd myvlessbottg
 cp .env.example .env
+chmod 600 .env
+# Заполните минимум TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, DOMAIN,
+# FLASK_SECRET_KEY, PANEL_LOGIN и PANEL_PASSWORD.
 docker compose up -d --build
-docker compose logs -f
+curl -fsS http://127.0.0.1:1488/healthz
 ```
 
-После первого запуска приложение:
-- создаёт/обновляет `users.db`;
-- переносит базовые значения из `.env` в таблицу `bot_settings`;
-- поднимает Flask на порту `1488`;
-- запускает основной бот, если заполнены `TELEGRAM_BOT_TOKEN` и `ADMIN_TELEGRAM_ID`; `TELEGRAM_BOT_USERNAME` можно указать вручную или получить автоматически через Bot API;
-- запускает support-бот, если заполнены `SUPPORT_BOT_TOKEN` и `support_group_id` в настройках.
+Затем настройте Nginx или Caddy перед контейнером. Готовый пример Nginx, TLS и порядок обновления описаны в [руководстве по деплою](docs/deployment.md#reverse-proxy-и-https).
 
-## Основные пути
+После первого запуска приложение создаёт или мигрирует `users.db` и переносит стартовые значения из `.env` в `bot_settings`. Админка доступна по `https://<DOMAIN>/login`; используйте `PANEL_LOGIN` и `PANEL_PASSWORD` из первоначального `.env`. Дальнейшие рабочие настройки редактируются в админке.
 
-- `src/shop_bot/__main__.py` — общий entrypoint
-- `src/shop_bot/bot/` — пользовательский бот и support-бот
-- `src/shop_bot/data_manager/` — SQLite, миграции, scheduler
-- `src/shop_bot/modules/` — интеграции с 3x-ui и MTG
-- `src/shop_bot/webhook_server/` — веб-админка и subscription API
-- `scripts/` — служебные проверки и очистка cache-артефактов
+## Проверка перед выкладкой
 
-## Support tickets
-
-- support-бот создаёт и поддерживает `forum topic` на пользователя в группе поддержки;
-- состояние тикета и история переписки сохраняются в SQLite, а не только в Telegram;
-- если topic удалён или сломан, следующий входящий message пытается восстановить тикет в новом topic без потери истории;
-- веб-админка больше не показывает отдельный раздел тикетов; support flow работает через Telegram и хранение истории в БД.
-
-## Проверки перед выкладкой
+В контейнере уже есть runtime-зависимости проекта:
 
 ```bash
-python3 -m compileall -q src scripts
-python3 scripts/check_callbacks.py
-python3 scripts/check_fsm_transitions.py
-python3 scripts/check_host_cleanup.py
-python3 scripts/check_payment_safety.py
-python3 scripts/check_profit_accounting.py
-python3 scripts/check_auto_selector.py
-python3 scripts/check_happ_subscription_metadata.py
-python3 scripts/check_ip_limit_rules.py
-python3 scripts/check_proxy_keyboard.py
-python3 scripts/check_scheduler_integrations.py
-python3 scripts/check_subscription_business_rules.py
-python3 scripts/check_subscription_consistency.py
-python3 scripts/check_xui_connection_equivalence.py
-python3 scripts/check_settings_defaults.py
+docker compose exec -T bot python3 -m compileall -q src scripts
+docker compose exec -T bot python3 scripts/check_callbacks.py
+docker compose exec -T bot python3 scripts/check_subscription_business_rules.py
+docker compose exec -T bot python3 scripts/check_subscription_consistency.py
 ```
 
-`scripts/check_subscription_consistency.py` по умолчанию маскирует Telegram ID и usernames в выводе. Для ручного локального разбора конкретных пользователей используйте `--show-identities`.
+Полный список проверок и назначение каждой команды — в [deployment guide](docs/deployment.md#проверки-перед-деплоем). Проверка consistency по умолчанию маскирует Telegram ID и usernames; `--show-identities` используйте только при доверенной локальной диагностике.
 
 ## Документация
 
-- `docs/architecture.md` — карта модулей и связей
-- `docs/bot-flow.md` — пользовательские сценарии бота
-- `docs/admin-panel.md` — разделы и действия в админке
-- `docs/deployment.md` — запуск, backup/import, обновление
-- `docs/env.md` — переменные окружения и настройки
-- `docs/codebase-audit.md` — итог аудита, явный мусор и спорные места
+- [Архитектура](docs/architecture.md) — модули, данные и интеграции.
+- [Сценарии бота](docs/bot-flow.md) — путь пользователя, trial, оплата и поддержка.
+- [Админ-панель](docs/admin-panel.md) — разделы и действия с production-эффектом.
+- [Деплой](docs/deployment.md) — HTTPS, backup/restore, обновление и проверки.
+- [Переменные окружения](docs/env.md) — `.env` и настройки `bot_settings`.
+- [История аудитов](docs/codebase-audit.md) — исправления и известные ограничения.
 
-## Важные замечания
+## Структура
 
-- В проекте нет отдельной очереди и внешнего брокера: фоновые задачи работают в одном процессе через `asyncio`.
-- `users.db`, `.env` и локальные backup-файлы считаются runtime-данными и не должны удаляться автоматически.
-- `install.sh` создаёт `.env` с правами `600`; при ручном создании файла выставляйте такие же права.
-- Backup/import из админки работает с `.env` только по явному выбору в форме, а не автоматически.
-- Встроенное обновление из админки теперь отказывается работать при dirty git worktree, чтобы не потерять локальные изменения.
-- Интеграция 3x-ui поддерживает legacy `/panel/api/inbounds/*` endpoints и новые `/panel/api/clients/*` endpoints, которые появились в актуальных версиях панели.
+- `src/shop_bot/bot/` — пользовательский и support-боты;
+- `src/shop_bot/data_manager/` — SQLite, миграции и scheduler;
+- `src/shop_bot/modules/` — интеграции 3x-ui и MTG;
+- `src/shop_bot/webhook_server/` — админка и subscription API;
+- `scripts/` — проверки и обслуживание;
+- `docs/` — эксплуатационная документация.
+
+## Безопасность и данные
+
+Не публикуйте `.env`, `users.db`, backup-файлы, токены или пароли. Они исключены из Git; права на `.env` должны быть `600`. Уязвимости не публикуйте в Issues — используйте порядок из [SECURITY.md](SECURITY.md).
+
+Лицензия: [GPL-3.0](LICENSE).

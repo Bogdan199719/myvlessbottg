@@ -3,7 +3,9 @@ content %}
 
 <div class="page-header">
     <h1>Управление ключами</h1>
-    <div class="page-actions">
+    <details class="maintenance-panel">
+        <summary class="button button-secondary">Обслуживание системы</summary>
+        <div class="page-actions maintenance-actions">
         <form action="{{ url_for('maintenance_route') }}" method="POST"
             onsubmit="return confirm('Запустить комплексное обслуживание: синхронизация конфигов + исправление параметров клиентов?');">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -19,15 +21,19 @@ content %}
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="button button-warning">Исправить параметры клиентов</button>
         </form>
-    </div>
+        </div>
+    </details>
 </div>
 
+<details class="maintenance-help">
+    <summary>Что делают операции обслуживания</summary>
 <div class="maintenance-hint">
     <strong>Что делают кнопки:</strong>
     <span><b>Синхронизировать конфиги</b> обновляет ссылки (connection string) в БД.</span>
     <span><b>Исправить параметры клиентов</b> чинит параметры flow/encryption/limit на панели XUI.</span>
     <span><b>Комплексное обслуживание</b> выполняет обе операции подряд.</span>
 </div>
+</details>
 
 <div class="admin-summary-grid">
     <div class="admin-summary-card">
@@ -91,11 +97,33 @@ content %}
     </div>
 </div>
 
+<form id="bulkKeysForm" action="{{ url_for('bulk_keys_route') }}" method="post"
+    class="bulk-action-form" data-bulk-form data-item-label="ключей">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label class="bulk-selection-count" aria-live="polite">
+        Выбрано строк: <strong data-bulk-count>0</strong>
+    </label>
+    <select name="bulk_action" class="form-control" aria-label="Массовое действие с ключами" required>
+        <option value="">Выберите действие</option>
+        <option value="revoke">Отозвать выбранные ключи</option>
+    </select>
+    <button type="submit" class="button button-small button-danger" disabled data-bulk-submit>
+        Применить
+    </button>
+    <button type="button" class="button button-small button-secondary" disabled data-bulk-clear>
+        Снять выбор
+    </button>
+    <small>Глобальная строка включает все показанные в ней серверные ключи.</small>
+</form>
+
 <section class="keys-section">
     <div class="table-scroll">
         <table class="users-table keys-table">
             <thead>
                 <tr>
+                    <th class="selection-cell">
+                        <input type="checkbox" data-bulk-select-all aria-label="Выбрать все строки ключей на странице">
+                    </th>
                     <th>ID</th>
                     <th>Хост</th>
                     <th>Email</th>
@@ -112,7 +140,7 @@ content %}
                 {% set global_keys = row.global_keys %}
                 {% if row.show_group_header %}
                 <tr class="key-user-group-row" data-group-row="{{ user.user_id }}">
-                    <td colspan="7" class="key-user-group-cell">
+                    <td colspan="8" class="key-user-group-cell">
                         <strong class="key-user-name">
                             <a href="{{ url_for('users_page', q=user.user_id) }}#user-{{ user.user_id }}">{{ user.username }}</a>
                         </strong>
@@ -127,6 +155,11 @@ content %}
                     data-key-trial="{{ '1' if user.is_trial else '0' }}"
                     data-key-status="{{ first_key.expiry_status.filter }}"
                     data-key-search="{{ user.user_id }} {{ user.username }} global {% for g in global_keys %}{{ g.host_name }} {{ g.key_email }} {% endfor %}">
+                    <td class="selection-cell">
+                        <input type="checkbox" data-bulk-item
+                            data-bulk-values="{% for g in global_keys %}{{ g.key_id }}{% if not loop.last %},{% endif %}{% endfor %}"
+                            aria-label="Выбрать глобальные ключи пользователя {{ user.user_id }}">
+                    </td>
                     <td>—</td>
                     <td>
                         <strong>
@@ -200,6 +233,10 @@ content %}
                     data-key-trial="{{ '1' if key.is_trial else '0' }}"
                     data-key-status="{{ key.expiry_status.filter }}"
                     data-key-search="{{ user.user_id }} {{ user.username }} {{ key.host_name }} {{ key.key_email }} {{ key.key_id }}">
+                    <td class="selection-cell">
+                        <input type="checkbox" data-bulk-item data-bulk-values="{{ key.key_id }}"
+                            aria-label="Выбрать ключ {{ key.key_id }}">
+                    </td>
                     <td>{{ key.key_id }}</td>
                     <td>
                         <strong>{{ key.host_name }}</strong><br>
@@ -282,7 +319,7 @@ content %}
                 </tr>
                 {% endif %}
                 {% else %}
-                <tr><td colspan="7"><p class="empty-state">Ключи по заданным условиям не найдены.</p></td></tr>
+                <tr><td colspan="8"><p class="empty-state">Ключи по заданным условиям не найдены.</p></td></tr>
                 {% endfor %}
             </tbody>
         </table>

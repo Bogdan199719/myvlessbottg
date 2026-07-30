@@ -53,9 +53,7 @@ DEFAULT_BOT_SETTINGS = {
     "panel_login": os.getenv("PANEL_LOGIN", "admin"),
     "panel_password": os.getenv("PANEL_PASSWORD"),
     "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
-    "admin_ip_allowlist": os.getenv(
-        "ADMIN_IP_ALLOWLIST", "94.183.234.189 79.139.250.224"
-    ),
+    "admin_ip_allowlist": os.getenv("ADMIN_IP_ALLOWLIST", ""),
     "show_about_menu_item": "true",
     "about_text": None,
     "terms_url": None,
@@ -104,6 +102,7 @@ DEFAULT_BOT_SETTINGS = {
     "ip_limit_enabled": "true",
     "ip_limit_max_ips": "10",
     "ip_limit_warning_grace_hours": "24",
+    "ip_limit_activity_window_minutes": "10",
     "p2p_enabled": "false",
     "p2p_card_number": None,
     "enable_global_plans": "true",
@@ -286,6 +285,57 @@ def initialize_db():
                 "CREATE INDEX IF NOT EXISTS idx_xui_ip_limit_events_state "
                 "ON xui_ip_limit_events(state, last_exceeded_at DESC)"
             )
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS xui_ip_limit_user_events (
+                    user_id INTEGER PRIMARY KEY,
+                    observed_ip_count INTEGER NOT NULL DEFAULT 0,
+                    limit_count INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'candidate',
+                    consecutive_exceeded INTEGER NOT NULL DEFAULT 0,
+                    first_exceeded_at TEXT NOT NULL,
+                    last_exceeded_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    warned_at TEXT,
+                    enforced_at TEXT,
+                    resolved_at TEXT,
+                    notification_error TEXT
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xui_ip_limit_user_events_state "
+                "ON xui_ip_limit_user_events(state, last_exceeded_at DESC)"
+            )
+            # Preserve decisions already enforced by the legacy per-key monitor.
+            # Warnings are intentionally not migrated because the new detector
+            # requires a complete, fresh, subscription-wide snapshot.
+            cursor.execute("""
+                INSERT INTO xui_ip_limit_user_events (
+                    user_id, observed_ip_count, limit_count, state,
+                    consecutive_exceeded, first_exceeded_at,
+                    last_exceeded_at, last_checked_at, warned_at,
+                    enforced_at, resolved_at, notification_error
+                )
+                SELECT
+                    user_id,
+                    MAX(observed_ip_count),
+                    MAX(limit_count),
+                    'enforced',
+                    0,
+                    MIN(first_exceeded_at),
+                    MAX(last_exceeded_at),
+                    MAX(last_checked_at),
+                    MIN(warned_at),
+                    MAX(enforced_at),
+                    NULL,
+                    MAX(notification_error)
+                FROM xui_ip_limit_events
+                WHERE state='enforced'
+                GROUP BY user_id
+                ON CONFLICT(user_id) DO NOTHING
+            """)
+            # ``run_migration`` opens its own SQLite connection below.
+            # Release the write transaction created by the legacy-state import.
+            conn.commit()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS mtg_hosts (
                     host_name TEXT NOT NULL PRIMARY KEY,
@@ -1383,7 +1433,10 @@ def process_xui_ip_limit_observations(
                 existing = dict(existing_row) if existing_row else None
 
                 if observed_count > limit_count:
-                    if not existing or existing.get("state") == "resolved":
+                    if not existing or existing.get("state") in {
+                        "resolved",
+                        "released",
+                    }:
                         cursor.execute(
                             """
                             INSERT INTO xui_ip_limit_events (
@@ -1484,7 +1537,10 @@ def process_xui_ip_limit_observations(
                         )
                     continue
 
-                if not existing or existing.get("state") == "resolved":
+                if not existing or existing.get("state") in {
+                    "resolved",
+                    "released",
+                }:
                     continue
 
                 cursor.execute(
@@ -1562,6 +1618,597 @@ def get_enforced_xui_ip_limit_key_ids() -> set[int]:
     except sqlite3.Error as e:
         logger.error("Failed to load enforced XUI IP-limit keys: %s", e)
         return set()
+
+
+def enforce_xui_ip_limit_now(key_id: int) -> dict | None:
+    """Move one warned key to enforcement immediately by administrator action."""
+    try:
+        safe_key_id = int(key_id)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            row = cursor.execute(
+                """
+                SELECT key_id, user_id, host_name, key_email
+                FROM xui_ip_limit_events
+                WHERE key_id=? AND state='warning'
+                """,
+                (safe_key_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_events
+                SET state='enforced', enforced_at=?, resolved_at=NULL
+                WHERE key_id=? AND state='warning'
+                """,
+                (_now_iso(), safe_key_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            conn.commit()
+            return dict(row)
+    except sqlite3.Error as e:
+        logger.error("Failed to enforce XUI IP limit for key %s: %s", key_id, e)
+        return None
+
+
+def release_xui_ip_limits(key_ids: list[int] | None = None) -> list[dict]:
+    """Release enforced native limits while keeping an auditable event record.
+
+    ``None`` releases every enforced key. An explicit list limits the operation
+    to those key IDs. Released events are terminal, so a later breach starts a
+    fresh warning and grace-period cycle.
+    """
+    normalized_ids: list[int] | None = None
+    if key_ids is not None:
+        normalized_ids = []
+        for key_id in key_ids:
+            try:
+                normalized_ids.append(int(key_id))
+            except (TypeError, ValueError):
+                continue
+        normalized_ids = sorted(set(normalized_ids))
+        if not normalized_ids:
+            return []
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where_sql = "state='enforced'"
+            params: list[int] = []
+            if normalized_ids is not None:
+                placeholders = ",".join("?" for _ in normalized_ids)
+                where_sql += f" AND key_id IN ({placeholders})"
+                params.extend(normalized_ids)
+
+            rows = cursor.execute(
+                f"""
+                SELECT key_id, user_id, host_name, key_email
+                FROM xui_ip_limit_events
+                WHERE {where_sql}
+                ORDER BY key_id
+                """,
+                params,
+            ).fetchall()
+            if not rows:
+                return []
+
+            released_at = _now_iso()
+            released_ids = [int(row["key_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in released_ids)
+            cursor.execute(
+                f"""
+                UPDATE xui_ip_limit_events
+                SET state='released', resolved_at=?
+                WHERE state='enforced' AND key_id IN ({placeholders})
+                """,
+                [released_at, *released_ids],
+            )
+            conn.commit()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to release XUI IP limits: %s", e)
+        return []
+
+
+def prune_xui_ip_limit_history(retention_days: int = 7) -> int:
+    """Delete completed IP-limit events after the audit retention period."""
+    try:
+        safe_retention_days = max(1, int(retention_days))
+    except (TypeError, ValueError):
+        safe_retention_days = 7
+    cutoff = (
+        time_utils.get_msk_now() - timedelta(days=safe_retention_days)
+    ).isoformat()
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM xui_ip_limit_events
+                WHERE state IN ('resolved', 'released')
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = max(0, int(cursor.rowcount))
+            conn.commit()
+            return deleted
+    except sqlite3.Error as e:
+        logger.error("Failed to prune XUI IP-limit history: %s", e)
+        return 0
+
+
+def process_xui_ip_limit_user_observations(
+    observations: list[dict],
+    limit_count: int,
+    warning_grace_hours: int,
+    confirmation_checks: int = 2,
+    clean_minutes: int = 60,
+    confirmation_gap_minutes: int = 15,
+) -> dict:
+    """Process one privacy-preserving, subscription-wide IP count per user."""
+    result = {"warnings": [], "enforced": [], "resolved": []}
+    if not observations:
+        return result
+
+    limit_count = max(1, int(limit_count))
+    warning_grace_hours = max(1, int(warning_grace_hours))
+    confirmation_checks = max(1, int(confirmation_checks))
+    clean_minutes = max(1, int(clean_minutes))
+    confirmation_gap_minutes = max(1, int(confirmation_gap_minutes))
+    now = time_utils.get_msk_now()
+    now_text = _now_iso()
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            for observation in observations:
+                try:
+                    user_id = int(observation["user_id"])
+                    observed_count = max(
+                        0,
+                        int(observation.get("ip_count", 0)),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                row = cursor.execute(
+                    """
+                    SELECT *
+                    FROM xui_ip_limit_user_events
+                    WHERE user_id=?
+                    """,
+                    (user_id,),
+                ).fetchone()
+                existing = dict(row) if row else None
+                state = str(existing.get("state") or "") if existing else ""
+
+                if observed_count > limit_count:
+                    if not existing or state in {"resolved", "released"}:
+                        initial_state = (
+                            "warning"
+                            if confirmation_checks == 1
+                            else "candidate"
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO xui_ip_limit_user_events (
+                                user_id, observed_ip_count, limit_count, state,
+                                consecutive_exceeded, first_exceeded_at,
+                                last_exceeded_at, last_checked_at, warned_at,
+                                enforced_at, resolved_at, notification_error
+                            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, NULL)
+                            ON CONFLICT(user_id) DO UPDATE SET
+                                observed_ip_count=excluded.observed_ip_count,
+                                limit_count=excluded.limit_count,
+                                state=excluded.state,
+                                consecutive_exceeded=1,
+                                first_exceeded_at=excluded.first_exceeded_at,
+                                last_exceeded_at=excluded.last_exceeded_at,
+                                last_checked_at=excluded.last_checked_at,
+                                warned_at=NULL,
+                                enforced_at=NULL,
+                                resolved_at=NULL,
+                                notification_error=NULL
+                            """,
+                            (
+                                user_id,
+                                observed_count,
+                                limit_count,
+                                initial_state,
+                                now_text,
+                                now_text,
+                                now_text,
+                            ),
+                        )
+                        if initial_state == "warning":
+                            result["warnings"].append(
+                                {
+                                    "user_id": user_id,
+                                    "ip_count": observed_count,
+                                    "limit_count": limit_count,
+                                }
+                            )
+                        continue
+
+                    if state == "candidate":
+                        previous_check = time_utils.parse_iso_to_msk(
+                            existing.get("last_checked_at")
+                        )
+                        is_consecutive = bool(
+                            previous_check
+                            and now - previous_check
+                            <= timedelta(minutes=confirmation_gap_minutes)
+                        )
+                        consecutive = (
+                            int(existing.get("consecutive_exceeded") or 0) + 1
+                            if is_consecutive
+                            else 1
+                        )
+                        next_state = (
+                            "warning"
+                            if consecutive >= confirmation_checks
+                            else "candidate"
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE xui_ip_limit_user_events
+                            SET observed_ip_count=?, limit_count=?, state=?,
+                                consecutive_exceeded=?, last_exceeded_at=?,
+                                last_checked_at=?,
+                                first_exceeded_at=CASE
+                                    WHEN ? THEN first_exceeded_at
+                                    ELSE ?
+                                END,
+                                resolved_at=NULL
+                            WHERE user_id=?
+                            """,
+                            (
+                                observed_count,
+                                limit_count,
+                                next_state,
+                                consecutive,
+                                now_text,
+                                now_text,
+                                1 if is_consecutive else 0,
+                                now_text,
+                                user_id,
+                            ),
+                        )
+                        if next_state == "warning":
+                            result["warnings"].append(
+                                {
+                                    "user_id": user_id,
+                                    "ip_count": observed_count,
+                                    "limit_count": limit_count,
+                                }
+                            )
+                        continue
+
+                    cursor.execute(
+                        """
+                        UPDATE xui_ip_limit_user_events
+                        SET observed_ip_count=?, limit_count=?,
+                            consecutive_exceeded=consecutive_exceeded + 1,
+                            last_exceeded_at=?, last_checked_at=?,
+                            resolved_at=NULL
+                        WHERE user_id=?
+                        """,
+                        (
+                            observed_count,
+                            limit_count,
+                            now_text,
+                            now_text,
+                            user_id,
+                        ),
+                    )
+                    warned_at = time_utils.parse_iso_to_msk(
+                        existing.get("warned_at")
+                    )
+                    if (
+                        state == "warning"
+                        and warned_at
+                        and now - warned_at
+                        >= timedelta(hours=warning_grace_hours)
+                    ):
+                        cursor.execute(
+                            """
+                            UPDATE xui_ip_limit_user_events
+                            SET state='enforced', enforced_at=?
+                            WHERE user_id=? AND state='warning'
+                            """,
+                            (now_text, user_id),
+                        )
+                        result["enforced"].append(
+                            {
+                                "user_id": user_id,
+                                "ip_count": observed_count,
+                                "limit_count": limit_count,
+                            }
+                        )
+                    elif state == "warning" and not warned_at:
+                        result["warnings"].append(
+                            {
+                                "user_id": user_id,
+                                "ip_count": observed_count,
+                                "limit_count": limit_count,
+                            }
+                        )
+                    continue
+
+                if not existing or state in {"resolved", "released"}:
+                    continue
+                if state == "candidate":
+                    cursor.execute(
+                        """
+                        DELETE FROM xui_ip_limit_user_events
+                        WHERE user_id=? AND state='candidate'
+                        """,
+                        (user_id,),
+                    )
+                    continue
+
+                cursor.execute(
+                    """
+                    UPDATE xui_ip_limit_user_events
+                    SET observed_ip_count=?, limit_count=?,
+                        consecutive_exceeded=0, last_checked_at=?
+                    WHERE user_id=?
+                    """,
+                    (observed_count, limit_count, now_text, user_id),
+                )
+                last_exceeded_at = time_utils.parse_iso_to_msk(
+                    existing.get("last_exceeded_at")
+                )
+                if (
+                    state == "warning"
+                    and last_exceeded_at
+                    and now - last_exceeded_at
+                    >= timedelta(minutes=clean_minutes)
+                ):
+                    cursor.execute(
+                        """
+                        UPDATE xui_ip_limit_user_events
+                        SET state='resolved', resolved_at=?
+                        WHERE user_id=? AND state='warning'
+                        """,
+                        (now_text, user_id),
+                    )
+                    result["resolved"].append({"user_id": user_id})
+
+            conn.commit()
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logger.error("Failed to process global XUI IP-limit observations: %s", e)
+
+    return result
+
+
+def mark_xui_ip_limit_user_warning_result(
+    user_id: int,
+    notification_error: str | None = None,
+) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_user_events
+                SET warned_at=?, notification_error=?
+                WHERE user_id=? AND state='warning' AND warned_at IS NULL
+                """,
+                (
+                    _now_iso(),
+                    (notification_error or "")[:500] or None,
+                    int(user_id),
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logger.error(
+            "Failed to mark global XUI IP-limit warning for user %s: %s",
+            user_id,
+            e,
+        )
+        return False
+
+
+def get_enforced_xui_ip_limit_user_ids() -> set[int]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE state='enforced'
+                """
+            ).fetchall()
+            return {int(row[0]) for row in rows}
+    except sqlite3.Error as e:
+        logger.error("Failed to load globally limited XUI users: %s", e)
+        return set()
+
+
+def get_pending_xui_ip_limit_user_ids() -> set[int]:
+    """Return candidates/warnings so missing or expired subscriptions can clear."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE state IN ('candidate', 'warning')
+                """
+            ).fetchall()
+            return {int(row[0]) for row in rows}
+    except sqlite3.Error as e:
+        logger.error("Failed to load pending global XUI IP-limit users: %s", e)
+        return set()
+
+
+def enforce_xui_ip_limit_user_now(user_id: int) -> dict | None:
+    try:
+        safe_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            row = cursor.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE user_id=? AND state='warning'
+                """,
+                (safe_user_id,),
+            ).fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_user_events
+                SET state='enforced', enforced_at=?, resolved_at=NULL
+                WHERE user_id=? AND state='warning'
+                """,
+                (_now_iso(), safe_user_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            conn.commit()
+            return dict(row)
+    except sqlite3.Error as e:
+        logger.error(
+            "Failed to enforce global XUI IP limit for user %s: %s",
+            user_id,
+            e,
+        )
+        return None
+
+
+def release_xui_ip_limit_users(
+    user_ids: list[int] | None = None,
+) -> list[dict]:
+    normalized_ids: list[int] | None = None
+    if user_ids is not None:
+        normalized_ids = []
+        for user_id in user_ids:
+            try:
+                normalized_ids.append(int(user_id))
+            except (TypeError, ValueError):
+                continue
+        normalized_ids = sorted(set(normalized_ids))
+        if not normalized_ids:
+            return []
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where_sql = "state='enforced'"
+            params: list[int] = []
+            if normalized_ids is not None:
+                placeholders = ",".join("?" for _ in normalized_ids)
+                where_sql += f" AND user_id IN ({placeholders})"
+                params.extend(normalized_ids)
+            rows = cursor.execute(
+                f"""
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE {where_sql}
+                ORDER BY user_id
+                """,
+                params,
+            ).fetchall()
+            if not rows:
+                return []
+            released_ids = [int(row["user_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in released_ids)
+            cursor.execute(
+                f"""
+                UPDATE xui_ip_limit_user_events
+                SET state='released', resolved_at=?
+                WHERE state='enforced'
+                  AND user_id IN ({placeholders})
+                """,
+                [_now_iso(), *released_ids],
+            )
+            conn.commit()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to release global XUI IP limits: %s", e)
+        return []
+
+
+def get_xui_ip_limit_user_events(limit: int = 100) -> list[dict]:
+    try:
+        safe_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        safe_limit = 100
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT e.*, u.username
+                FROM xui_ip_limit_user_events AS e
+                LEFT JOIN users AS u ON u.telegram_id=e.user_id
+                WHERE e.state <> 'candidate'
+                ORDER BY
+                    CASE e.state
+                        WHEN 'enforced' THEN 0
+                        WHEN 'warning' THEN 1
+                        ELSE 2
+                    END,
+                    e.last_exceeded_at DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to load global XUI IP-limit events: %s", e)
+        return []
+
+
+def prune_xui_ip_limit_user_history(retention_days: int = 7) -> int:
+    try:
+        safe_retention_days = max(1, int(retention_days))
+    except (TypeError, ValueError):
+        safe_retention_days = 7
+    cutoff = (
+        time_utils.get_msk_now() - timedelta(days=safe_retention_days)
+    ).isoformat()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM xui_ip_limit_user_events
+                WHERE state IN ('resolved', 'released')
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = max(0, int(cursor.rowcount))
+            conn.commit()
+            return deleted
+    except sqlite3.Error as e:
+        logger.error("Failed to prune global XUI IP-limit history: %s", e)
+        return 0
 
 
 def get_xui_ip_limit_events(limit: int = 100) -> list[dict]:
@@ -2090,7 +2737,7 @@ def void_profit_distribution(distribution_id: int) -> bool:
                 """
                 UPDATE profit_distributions
                 SET status = 'void', updated_at = ?
-                WHERE distribution_id = ? AND status IN ('active', 'paid')
+                WHERE distribution_id = ? AND status = 'active'
                 """,
                 (_now_iso(), distribution_id),
             )
@@ -4400,6 +5047,7 @@ def delete_keys_by_ids(key_ids: list[int]) -> int:
 
 
 def delete_user_everywhere(user_id: int) -> bool:
+    """Delete an operational user profile while preserving the payment ledger."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -4408,7 +5056,8 @@ def delete_user_everywhere(user_id: int) -> bool:
                 "UPDATE users SET referred_by = NULL WHERE referred_by = ?", (user_id,)
             )
             cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            # Transactions are accounting records. Removing them would rewrite
+            # historical revenue and invalidate closed profit distributions.
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
             )

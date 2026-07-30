@@ -141,7 +141,7 @@
 	}
 	.settings-status-row {
 		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
+		grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
 		gap: .65rem;
 		margin: 1rem 0 1.15rem;
 	}
@@ -237,20 +237,20 @@
 
 <p class="settings-page-intro">Выберите раздел или прокрутите страницу: все настройки остаются доступны в одной форме сохранения.</p>
 <nav class="settings-category-tabs" aria-label="Основные разделы настроек">
-	<a href="#hosts"><span aria-hidden="true">🖥️</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
-	<a href="#subscription-settings"><span aria-hidden="true">🔗</span><span>Подписка<small>Happ, автовыбор и обновление</small></span></a>
-	<a href="#ip-limit-settings"><span aria-hidden="true">🛡️</span><span>Лимит IP<small>Настройка и журнал событий</small></span></a>
-	<a href="#payment-settings"><span aria-hidden="true">💳</span><span>Платежи<small>YooKassa, P2P, Stars и CryptoBot</small></span></a>
-	<a href="#bot-settings"><span aria-hidden="true">🤖</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
-	<a href="#panel-settings"><span aria-hidden="true">🔐</span><span>Панель и бэкапы<small>Доступ, экспорт и восстановление</small></span></a>
+	<a href="#hosts"><span aria-hidden="true">01</span><span>Серверы<small>VPN, MTG и тарифы</small></span></a>
+	<a href="#subscription-settings"><span aria-hidden="true">02</span><span>Подписка<small>Happ, автовыбор и обновление</small></span></a>
+	<a href="#ip-limit-settings"><span aria-hidden="true">03</span><span>Лимит IP<small>Настройка и журнал событий</small></span></a>
+	<a href="#payment-settings"><span aria-hidden="true">04</span><span>Платежи<small>YooKassa, P2P, Stars и CryptoBot</small></span></a>
+	<a href="#bot-settings"><span aria-hidden="true">05</span><span>Боты и контент<small>Telegram, поддержка и тексты</small></span></a>
+	<a href="#panel-settings"><span aria-hidden="true">06</span><span>Панель и бэкапы<small>Доступ, экспорт и восстановление</small></span></a>
 </nav>
 
 {% macro pay_rules_section(context_key, host_plans, pay_rules) %}
 {%- set ml = [
-  ('yookassa',   '🏦 YooKassa'),
-  ('stars',      '⭐ Stars'),
-  ('p2p',        '💳 P2P'),
-  ('cryptobot',  '🤖 CryptoBot'),
+  ('yookassa',   'YooKassa'),
+  ('stars',      'Stars'),
+  ('p2p',        'P2P'),
+  ('cryptobot',  'CryptoBot'),
 ] -%}
 <div class="payment-rules-section">
   <div class="payment-rules-head">
@@ -1066,7 +1066,7 @@
 
 			<section class="settings-section settings-section-accent" id="ip-limit-settings">
 				<h2>🛡️ Лимит IP и подозрительная активность</h2>
-				<p class="settings-section-intro">Сначала пользователь получает предупреждение. Ограничение включается только после указанного льготного периода.</p>
+				<p class="settings-section-intro">Активные IP считаются по всей подписке. Сначала пользователь получает предупреждение, а ограничение включается после льготного периода или досрочно администратором.</p>
 				<div class="settings-status-row" aria-label="Текущее состояние защиты подписок">
 					<div class="settings-status-card">
 						<small>Контроль</small>
@@ -1079,6 +1079,10 @@
 					<div class="settings-status-card">
 						<small>Событий в журнале</small>
 						<strong>{{ ip_limit_events|length }}</strong>
+					</div>
+					<div class="settings-status-card">
+						<small>Активных ограничений</small>
+						<strong>{{ ip_limit_enforced_count }}</strong>
 					</div>
 				</div>
 				<div class="form-group form-group-checkbox">
@@ -1103,58 +1107,139 @@
 								value="{{ settings.ip_limit_warning_grace_hours or '24' }}" />
 							<small class="field-hint">В часах. До окончания этого времени подключения не ограничиваются.</small>
 						</div>
+						<div class="form-group">
+							<label for="ip_limit_activity_window_minutes">Окно активности IP:</label>
+							<input type="number" id="ip_limit_activity_window_minutes"
+								name="ip_limit_activity_window_minutes" min="1" max="60" step="1"
+								value="{{ settings.ip_limit_activity_window_minutes or '10' }}" />
+							<small class="field-hint">Учитываются только IP, замеченные панелью за последние минуты. Рекомендуется 10.</small>
+						</div>
 					</div>
 					<p class="field-help">
-						Проверка выполняется каждые 5 минут. IP-адреса остаются на VPN-панелях:
-						бот хранит только количество. После предупреждения и льготного периода 3x-ui
-						отключает только подключения сверх лимита. Ограничение считается для каждой
-						VPN-конфигурации на сервере и не является точным счётчиком физических устройств.
+						Проверка выполняется каждые 5 минут. Превышение подтверждается двумя проверками
+						подряд. Одинаковый внешний IP на разных VPN-серверах считается один раз; сырые
+						IP бот не сохраняет и не пишет в журнал. После предупреждения и льготного периода
+						заданный лимит 3x-ui выставляется на всех конфигурациях пользователя. Сам 3x-ui
+						применяет его отдельно на каждой конфигурации, поэтому это защита от раздачи
+						подписки, а не точный счётчик физических устройств.
 					</p>
 				</div>
-				{% if ip_limit_events %}
 				<div class="form-group">
-					<h3>Превышения и подозрительная активность</h3>
+					<h3>Требуют внимания</h3>
+					<div class="ip-limit-bulk-actions">
+						<p class="field-hint">Активных ограничений: {{ ip_limit_enforced_count }}. Снятие не отключает мониторинг.</p>
+						{% if ip_limit_enforced_count %}
+						<button type="submit"
+							class="button button-warning button-small"
+							formaction="{{ url_for('release_all_ip_limits_route') }}"
+							formmethod="post"
+							onclick="return confirm('Снять все активные ограничения ({{ ip_limit_enforced_count }})? Мониторинг продолжит работу и повторные превышения будут зарегистрированы заново.');">
+							Снять все активные ограничения
+						</button>
+						{% else %}
+						<button type="button" class="button button-secondary button-small button-disabled" disabled>
+							Нет активных ограничений
+						</button>
+						{% endif %}
+					</div>
+					{% if ip_limit_active_events %}
 					<div class="table-scroll">
 						<table class="users-table">
 							<thead>
 								<tr>
 									<th>Пользователь</th>
-									<th>Сервер</th>
-									<th>IP</th>
+									<th>Активные IP по подписке</th>
 									<th>Состояние</th>
 									<th>Последнее превышение</th>
+									<th>Действие</th>
 								</tr>
 							</thead>
 							<tbody>
-								{% for event in ip_limit_events %}
+								{% for event in ip_limit_active_events %}
 								<tr>
 									<td>
 										{% if event.username %}@{{ event.username }}<br>{% endif %}
 										<small>ID {{ event.user_id }}</small>
 									</td>
-									<td>{{ event.host_name }}</td>
 									<td><strong>{{ event.observed_ip_count }}</strong> / {{ event.limit_count }}</td>
 									<td>
 										{% if event.state == 'enforced' %}
 										<span class="status-badge status-stopped">Ограничение активно</span>
 										{% elif event.state == 'warning' %}
 										<span class="status-badge status-warning">Предупреждён</span>
-										{% else %}
-										<span class="status-badge status-active">Нормализовано</span>
 										{% endif %}
 										{% if event.notification_error %}
 										<br><small>Telegram: сообщение не доставлено</small>
 										{% endif %}
 									</td>
 									<td>{{ event.last_exceeded_at }}</td>
+									<td>
+										{% if event.state == 'warning' %}
+										<button type="submit"
+											class="button button-danger button-tiny"
+											formaction="{{ url_for('enforce_ip_limit_route', user_id=event.user_id) }}"
+											formmethod="post"
+											onclick="return confirm('Выставить заданный лимит на всех VPN-конфигурациях пользователя сейчас, не дожидаясь окончания льготного периода?');">
+											Ограничить сейчас
+										</button>
+										{% elif event.state == 'enforced' %}
+										<button type="submit"
+											class="button button-warning button-tiny"
+											formaction="{{ url_for('release_ip_limit_route', user_id=event.user_id) }}"
+											formmethod="post"
+											onclick="return confirm('Снять ограничение со всех VPN-конфигураций пользователя? При повторном превышении начнётся новый цикл предупреждения.');">
+											Снять
+										</button>
+										{% else %}
+										<span aria-hidden="true">—</span>
+										{% endif %}
+									</td>
 								</tr>
 								{% endfor %}
 							</tbody>
 						</table>
 					</div>
+					{% else %}
+					<p class="settings-empty-state">✓ Сейчас нет пользователей, требующих внимания.</p>
+					{% endif %}
 				</div>
-				{% else %}
-				<p class="settings-empty-state">✓ Превышений пока не зафиксировано. Когда появится событие, таблица будет показана здесь автоматически.</p>
+
+				{% if ip_limit_history_events %}
+				<details class="ip-limit-history">
+					<summary>История завершённых событий ({{ ip_limit_history_events|length }})</summary>
+					<p class="field-hint">Нормализованные и снятые администратором события автоматически удаляются через 7 дней.</p>
+					<div class="table-scroll">
+						<table class="users-table">
+							<thead>
+								<tr>
+									<th>Пользователь</th>
+									<th>Последний замер по подписке</th>
+									<th>Результат</th>
+									<th>Завершено</th>
+								</tr>
+							</thead>
+							<tbody>
+								{% for event in ip_limit_history_events %}
+								<tr>
+									<td>
+										{% if event.username %}@{{ event.username }}<br>{% endif %}
+										<small>ID {{ event.user_id }}</small>
+									</td>
+									<td><strong>{{ event.observed_ip_count }}</strong> / {{ event.limit_count }}</td>
+									<td>
+										{% if event.state == 'released' %}
+										<span class="status-badge status-info">Снято администратором</span>
+										{% else %}
+										<span class="status-badge status-active">Нормализовано</span>
+										{% endif %}
+									</td>
+									<td>{{ event.resolved_at or event.last_checked_at }}</td>
+								</tr>
+								{% endfor %}
+							</tbody>
+						</table>
+					</div>
+				</details>
 				{% endif %}
 			</section>
 

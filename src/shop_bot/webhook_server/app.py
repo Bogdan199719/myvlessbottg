@@ -18,6 +18,7 @@ import time as _time
 from collections import defaultdict
 from hmac import compare_digest
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from shop_bot.utils import time_utils, update_manager
 from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
@@ -63,7 +64,10 @@ from shop_bot.data_manager.database import (
     update_setting,
     get_all_hosts,
     get_all_xui_host_health,
-    get_xui_ip_limit_events,
+    get_enforced_xui_ip_limit_user_ids,
+    get_xui_ip_limit_user_events,
+    enforce_xui_ip_limit_user_now,
+    release_xui_ip_limit_users,
     get_plans_for_host,
     create_host,
     delete_host,
@@ -757,6 +761,7 @@ ALL_SETTINGS_KEYS = [
     "ip_limit_enabled",
     "ip_limit_max_ips",
     "ip_limit_warning_grace_hours",
+    "ip_limit_activity_window_minutes",
     "subscription_live_sync",
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
@@ -1286,6 +1291,19 @@ def create_webhook_app(bot_controller_instance):
         vlad_share = _parse_percent_value(
             settings.get("profit_vlad_share_percent"), 60.0
         )
+        # The partner agreement is deliberately kept explicit here: all receipts
+        # first belong to Vlad, he pays 9% tax from the full revenue, and the
+        # remaining pool is divided 40% / 60%.  Never silently distribute an
+        # over- or under-allocated pool because of a damaged setting value.
+        if abs((bogdan_share + vlad_share) - 100.0) > 0.000001:
+            logger.error(
+                "Invalid partner shares in settings: Bogdan=%s, Vlad=%s. "
+                "Using contractual 40/60 shares.",
+                bogdan_share,
+                vlad_share,
+            )
+            bogdan_share, vlad_share = 40.0, 60.0
+
         return {
             "bogdan_share_percent": bogdan_share,
             "vlad_share_percent": vlad_share,
@@ -1298,33 +1316,44 @@ def create_webhook_app(bot_controller_instance):
         }
 
     def _calculate_partner_profit(revenue_rub: float, settings: dict) -> dict:
-        revenue = max(0.0, float(revenue_rub or 0.0))
-        bogdan_share = float(settings["bogdan_share_percent"])
-        vlad_share = float(settings["vlad_share_percent"])
-        tax_percent = float(settings["vlad_tax_percent"])
-        server_cost = float(settings["server_cost_rub"])
+        money = Decimal("0.01")
+        revenue = max(Decimal("0"), Decimal(str(revenue_rub or 0))).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
+        bogdan_share = Decimal(str(settings["bogdan_share_percent"]))
+        vlad_share = Decimal(str(settings["vlad_share_percent"]))
+        tax_percent = Decimal(str(settings["vlad_tax_percent"]))
+        server_cost = max(
+            Decimal("0"), Decimal(str(settings["server_cost_rub"]))
+        ).quantize(money, rounding=ROUND_HALF_UP)
 
-        total_tax = revenue * tax_percent / 100
+        # Contractual order: revenue -> Vlad's tax -> server costs -> 40/60.
+        total_tax = (revenue * tax_percent / Decimal("100")).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
         revenue_after_tax = revenue - total_tax
         profit_pool = revenue_after_tax - server_cost
-        bogdan_profit = profit_pool * bogdan_share / 100
-        vlad_net = profit_pool * vlad_share / 100
+        bogdan_profit = (profit_pool * bogdan_share / Decimal("100")).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
+        # Keep the recorded partner amounts exactly equal to the pool to kopeck.
+        vlad_net = profit_pool - bogdan_profit
 
         return {
-            "revenue_rub": round(revenue, 2),
-            "revenue_after_tax_rub": round(revenue_after_tax, 2),
-            "profit_pool_rub": round(profit_pool, 2),
-            "bogdan_share_percent": bogdan_share,
-            "vlad_share_percent": vlad_share,
-            "vlad_tax_percent": tax_percent,
-            "server_cost_rub": round(server_cost, 2),
-            "server_share_rub": round(server_cost, 2),
-            "bogdan_gross_rub": round(bogdan_profit, 2),
-            "bogdan_profit_rub": round(bogdan_profit, 2),
-            "vlad_gross_rub": round(vlad_net, 2),
-            "vlad_tax_rub": round(total_tax, 2),
-            "vlad_net_rub": round(vlad_net, 2),
-            "total_net_rub": round(bogdan_profit + vlad_net, 2),
+            "revenue_rub": float(revenue),
+            "revenue_after_tax_rub": float(revenue_after_tax),
+            "profit_pool_rub": float(profit_pool),
+            "bogdan_share_percent": float(bogdan_share),
+            "vlad_share_percent": float(vlad_share),
+            "vlad_tax_percent": float(tax_percent),
+            "server_cost_rub": float(server_cost),
+            "server_share_rub": float(server_cost),
+            "bogdan_gross_rub": float(bogdan_profit),
+            "bogdan_profit_rub": float(bogdan_profit),
+            "vlad_gross_rub": float(vlad_net),
+            "vlad_tax_rub": float(total_tax),
+            "vlad_net_rub": float(vlad_net),
+            "total_net_rub": float(bogdan_profit + vlad_net),
         }
 
     def _month_bounds(now: datetime, offset: int = 0) -> tuple[datetime, datetime]:
@@ -1506,8 +1535,17 @@ def create_webhook_app(bot_controller_instance):
             item["vlad_display"] = _profit_display_amount(calculation.get("vlad_net_rub"))
         history = get_profit_distributions(limit=8, include_void=True)
         for row in history:
+            journal_revenue = get_paid_revenue_between(
+                row.get("period_start"), row.get("period_end")
+            )
+            reconciliation_delta = round(
+                float(row.get("revenue_rub") or 0) - journal_revenue, 2
+            )
             row["period_start_label"] = _format_profit_dt(row.get("period_start"))
             row["period_end_label"] = _format_profit_dt(row.get("period_end"))
+            row["journal_revenue_rub"] = journal_revenue
+            row["reconciliation_delta_rub"] = reconciliation_delta
+            row["is_reconciled"] = abs(reconciliation_delta) < 0.01
             row["status_label"] = {
                 "active": "рассчитано",
                 "paid": "выплачено",
@@ -2013,6 +2051,56 @@ def create_webhook_app(bot_controller_instance):
                 f"Операция с XUI-панелью превысила лимит ожидания ({timeout}с). Проверьте доступность сервера."
             ) from exc
 
+    async def _sync_ip_limit_value(events: list[dict], limit_count: int) -> dict:
+        """Apply one native IP-limit value to the selected XUI keys."""
+        safe_limit_count = max(0, int(limit_count))
+        desired_by_host: dict[str, dict[str, dict]] = {}
+        for event in events:
+            host_name = str(event.get("host_name") or "")
+            key_email = str(event.get("key_email") or "")
+            if not host_name or not key_email:
+                continue
+            desired_by_host.setdefault(host_name, {})[key_email] = {
+                "ip_limit": safe_limit_count
+            }
+
+        results = await asyncio.gather(
+            *(
+                xui_api.sync_clients_state_on_host(host_name, desired_by_email)
+                for host_name, desired_by_email in desired_by_host.items()
+            )
+        )
+        return {
+            "targeted": len(events),
+            "checked": sum(int(item.get("checked", 0)) for item in results),
+            "updated": sum(int(item.get("updated", 0)) for item in results),
+            "not_found": sum(int(item.get("not_found", 0)) for item in results),
+            "errors": sum(int(item.get("errors", 0)) for item in results),
+        }
+
+    def _ip_limit_targets_for_users(user_ids: list[int]) -> list[dict]:
+        """Expand a global user decision to every XUI key in their subscription."""
+        targets: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for user_id in sorted(set(int(value) for value in user_ids)):
+            for key in get_user_keys(user_id):
+                if str(key.get("service_type") or "xui") != "xui":
+                    continue
+                host_name = str(key.get("host_name") or "")
+                key_email = str(key.get("key_email") or "")
+                identity = (host_name, key_email)
+                if not host_name or not key_email or identity in seen:
+                    continue
+                seen.add(identity)
+                targets.append(
+                    {
+                        "user_id": user_id,
+                        "host_name": host_name,
+                        "key_email": key_email,
+                    }
+                )
+        return targets
+
     def _run_auto_provision_for_global_users(context_host_name: str) -> bool:
         """Run global users auto-provisioning from admin host actions."""
         try:
@@ -2110,10 +2198,27 @@ def create_webhook_app(bot_controller_instance):
                 safe_settings[f"{secret_key}_configured"] = True
                 safe_settings[secret_key] = ""
 
+        ip_limit_events = get_xui_ip_limit_user_events(100)
+        ip_limit_active_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") in {"warning", "enforced"}
+        ]
+        ip_limit_history_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") not in {"warning", "enforced"}
+        ]
+
         return {
             "settings": safe_settings,
             "hosts": hosts,
-            "ip_limit_events": get_xui_ip_limit_events(100),
+            "ip_limit_events": ip_limit_events,
+            "ip_limit_active_events": ip_limit_active_events,
+            "ip_limit_history_events": ip_limit_history_events,
+            "ip_limit_enforced_count": len(
+                get_enforced_xui_ip_limit_user_ids()
+            ),
             "global_plans": get_plans_for_host("ALL", service_type="xui"),
             "mtg_hosts": mtg_hosts,
             "payment_rules": get_all_payment_rules(),
@@ -2346,6 +2451,11 @@ def create_webhook_app(bot_controller_instance):
             return redirect(request.referrer or url_for("dashboard_page"))
 
         revenue = get_paid_revenue_between(period_start, period_end)
+        # The default is only a convenience for the next close.  The amount is
+        # captured in this period's immutable calculation, not inferred later.
+        settings["server_cost_rub"] = _parse_money_value(
+            request.form.get("server_cost_rub"), settings["server_cost_rub"]
+        )
         calculated = _calculate_partner_profit(revenue, settings)
         distribution_id = create_profit_distribution(
             period_start=period_start,
@@ -2440,8 +2550,9 @@ def create_webhook_app(bot_controller_instance):
             )
             return redirect(request.referrer or url_for("dashboard_page"))
 
-        default_revenue = get_paid_revenue_between(period_start, period_end)
-        revenue = _parse_money_value(request.form.get("revenue_rub"), default_revenue)
+        # Revenue is always rebuilt from the paid transaction journal.  Manual
+        # entry here made a "closed" period impossible to reconcile later.
+        revenue = get_paid_revenue_between(period_start, period_end)
         calculated = _calculate_partner_profit(revenue, settings)
         ok = update_profit_distribution(
             distribution_id,
@@ -2491,9 +2602,9 @@ def create_webhook_app(bot_controller_instance):
     def void_profit_distribution_route(distribution_id: int):
         ok = void_profit_distribution(distribution_id)
         flash(
-            "Фиксация отменена. Следующий расчёт снова учтёт этот период."
+            "Невыплаченная фиксация отменена. Следующий расчёт снова учтёт этот период."
             if ok
-            else "Активная фиксация не найдена.",
+            else "Отменить можно только невыплаченную фиксацию.",
             "success" if ok else "warning",
         )
         return redirect(request.referrer or url_for("dashboard_page"))
@@ -3069,6 +3180,50 @@ def create_webhook_app(bot_controller_instance):
         )
         return _admin_secret_response(subscription_link, "Subscription URL")
 
+    @flask_app.route("/keys/bulk", methods=["POST"])
+    @login_required
+    def bulk_keys_route():
+        if (request.form.get("bulk_action") or "").strip() != "revoke":
+            flash("Выберите действие для отмеченных ключей.", "warning")
+            return redirect(url_for("keys_page"))
+
+        key_ids = _requested_bulk_ids("key_ids", limit=250)
+        if not key_ids:
+            flash("Отметьте хотя бы один ключ.", "warning")
+            return redirect(url_for("keys_page"))
+
+        revoked_ids: list[int] = []
+        skipped = 0
+        failed = 0
+        for key_id in key_ids:
+            key = get_key_by_id(key_id)
+            if not key:
+                skipped += 1
+                continue
+            try:
+                if _delete_remote_user_key(key):
+                    revoked_ids.append(key_id)
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                logger.exception("Bulk key revoke failed for key %s", key_id)
+
+        if revoked_ids:
+            local_deleted_count = delete_keys_by_ids(revoked_ids)
+            if local_deleted_count != len(revoked_ids):
+                failed += len(revoked_ids) - local_deleted_count
+        else:
+            local_deleted_count = 0
+
+        flash(
+            f"Отзыв ключей завершён: удалено — {local_deleted_count}; "
+            f"пропущено — {skipped}; с ошибкой — {failed}. "
+            "Ключи с ошибками сохранены в базе для повторной попытки.",
+            "success" if failed == 0 else "warning",
+        )
+        return redirect(url_for("keys_page"))
+
     @flask_app.route("/users/<int:user_id>/subscription-secret")
     @login_required
     def user_subscription_secret_route(user_id: int):
@@ -3482,13 +3637,19 @@ def create_webhook_app(bot_controller_instance):
                 ip_limit_grace = int(
                     request.form.get("ip_limit_warning_grace_hours", "24")
                 )
+                ip_limit_activity_window = int(
+                    request.form.get("ip_limit_activity_window_minutes", "10")
+                )
                 if not 1 <= ip_limit_max <= 100:
                     raise ValueError
                 if not 1 <= ip_limit_grace <= 168:
                     raise ValueError
+                if not 1 <= ip_limit_activity_window <= 60:
+                    raise ValueError
             except (TypeError, ValueError):
                 flash(
-                    "Лимит IP должен быть от 1 до 100, время предупреждения — от 1 до 168 часов.",
+                    "Лимит IP должен быть от 1 до 100, окно активности — от 1 "
+                    "до 60 минут, время предупреждения — от 1 до 168 часов.",
                     "danger",
                 )
                 return redirect(url_for("settings_page"))
@@ -3557,6 +3718,114 @@ def create_webhook_app(bot_controller_instance):
         return render_template(
             "settings.html", **_load_settings_page_context(), **common_data
         )
+
+    def _release_ip_limits_from_admin(user_ids: list[int] | None):
+        released = release_xui_ip_limit_users(user_ids)
+        if not released:
+            flash("Активные ограничения для снятия не найдены.", "warning")
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        released_user_ids = [int(item["user_id"]) for item in released]
+        targets = _ip_limit_targets_for_users(released_user_ids)
+        try:
+            result = _run_async(
+                _sync_ip_limit_value(targets, 0),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limits were released in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                f"В базе снято ограничений: {len(released)}. Панели не ответили сразу; "
+                "фоновая синхронизация повторит сброс автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                f"Снято ограничений: {len(released)}. Не удалось сразу обновить: "
+                f"{result['errors'] + result['not_found']}; фоновая синхронизация "
+                "повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Снято ограничений: {len(released)}. Мониторинг продолжает работу.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/enforce",
+        methods=["POST"],
+    )
+    @login_required
+    def enforce_ip_limit_route(user_id: int):
+        enforced = enforce_xui_ip_limit_user_now(user_id)
+        if not enforced:
+            flash(
+                "Предупреждение не найдено или ограничение уже применено.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        try:
+            configured_limit = max(
+                1,
+                min(int(get_setting("ip_limit_max_ips") or 10), 100),
+            )
+        except (TypeError, ValueError):
+            configured_limit = 10
+
+        try:
+            targets = _ip_limit_targets_for_users([user_id])
+            result = _run_async(
+                _sync_ip_limit_value(targets, configured_limit),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limit was enforced in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                "Ограничение включено в базе. Панель не ответила сразу; "
+                "фоновая синхронизация повторит применение автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                "Ограничение включено. Панель не подтвердила применение; "
+                "фоновая синхронизация повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Принудительное ограничение {configured_limit} IP включено "
+                "на всех конфигурациях пользователя.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/release",
+        methods=["POST"],
+    )
+    @login_required
+    def release_ip_limit_route(user_id: int):
+        return _release_ip_limits_from_admin([user_id])
+
+    @flask_app.route("/settings/ip-limit-users/release-all", methods=["POST"])
+    @login_required
+    def release_all_ip_limits_route():
+        return _release_ip_limits_from_admin(None)
 
     @flask_app.route("/start-shop-bot", methods=["POST"])
     @login_required
@@ -3637,6 +3906,58 @@ def create_webhook_app(bot_controller_instance):
         flash(f"Пользователь {user_id} был заблокирован.", "success")
         return redirect(url_for("users_page"))
 
+    def _requested_bulk_ids(field_name: str, *, limit: int = 100) -> list[int]:
+        """Parse a bounded, de-duplicated list of positive integer form IDs."""
+        parsed_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_value in request.form.getlist(field_name):
+            try:
+                item_id = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if item_id <= 0 or item_id in seen:
+                continue
+            seen.add(item_id)
+            parsed_ids.append(item_id)
+            if len(parsed_ids) >= limit:
+                break
+        return parsed_ids
+
+    def _revoke_user_keys(user_id: int) -> dict:
+        """Revoke a user's keys remotely and delete only successful local rows."""
+        keys_to_revoke = get_user_keys(user_id)
+        deleted_key_ids: list[int] = []
+        failed_keys: list[str] = []
+
+        for key in keys_to_revoke:
+            try:
+                if _delete_remote_user_key(key):
+                    if key.get("key_id") is not None:
+                        deleted_key_ids.append(int(key["key_id"]))
+                else:
+                    failed_keys.append(
+                        key.get("key_email") or f"key:{key.get('key_id')}"
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Failed to revoke key '%s' for user %s: %s",
+                    key.get("key_email"),
+                    user_id,
+                    exc,
+                    exc_info=True,
+                )
+                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
+
+        if deleted_key_ids:
+            local_deleted_count = delete_keys_by_ids(deleted_key_ids)
+            if local_deleted_count != len(deleted_key_ids):
+                failed_keys.append("ошибка удаления отозванных ключей из локальной БД")
+        return {
+            "total": len(keys_to_revoke),
+            "revoked": local_deleted_count if deleted_key_ids else 0,
+            "failed": failed_keys,
+        }
+
     @flask_app.route("/users/unban/<int:user_id>", methods=["POST"])
     @login_required
     def unban_user_route(user_id):
@@ -3647,50 +3968,80 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/revoke/<int:user_id>", methods=["POST"])
     @login_required
     def revoke_keys_route(user_id):
-        keys_to_revoke = get_user_keys(user_id)
-        success_count = 0
-        deleted_key_ids: list[int] = []
-        failed_keys: list[str] = []
-
-        for key in keys_to_revoke:
-            try:
-                result = _delete_remote_user_key(key)
-                if result:
-                    success_count += 1
-                    if key.get("key_id") is not None:
-                        deleted_key_ids.append(int(key["key_id"]))
-                else:
-                    failed_keys.append(
-                        key.get("key_email") or f"key:{key.get('key_id')}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to revoke key '{key.get('key_email')}' for user {user_id}: {e}",
-                    exc_info=True,
-                )
-                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
-
-        if deleted_key_ids:
-            delete_keys_by_ids(deleted_key_ids)
-
-        if success_count == len(keys_to_revoke):
+        result = _revoke_user_keys(user_id)
+        if not result["failed"]:
             flash(
-                f"Все {len(keys_to_revoke)} ключей для пользователя {user_id} были успешно отозваны.",
+                f"Все {result['total']} ключей для пользователя {user_id} были успешно отозваны.",
                 "success",
             )
         else:
             flash(
-                f"Удалось отозвать {success_count} из {len(keys_to_revoke)} ключей для пользователя {user_id}. "
+                f"Удалось отозвать {result['revoked']} из {result['total']} ключей для пользователя {user_id}. "
                 "Локально удалены только успешно отозванные ключи; остальные сохранены для повторной попытки.",
                 "warning",
             )
-            if failed_keys:
-                logger.warning(
-                    "User %s revoke aborted for keys still present on remote side: %s",
-                    user_id,
-                    ", ".join(failed_keys),
+            logger.warning(
+                "User %s revoke aborted for keys still present on remote side: %s",
+                user_id,
+                ", ".join(result["failed"]),
+            )
+
+        return redirect(url_for("users_page"))
+
+    @flask_app.route("/users/bulk", methods=["POST"])
+    @login_required
+    def bulk_users_route():
+        action = (request.form.get("bulk_action") or "").strip()
+        user_ids = _requested_bulk_ids("user_ids")
+        allowed_actions = {"ban", "unban", "revoke", "delete"}
+        if action not in allowed_actions or not user_ids:
+            flash("Выберите пользователей и массовое действие.", "warning")
+            return redirect(url_for("users_page"))
+
+        completed = 0
+        skipped = 0
+        failed = 0
+        for user_id in user_ids:
+            if not get_user(user_id):
+                skipped += 1
+                continue
+            try:
+                if action == "ban":
+                    ban_user(user_id)
+                elif action == "unban":
+                    unban_user(user_id)
+                elif action == "revoke":
+                    result = _revoke_user_keys(user_id)
+                    if result["failed"]:
+                        failed += 1
+                        continue
+                else:
+                    result = _revoke_user_keys(user_id)
+                    if result["failed"]:
+                        failed += 1
+                        continue
+                    if not delete_user_everywhere(user_id):
+                        failed += 1
+                        continue
+                completed += 1
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "Bulk user action '%s' failed for user %s", action, user_id
                 )
 
+        action_labels = {
+            "ban": "заблокировано",
+            "unban": "разблокировано",
+            "revoke": "ключи отозваны",
+            "delete": "удалено",
+        }
+        category = "success" if failed == 0 else "warning"
+        flash(
+            f"Массовое действие завершено: {action_labels[action]} — {completed}; "
+            f"пропущено — {skipped}; с ошибкой — {failed}.",
+            category,
+        )
         return redirect(url_for("users_page"))
 
     @flask_app.route("/users/issue-key/<int:user_id>", methods=["POST"])
@@ -3958,39 +4309,15 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/delete/<int:user_id>", methods=["POST"])
     @login_required
     def delete_user_route(user_id):
-        keys_to_revoke = get_user_keys(user_id)
-        success_count = 0
-        deleted_key_ids: list[int] = []
-        failed_keys: list[str] = []
-
-        for key in keys_to_revoke:
-            try:
-                result = _delete_remote_user_key(key)
-                if result:
-                    success_count += 1
-                    if key.get("key_id") is not None:
-                        deleted_key_ids.append(int(key["key_id"]))
-                else:
-                    failed_keys.append(
-                        key.get("key_email") or f"key:{key.get('key_id')}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete key '{key.get('key_email')}' for user {user_id}: {e}",
-                    exc_info=True,
-                )
-                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
-
-        if failed_keys:
-            if deleted_key_ids:
-                delete_keys_by_ids(deleted_key_ids)
+        result = _revoke_user_keys(user_id)
+        if result["failed"]:
             logger.warning(
                 "User %s deletion cancelled because some remote keys remain: %s",
                 user_id,
-                ", ".join(failed_keys),
+                ", ".join(result["failed"]),
             )
             flash(
-                f"Удаление пользователя {user_id} остановлено: удалось удалить {success_count} из {len(keys_to_revoke)} ключей. "
+                f"Удаление пользователя {user_id} остановлено: удалось удалить {result['revoked']} из {result['total']} ключей. "
                 "Пользователь сохранён в БД, а локально удалены только уже удалённые на сервере ключи.",
                 "warning",
             )
@@ -4004,16 +4331,10 @@ def create_webhook_app(bot_controller_instance):
             )
             return redirect(url_for("users_page"))
 
-        if success_count == len(keys_to_revoke):
-            flash(
-                f"Пользователь {user_id} и все его данные были удалены. Ключей отозвано: {success_count}.",
-                "success",
-            )
-        else:
-            flash(
-                f"Пользователь {user_id} удален из базы, но удалось отозвать {success_count} из {len(keys_to_revoke)} ключей. Проверьте логи.",
-                "warning",
-            )
+        flash(
+            f"Пользователь {user_id} и все его данные были удалены. Ключей отозвано: {result['revoked']}.",
+            "success",
+        )
 
         return redirect(url_for("users_page"))
 

@@ -10,7 +10,18 @@ CYAN='\033[0;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-PROJECT_DIR="vless-shopbot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="vless-shopbot"
+# When the script is launched from a clone, install that exact checkout instead
+# of cloning a second copy inside it.  A standalone downloaded script preserves
+# the previous default directory name.
+if [ -f "$SCRIPT_DIR/pyproject.toml" ] && [ -d "$SCRIPT_DIR/.git" ]; then
+    PROJECT_DIR="$SCRIPT_DIR"
+    USE_CURRENT_CHECKOUT=true
+else
+    PROJECT_DIR="${PROJECT_DIR:-$PROJECT_NAME}"
+    USE_CURRENT_CHECKOUT=false
+fi
 ENV_FILE=".env"
 REPO_URL="https://github.com/Bogdan199719/myvlessbottg.git"
 
@@ -55,7 +66,12 @@ check_dependencies() {
 
 setup_project() {
     echo -e "\n${CYAN}📂 Setting up project...${NC}"
-    
+
+    if [ "$USE_CURRENT_CHECKOUT" = true ]; then
+        echo -e "${GREEN}✔ Using current checkout: $PROJECT_DIR${NC}"
+        return
+    fi
+
     if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${YELLOW}Cloning repository...${NC}"
         if ! git clone "$REPO_URL" "$PROJECT_DIR"; then
@@ -132,7 +148,7 @@ setup_nginx_ssl() {
         return
     fi
     
-    NGINX_CONF="/etc/nginx/sites-available/$PROJECT_DIR.conf"
+    NGINX_CONF="/etc/nginx/sites-available/$PROJECT_NAME.conf"
     
     # Check if cert exists
     if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
@@ -172,12 +188,16 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        # Bulk admin actions may wait for several remote 3x-ui panels.
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 300s;
     }
 }
 EOF
 
     # Enable Site
-    sudo ln -sfn "$NGINX_CONF" "/etc/nginx/sites-enabled/$PROJECT_DIR.conf"
+    sudo ln -sfn "$NGINX_CONF" "/etc/nginx/sites-enabled/$PROJECT_NAME.conf"
     
     # Test and Reload
     sudo nginx -t && sudo systemctl reload nginx

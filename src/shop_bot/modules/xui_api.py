@@ -2,6 +2,9 @@ import uuid
 import time
 import json
 import asyncio
+import hashlib
+import hmac
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
@@ -30,6 +33,7 @@ _BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
 _LINK_FETCH_MAX_WORKERS = 6
+_IP_ACTIVITY_FINGERPRINT_KEY = secrets.token_bytes(32)
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
     "connection aborted",
     "connection reset",
@@ -243,37 +247,6 @@ def _is_transient_network_error(error: Exception) -> bool:
     return any(marker in error_msg for marker in _TRANSIENT_NETWORK_ERROR_MARKERS)
 
 
-def _attach_bearer_auth(api: Api, api_token: str) -> None:
-    """
-    Teach py3xui's current request layer to use 3x-ui v3 Bearer tokens.
-
-    py3xui 0.4.x only knows session-cookie requests. The 3x-ui panel now
-    accepts Authorization: Bearer <apiToken> under /panel/api/* and bypasses
-    CSRF for those callers. Keeping this adapter local lets existing cookie
-    login keep working for older panels.
-    """
-    token = api_token.strip()
-    if not token:
-        return
-
-    for api_part in (api.client, api.inbound, api.database, api.server):
-        original_request = api_part._request_with_retry
-
-        def _request_with_bearer(
-            method, url, headers, _original=original_request, **kwargs
-        ):
-            auth_headers = dict(headers or {})
-            auth_headers["Authorization"] = f"Bearer {token}"
-            return _original(method, url, auth_headers, **kwargs)
-
-        api_part.session = "__bearer_token__"
-        api_part.cookie_name = None
-        api_part._request_with_retry = _request_with_bearer
-
-    api.session = "__bearer_token__"
-    api.cookie_name = None
-
-
 def _bearer_recently_failed(host_url: str) -> bool:
     failed_at = _host_bearer_failure_cache.get(host_url)
     return bool(failed_at and time.time() - failed_at < _BEARER_FAILURE_CACHE_SECONDS)
@@ -324,10 +297,11 @@ def _set_cookie_auth(
 
 def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> bool:
     """
-    Login against 3x-ui builds that require a CSRF token on /login.
+    Explicit compatibility login for 3x-ui builds that require a CSRF token.
 
-    Newer 3x-ui SPA pages expose /csrf-token before login. py3xui 0.4.x does
-    not fetch or replay that token, so panels can return 403 on the legacy path.
+    Keeping this small fallback independent from the SDK also covers panels
+    with non-standard session-cookie behavior. The native SDK login remains
+    the final fallback for older installations.
     """
     session = requests.Session()
     csrf_url = f"{host_url.rstrip('/')}/csrf-token"
@@ -371,6 +345,32 @@ def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> b
     return False
 
 
+def _login_without_csrf(api: Api, host_url: str, username: str, password: str) -> bool:
+    """Retain cookie login compatibility with pre-CSRF 3x-ui panels."""
+    session = requests.Session()
+    login_url = f"{host_url.rstrip('/')}/login"
+    try:
+        login_response = session.post(
+            login_url,
+            headers={"Accept": "application/json"},
+            json={"username": username, "password": password},
+            timeout=10,
+        )
+        login_response.raise_for_status()
+        payload = login_response.json()
+        if not payload.get("success"):
+            return False
+
+        for cookie in session.cookies:
+            if cookie.value:
+                _set_cookie_auth(api, cookie.name, cookie.value)
+                return True
+    except Exception as e:
+        logger.debug("Legacy XUI login failed for '%s': %s", host_url, e)
+
+    return False
+
+
 def _json_string_to_dict(value):
     if isinstance(value, str):
         try:
@@ -396,9 +396,9 @@ def _normalize_inbound_payload(data: dict) -> dict:
 def _validate_inbound_payload(data: dict) -> Inbound:
     """Validate an inbound while retaining transports unknown to py3xui.
 
-    py3xui 0.4.x drops newer stream settings such as ``xhttpSettings`` from
-    its Pydantic model.  Keep the normalized raw stream payload on the model so
-    share-link generation can still include the server's transport parameters.
+    Keep the normalized raw stream payload on the model so future 3x-ui
+    transport fields remain available to share-link generation even before
+    the SDK models them explicitly.
     """
     normalized = _normalize_inbound_payload(data)
     inbound = Inbound.model_validate(normalized)
@@ -486,15 +486,21 @@ def login_to_host(
         _set_api_request_timeouts(api)
         if _login_with_csrf(api, host_url, username, password):
             return api
+        if _login_without_csrf(api, host_url, username, password):
+            return api
         api.login()
         return api
 
     for attempt in range(1, _XUI_LOGIN_ATTEMPTS + 1):
         try:
             if token and not _bearer_recently_failed(host_url):
-                api = Api(host=host_url, username=username, password=password)
+                api = Api(
+                    host=host_url,
+                    username=username,
+                    password=password,
+                    token=token,
+                )
                 _set_api_request_timeouts(api)
-                _attach_bearer_auth(api, token)
                 try:
                     target_inbound = _load_target_inbound(api)
                 except Exception as token_error:
@@ -651,8 +657,8 @@ def _build_client_for_inbound(
         identifier = email
         client_kwargs["password"] = client_identifier or str(uuid.uuid4())
     elif protocol in {"hysteria", "hysteria2"}:
-        # py3xui 0.4.0 does not model Hysteria's auth field, so Hysteria clients
-        # are created via raw API helpers instead of this pydantic model.
+        # py3xui 0.7.0 does not model Hysteria's auth field, so Hysteria clients
+        # are created via raw API helpers instead of this Pydantic model.
         client_kwargs["id"] = identifier
     else:
         client_kwargs["id"] = identifier
@@ -826,7 +832,11 @@ def _connection_string_for_client(
                 connection_string = candidate
         else:
             connection_string = candidate
-    if connection_string is None and protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
+    if (
+        connection_string is None
+        and protocol_lower in {"hysteria", "hysteria2"}
+        and client_identifier
+    ):
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
@@ -912,6 +922,46 @@ def _ip_value_from_panel_record(value) -> str | None:
     return text.split(" (", 1)[0].strip() or None
 
 
+def _ip_timestamp_from_panel_record(value) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        timestamp = float(value.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    if timestamp <= 0:
+        return None
+    return int(timestamp)
+
+
+def _fingerprint_ip(ip: str) -> str:
+    """Return a process-local fingerprint so callers never receive raw IPs."""
+    return hmac.new(
+        _IP_ACTIVITY_FINGERPRINT_KEY,
+        ip.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _activity_from_panel_values(values) -> list[dict]:
+    latest_by_fingerprint: dict[str, int] = {}
+    for value in values or []:
+        ip = _ip_value_from_panel_record(value)
+        timestamp = _ip_timestamp_from_panel_record(value)
+        if not ip or timestamp is None:
+            continue
+        fingerprint = _fingerprint_ip(ip)
+        previous = latest_by_fingerprint.get(fingerprint)
+        if previous is None or timestamp > previous:
+            latest_by_fingerprint[fingerprint] = timestamp
+    return [
+        {"fingerprint": fingerprint, "timestamp": timestamp}
+        for fingerprint, timestamp in latest_by_fingerprint.items()
+    ]
+
+
 def get_client_ip_counts_for_host(
     host_name: str, expected_emails: set[str] | None = None
 ) -> dict:
@@ -932,11 +982,10 @@ def get_client_ip_counts_for_host(
 
     wanted = set(expected_emails or ())
     try:
-        payload = _raw_api_request(
-            api, requests.get, "panel/api/server/clientIps"
-        )
+        payload = _raw_api_request(api, requests.get, "panel/api/server/clientIps")
         rows = payload.get("obj") or []
         counts: dict[str, int] = {}
+        activity: dict[str, list[dict]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -952,12 +1001,15 @@ def get_client_ip_counts_for_host(
                 if ip
             }
             counts[email] = len(unique_ips)
+            activity[email] = _activity_from_panel_values(row.get("ips") or [])
         if wanted:
             for email in wanted:
                 counts.setdefault(email, 0)
+                activity.setdefault(email, [])
         return {
             "host": host_name,
             "counts": counts,
+            "activity": activity,
             "fail2ban": get_host_fail2ban_status_from_api(api),
         }
     except Exception as bulk_error:
@@ -967,26 +1019,25 @@ def get_client_ip_counts_for_host(
     # Compatibility path for older panels. It is intentionally bounded to the
     # keys expected on this physical panel.
     counts = {}
+    activity = {}
     for email in sorted(wanted):
         values = api.client.get_ips(email) or []
         unique_ips = {
-            ip
-            for ip in (_ip_value_from_panel_record(value) for value in values)
-            if ip
+            ip for ip in (_ip_value_from_panel_record(value) for value in values) if ip
         }
         counts[email] = len(unique_ips)
+        activity[email] = _activity_from_panel_values(values)
     return {
         "host": host_name,
         "counts": counts,
+        "activity": activity,
         "fail2ban": get_host_fail2ban_status_from_api(api),
     }
 
 
 def get_host_fail2ban_status_from_api(api: Api) -> dict:
     try:
-        payload = _raw_api_request(
-            api, requests.get, "panel/api/server/fail2banStatus"
-        )
+        payload = _raw_api_request(api, requests.get, "panel/api/server/fail2banStatus")
         status = payload.get("obj") or {}
         return {
             "enabled": bool(status.get("enabled")),
@@ -1208,7 +1259,9 @@ def _get_raw_inbound_obj(api: Api, inbound_id: int) -> dict:
 def _get_raw_clients(api: Api, inbound_id: int) -> list[dict]:
     inbound_obj = _get_raw_inbound_obj(api, inbound_id)
     settings_raw = inbound_obj.get("settings") or "{}"
-    settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+    settings = (
+        json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+    )
     return settings.get("clients") or []
 
 
@@ -1626,9 +1679,7 @@ def _get_vless_connection_string(
     # Common parameters
     base_link = f"vless://{user_uuid}@{hostname}:{port}?type={network}&encryption=none"
 
-    raw_stream_settings = getattr(
-        stream_settings, "_shop_bot_raw_stream_settings", {}
-    )
+    raw_stream_settings = getattr(stream_settings, "_shop_bot_raw_stream_settings", {})
     if not isinstance(raw_stream_settings, dict):
         raw_stream_settings = {}
 
@@ -1790,6 +1841,7 @@ def update_or_create_client_on_panel(
     telegram_id: str = None,
     absolute_expiry_ms: int | None = None,
     preserve_longer_expiry: bool = True,
+    client_identifier: str | None = None,
 ) -> tuple[str | None, int | None]:
     def _is_record_not_found_error(exc: Exception) -> bool:
         return "record not found" in str(exc).lower()
@@ -1900,6 +1952,7 @@ def update_or_create_client_on_panel(
                     enable=should_enable_client,
                     expiry_time=new_expiry_ms,
                     telegram_id=telegram_id,
+                    client_identifier=client_identifier,
                 )
                 _add_raw_client(api, inbound_id, raw_client)
                 logger.info(
@@ -1979,9 +2032,7 @@ def update_or_create_client_on_panel(
                         expiry_time=new_expiry_ms,
                         telegram_id=telegram_id,
                     )
-                    _add_client_compat(
-                        api, inbound_id, recreated_client, client_uuid
-                    )
+                    _add_client_compat(api, inbound_id, recreated_client, client_uuid)
                     actual_uuid = _get_raw_client_identifier_by_email(
                         api, inbound_id, protocol, email
                     )
@@ -2014,6 +2065,7 @@ def update_or_create_client_on_panel(
                 flow=target_flow,
                 expiry_time=new_expiry_ms,
                 telegram_id=telegram_id,
+                client_identifier=client_identifier,
             )
 
             _add_client_compat(api, inbound_id, new_client, client_uuid)
@@ -2041,6 +2093,7 @@ def update_or_create_client_on_panel(
     except Exception as e:
         logger.error(f"Error in update_or_create_client_on_panel: {e}", exc_info=True)
         return None, None
+
 
 async def create_or_update_key_on_host(
     host_name: str, email: str, days_to_add: int, telegram_id: str = None
@@ -2523,6 +2576,7 @@ def _sync_clients_state_on_host_sync(
         "host": host_name,
         "checked": 0,
         "updated": 0,
+        "recreated": 0,
         "already_ok": 0,
         "not_found": 0,
         "traffic_fixed": 0,
@@ -2575,6 +2629,21 @@ def _sync_clients_state_on_host_sync(
                 result["checked"] += 1
                 raw_client = raw_clients_by_email.get(email)
                 if not raw_client:
+                    if state.get("recreate_missing"):
+                        recreated_identifier, _ = update_or_create_client_on_panel(
+                            api=api,
+                            inbound_id=inbound.id,
+                            email=email,
+                            absolute_expiry_ms=state.get("expiry_timestamp_ms"),
+                            preserve_longer_expiry=False,
+                            telegram_id=state.get("telegram_id"),
+                            client_identifier=state.get("client_identifier"),
+                        )
+                        if recreated_identifier:
+                            result["updated"] += 1
+                            result["recreated"] += 1
+                            continue
+                        result["errors"] += 1
                     result["not_found"] += 1
                     continue
 
@@ -2626,7 +2695,9 @@ def _sync_clients_state_on_host_sync(
                     changed = True
 
                 if changed:
-                    _update_raw_client(api, inbound.id, str(client_identifier), raw_client)
+                    _update_raw_client(
+                        api, inbound.id, str(client_identifier), raw_client
+                    )
                     result["updated"] += 1
                     if needs_traffic_reset:
                         _normalize_client_traffic_state(api, inbound.id, email)
@@ -2668,6 +2739,21 @@ def _sync_clients_state_on_host_sync(
             result["checked"] += 1
             client = clients_by_email.get(email)
             if not client:
+                if state.get("recreate_missing"):
+                    recreated_identifier, _ = update_or_create_client_on_panel(
+                        api=api,
+                        inbound_id=inbound.id,
+                        email=email,
+                        absolute_expiry_ms=state.get("expiry_timestamp_ms"),
+                        preserve_longer_expiry=False,
+                        telegram_id=state.get("telegram_id"),
+                        client_identifier=state.get("client_identifier"),
+                    )
+                    if recreated_identifier:
+                        result["updated"] += 1
+                        result["recreated"] += 1
+                        continue
+                    result["errors"] += 1
                 result["not_found"] += 1
                 continue
 

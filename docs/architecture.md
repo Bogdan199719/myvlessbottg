@@ -38,9 +38,11 @@
 
 3x-ui API compatibility:
 
+- `py3xui==0.7.0` provides native Bearer-token and CSRF-aware session authentication;
 - legacy panels use `/panel/api/inbounds/addClient`, `/updateClient`, `/:id/delClient` and traffic endpoints through the py3xui client;
 - current 3x-ui panels also expose `/panel/api/clients/add`, `/update/:email`, `/del/:email`, `/:email/attach`, `/resetTraffic/:email` and `/traffic/:email`;
-- integration code tries the legacy path first and falls back to the new clients API when the legacy endpoint is missing. Payloads are normalised so numeric fields such as `tgId`, `expiryTime`, `totalGB` and `limitIp` are sent as numbers for newer Go validators.
+- integration code prefers the current clients API and falls back to legacy inbound routes only when those endpoints are unavailable;
+- Hysteria/Hysteria2 clients still use the raw JSON API because the SDK client model does not expose the panel's `auth` field. Payloads are normalised so numeric fields such as `tgId`, `expiryTime`, `totalGB` and `limitIp` are sent as numbers for newer Go validators.
 
 ### Admin web layer
 
