@@ -431,6 +431,36 @@ h5 { font-size: 0.85rem; color: var(--text-dim); margin: 14px 0 8px; }
 
 .button-wide { width: 100%; }
 
+.ip-limit-bulk-actions {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin: 12px 0;
+}
+
+.ip-limit-bulk-actions p {
+	margin: 0;
+}
+
+.ip-limit-history {
+	margin-top: 16px;
+	padding: 12px 14px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	background: rgba(8, 12, 18, 0.2);
+}
+
+.ip-limit-history > summary {
+	cursor: pointer;
+	font-weight: 700;
+}
+
+.ip-limit-history > .field-hint {
+	margin: 10px 0;
+}
+
 .button-small {
 	padding: 7px 14px;
 	font-size: 0.85rem;

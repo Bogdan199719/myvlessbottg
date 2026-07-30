@@ -2,6 +2,9 @@ import uuid
 import time
 import json
 import asyncio
+import hashlib
+import hmac
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
@@ -30,6 +33,7 @@ _BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
 _LINK_FETCH_MAX_WORKERS = 6
+_IP_ACTIVITY_FINGERPRINT_KEY = secrets.token_bytes(32)
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
     "connection aborted",
     "connection reset",
@@ -912,6 +916,46 @@ def _ip_value_from_panel_record(value) -> str | None:
     return text.split(" (", 1)[0].strip() or None
 
 
+def _ip_timestamp_from_panel_record(value) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        timestamp = float(value.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    if timestamp <= 0:
+        return None
+    return int(timestamp)
+
+
+def _fingerprint_ip(ip: str) -> str:
+    """Return a process-local fingerprint so callers never receive raw IPs."""
+    return hmac.new(
+        _IP_ACTIVITY_FINGERPRINT_KEY,
+        ip.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _activity_from_panel_values(values) -> list[dict]:
+    latest_by_fingerprint: dict[str, int] = {}
+    for value in values or []:
+        ip = _ip_value_from_panel_record(value)
+        timestamp = _ip_timestamp_from_panel_record(value)
+        if not ip or timestamp is None:
+            continue
+        fingerprint = _fingerprint_ip(ip)
+        previous = latest_by_fingerprint.get(fingerprint)
+        if previous is None or timestamp > previous:
+            latest_by_fingerprint[fingerprint] = timestamp
+    return [
+        {"fingerprint": fingerprint, "timestamp": timestamp}
+        for fingerprint, timestamp in latest_by_fingerprint.items()
+    ]
+
+
 def get_client_ip_counts_for_host(
     host_name: str, expected_emails: set[str] | None = None
 ) -> dict:
@@ -937,6 +981,7 @@ def get_client_ip_counts_for_host(
         )
         rows = payload.get("obj") or []
         counts: dict[str, int] = {}
+        activity: dict[str, list[dict]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -952,12 +997,15 @@ def get_client_ip_counts_for_host(
                 if ip
             }
             counts[email] = len(unique_ips)
+            activity[email] = _activity_from_panel_values(row.get("ips") or [])
         if wanted:
             for email in wanted:
                 counts.setdefault(email, 0)
+                activity.setdefault(email, [])
         return {
             "host": host_name,
             "counts": counts,
+            "activity": activity,
             "fail2ban": get_host_fail2ban_status_from_api(api),
         }
     except Exception as bulk_error:
@@ -967,6 +1015,7 @@ def get_client_ip_counts_for_host(
     # Compatibility path for older panels. It is intentionally bounded to the
     # keys expected on this physical panel.
     counts = {}
+    activity = {}
     for email in sorted(wanted):
         values = api.client.get_ips(email) or []
         unique_ips = {
@@ -975,9 +1024,11 @@ def get_client_ip_counts_for_host(
             if ip
         }
         counts[email] = len(unique_ips)
+        activity[email] = _activity_from_panel_values(values)
     return {
         "host": host_name,
         "counts": counts,
+        "activity": activity,
         "fail2ban": get_host_fail2ban_status_from_api(api),
     }
 

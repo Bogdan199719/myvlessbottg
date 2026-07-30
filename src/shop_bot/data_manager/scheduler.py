@@ -1,5 +1,4 @@
 import asyncio
-import html
 import logging
 import math
 import time
@@ -44,6 +43,7 @@ _HOST_HEALTH_MAX_CONCURRENCY = 4
 _IP_LIMIT_INTERVAL_SECONDS = 5 * 60
 _IP_LIMIT_PANEL_TIMEOUT_SECONDS = 90
 _IP_LIMIT_MAX_CONCURRENCY = 4
+_IP_LIMIT_HISTORY_RETENTION_DAYS = 30
 
 
 logger = logging.getLogger(__name__)
@@ -784,8 +784,8 @@ async def enforce_clients_state_from_db() -> None:
     # exhausted its grace period. The panel still records IP observations with
     # limitIp=0; this behavior is verified by the bulk clientIps API.
     warning_ip_limit = 0
-    enforced_key_ids = (
-        await asyncio.to_thread(database.get_enforced_xui_ip_limit_key_ids)
+    enforced_user_ids = (
+        await asyncio.to_thread(database.get_enforced_xui_ip_limit_user_ids)
         if ip_limit_enabled
         else set()
     )
@@ -828,7 +828,7 @@ async def enforce_clients_state_from_db() -> None:
                 "force_unlimited": True,
                 "ip_limit": (
                     configured_ip_limit
-                    if db_key.get("key_id") in enforced_key_ids
+                    if db_key.get("user_id") in enforced_user_ids
                     else warning_ip_limit
                 )
                 if ip_limit_enabled
@@ -1425,10 +1425,10 @@ async def refresh_xui_host_health() -> dict:
 
 
 async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
-    """Collect per-client IP counts once per physical panel and process breaches."""
+    """Process fresh, subscription-wide IP activity without retaining raw IPs."""
     result = {
         "panels": 0,
-        "keys": 0,
+        "users": 0,
         "warnings": 0,
         "enforced": 0,
         "resolved": 0,
@@ -1439,6 +1439,9 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
 
     limit_count = _int_setting("ip_limit_max_ips", 10, 1, 100)
     grace_hours = _int_setting("ip_limit_warning_grace_hours", 24, 1, 168)
+    activity_window_minutes = _int_setting(
+        "ip_limit_activity_window_minutes", 10, 1, 60
+    )
     hosts = await asyncio.to_thread(database.get_all_hosts, True)
     if not hosts:
         return result
@@ -1451,10 +1454,15 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
         host_groups.setdefault(group_key, []).append(host)
 
     now = time_utils.get_msk_now()
+    now_timestamp = int(time.time())
+    activity_cutoff = now_timestamp - activity_window_minutes * 60
     semaphore = asyncio.Semaphore(_IP_LIMIT_MAX_CONCURRENCY)
-    observations: list[dict] = []
+    activity_by_user: dict[int, set[str]] = {}
+    observed_user_ids: set[int] = set()
+    snapshot_complete = True
 
     async def _collect(group: list[dict]) -> None:
+        nonlocal snapshot_complete
         representative = group[0]
         keys_by_email: dict[str, dict] = {}
         for host in group:
@@ -1470,6 +1478,12 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                 if not email or not expiry or expiry <= now:
                     continue
                 keys_by_email[str(email)] = key
+                try:
+                    user_id = int(key["user_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                observed_user_ids.add(user_id)
+                activity_by_user.setdefault(user_id, set())
 
         if not keys_by_email:
             return
@@ -1489,6 +1503,7 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                 representative.get("host_name"),
                 e,
             )
+            snapshot_complete = False
             return
 
         result["panels"] += 1
@@ -1500,48 +1515,76 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                 "observations skipped to avoid promising unenforced limits.",
                 representative.get("host_name"),
             )
+            snapshot_complete = False
             return
 
-        counts = panel_result.get("counts") or {}
+        activity = panel_result.get("activity") or {}
         for email, key in keys_by_email.items():
-            observations.append(
-                {
-                    "key_id": key.get("key_id"),
-                    "user_id": key.get("user_id"),
-                    "host_name": key.get("host_name"),
-                    "key_email": email,
-                    "ip_count": int(counts.get(email, 0) or 0),
-                }
-            )
+            try:
+                user_id = int(key["user_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            for item in activity.get(email) or []:
+                fingerprint = str(item.get("fingerprint") or "")
+                try:
+                    timestamp = int(item.get("timestamp"))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    fingerprint
+                    and activity_cutoff <= timestamp <= now_timestamp + 60
+                ):
+                    activity_by_user[user_id].add(fingerprint)
 
     await asyncio.gather(*(_collect(group) for group in host_groups.values()))
-    result["keys"] = len(observations)
+    if not snapshot_complete:
+        logger.warning(
+            "Scheduler: Global IP-limit snapshot incomplete; no user states changed."
+        )
+        return result
+
+    observed_user_ids.update(
+        await asyncio.to_thread(database.get_pending_xui_ip_limit_user_ids)
+    )
+    observations = [
+        {
+            "user_id": user_id,
+            "ip_count": len(activity_by_user.get(user_id, set())),
+        }
+        for user_id in sorted(observed_user_ids)
+    ]
+    result["users"] = len(observations)
     actions = await asyncio.to_thread(
-        database.process_xui_ip_limit_observations,
+        database.process_xui_ip_limit_user_observations,
         observations,
         limit_count,
         grace_hours,
+        2,
     )
     result["warnings"] = len(actions["warnings"])
     result["enforced"] = len(actions["enforced"])
     result["resolved"] = len(actions["resolved"])
+    pruned_history = await asyncio.to_thread(
+        database.prune_xui_ip_limit_user_history,
+        _IP_LIMIT_HISTORY_RETENTION_DAYS,
+    )
+    if pruned_history:
+        logger.info(
+            "Scheduler: Removed %s completed IP-limit event(s) older than %s days.",
+            pruned_history,
+            _IP_LIMIT_HISTORY_RETENTION_DAYS,
+        )
 
-    warnings_by_user: dict[int, list[dict]] = {}
     for warning in actions["warnings"]:
-        warnings_by_user.setdefault(int(warning["user_id"]), []).append(warning)
-
-    for user_id, user_warnings in warnings_by_user.items():
+        user_id = int(warning["user_id"])
         if bot is None:
             continue
-        details = "\n".join(
-            f"• <b>{html.escape(str(item['host_name']))}</b>: "
-            f"{item['ip_count']} IP при лимите {item['limit_count']}"
-            for item in user_warnings[:10]
-        )
         message = (
             "⚠️ <b>Предупреждение о подключениях</b>\n\n"
-            "Обнаружено превышение количества одновременно используемых "
-            f"IP-адресов:\n{details}\n\n"
+            "Во всей подписке обнаружено "
+            f"<b>{warning['ip_count']} активных IP</b> при лимите "
+            f"<b>{warning['limit_count']}</b>. Одинаковый внешний IP на разных "
+            "VPN-серверах считается один раз.\n\n"
             "Сейчас доступ ещё не ограничен. Пожалуйста, отключите лишние "
             f"устройства в течение {grace_hours} ч. После этого 3x-ui будет "
             "автоматически отключать подключения сверх лимита.\n\n"
@@ -1550,38 +1593,35 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
         )
         try:
             await bot.send_message(user_id, message, parse_mode="HTML")
-            for warning in user_warnings:
-                await asyncio.to_thread(
-                    database.mark_xui_ip_limit_warning_result,
-                    warning["key_id"],
-                    None,
-                )
+            await asyncio.to_thread(
+                database.mark_xui_ip_limit_user_warning_result,
+                user_id,
+                None,
+            )
         except TelegramForbiddenError as e:
-            for warning in user_warnings:
-                await asyncio.to_thread(
-                    database.mark_xui_ip_limit_warning_result,
-                    warning["key_id"],
-                    f"Telegram delivery forbidden: {e}",
-                )
+            await asyncio.to_thread(
+                database.mark_xui_ip_limit_user_warning_result,
+                user_id,
+                f"Telegram delivery forbidden: {e}",
+            )
         except Exception as e:
             result["errors"] += 1
             logger.warning(
-                "Scheduler: Could not send IP-limit warning for user %s (%s key(s)): %s",
+                "Scheduler: Could not send IP-limit warning for user %s: %s",
                 user_id,
-                len(user_warnings),
                 e,
             )
 
     if actions["enforced"]:
         logger.warning(
-            "Scheduler: IP limit moved to enforcement for %s key(s).",
+            "Scheduler: IP limit moved to enforcement for %s user(s).",
             len(actions["enforced"]),
         )
     logger.info(
-        "Scheduler: IP-limit monitor finished. panels=%s keys=%s warnings=%s "
+        "Scheduler: IP-limit monitor finished. panels=%s users=%s warnings=%s "
         "enforced=%s resolved=%s errors=%s",
         result["panels"],
-        result["keys"],
+        result["users"],
         result["warnings"],
         result["enforced"],
         result["resolved"],

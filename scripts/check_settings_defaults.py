@@ -37,6 +37,7 @@ REQUIRED_DEFAULT_SETTINGS = {
     "ip_limit_enabled",
     "ip_limit_max_ips",
     "ip_limit_warning_grace_hours",
+    "ip_limit_activity_window_minutes",
     "subscription_live_sync",
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",

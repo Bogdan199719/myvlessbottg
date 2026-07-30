@@ -64,7 +64,10 @@ from shop_bot.data_manager.database import (
     update_setting,
     get_all_hosts,
     get_all_xui_host_health,
-    get_xui_ip_limit_events,
+    get_enforced_xui_ip_limit_user_ids,
+    get_xui_ip_limit_user_events,
+    enforce_xui_ip_limit_user_now,
+    release_xui_ip_limit_users,
     get_plans_for_host,
     create_host,
     delete_host,
@@ -758,6 +761,7 @@ ALL_SETTINGS_KEYS = [
     "ip_limit_enabled",
     "ip_limit_max_ips",
     "ip_limit_warning_grace_hours",
+    "ip_limit_activity_window_minutes",
     "subscription_live_sync",
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
@@ -2047,6 +2051,56 @@ def create_webhook_app(bot_controller_instance):
                 f"Операция с XUI-панелью превысила лимит ожидания ({timeout}с). Проверьте доступность сервера."
             ) from exc
 
+    async def _sync_ip_limit_value(events: list[dict], limit_count: int) -> dict:
+        """Apply one native IP-limit value to the selected XUI keys."""
+        safe_limit_count = max(0, int(limit_count))
+        desired_by_host: dict[str, dict[str, dict]] = {}
+        for event in events:
+            host_name = str(event.get("host_name") or "")
+            key_email = str(event.get("key_email") or "")
+            if not host_name or not key_email:
+                continue
+            desired_by_host.setdefault(host_name, {})[key_email] = {
+                "ip_limit": safe_limit_count
+            }
+
+        results = await asyncio.gather(
+            *(
+                xui_api.sync_clients_state_on_host(host_name, desired_by_email)
+                for host_name, desired_by_email in desired_by_host.items()
+            )
+        )
+        return {
+            "targeted": len(events),
+            "checked": sum(int(item.get("checked", 0)) for item in results),
+            "updated": sum(int(item.get("updated", 0)) for item in results),
+            "not_found": sum(int(item.get("not_found", 0)) for item in results),
+            "errors": sum(int(item.get("errors", 0)) for item in results),
+        }
+
+    def _ip_limit_targets_for_users(user_ids: list[int]) -> list[dict]:
+        """Expand a global user decision to every XUI key in their subscription."""
+        targets: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for user_id in sorted(set(int(value) for value in user_ids)):
+            for key in get_user_keys(user_id):
+                if str(key.get("service_type") or "xui") != "xui":
+                    continue
+                host_name = str(key.get("host_name") or "")
+                key_email = str(key.get("key_email") or "")
+                identity = (host_name, key_email)
+                if not host_name or not key_email or identity in seen:
+                    continue
+                seen.add(identity)
+                targets.append(
+                    {
+                        "user_id": user_id,
+                        "host_name": host_name,
+                        "key_email": key_email,
+                    }
+                )
+        return targets
+
     def _run_auto_provision_for_global_users(context_host_name: str) -> bool:
         """Run global users auto-provisioning from admin host actions."""
         try:
@@ -2144,10 +2198,27 @@ def create_webhook_app(bot_controller_instance):
                 safe_settings[f"{secret_key}_configured"] = True
                 safe_settings[secret_key] = ""
 
+        ip_limit_events = get_xui_ip_limit_user_events(100)
+        ip_limit_active_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") in {"warning", "enforced"}
+        ]
+        ip_limit_history_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") not in {"warning", "enforced"}
+        ]
+
         return {
             "settings": safe_settings,
             "hosts": hosts,
-            "ip_limit_events": get_xui_ip_limit_events(100),
+            "ip_limit_events": ip_limit_events,
+            "ip_limit_active_events": ip_limit_active_events,
+            "ip_limit_history_events": ip_limit_history_events,
+            "ip_limit_enforced_count": len(
+                get_enforced_xui_ip_limit_user_ids()
+            ),
             "global_plans": get_plans_for_host("ALL", service_type="xui"),
             "mtg_hosts": mtg_hosts,
             "payment_rules": get_all_payment_rules(),
@@ -3566,13 +3637,19 @@ def create_webhook_app(bot_controller_instance):
                 ip_limit_grace = int(
                     request.form.get("ip_limit_warning_grace_hours", "24")
                 )
+                ip_limit_activity_window = int(
+                    request.form.get("ip_limit_activity_window_minutes", "10")
+                )
                 if not 1 <= ip_limit_max <= 100:
                     raise ValueError
                 if not 1 <= ip_limit_grace <= 168:
                     raise ValueError
+                if not 1 <= ip_limit_activity_window <= 60:
+                    raise ValueError
             except (TypeError, ValueError):
                 flash(
-                    "Лимит IP должен быть от 1 до 100, время предупреждения — от 1 до 168 часов.",
+                    "Лимит IP должен быть от 1 до 100, окно активности — от 1 "
+                    "до 60 минут, время предупреждения — от 1 до 168 часов.",
                     "danger",
                 )
                 return redirect(url_for("settings_page"))
@@ -3641,6 +3718,114 @@ def create_webhook_app(bot_controller_instance):
         return render_template(
             "settings.html", **_load_settings_page_context(), **common_data
         )
+
+    def _release_ip_limits_from_admin(user_ids: list[int] | None):
+        released = release_xui_ip_limit_users(user_ids)
+        if not released:
+            flash("Активные ограничения для снятия не найдены.", "warning")
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        released_user_ids = [int(item["user_id"]) for item in released]
+        targets = _ip_limit_targets_for_users(released_user_ids)
+        try:
+            result = _run_async(
+                _sync_ip_limit_value(targets, 0),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limits were released in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                f"В базе снято ограничений: {len(released)}. Панели не ответили сразу; "
+                "фоновая синхронизация повторит сброс автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                f"Снято ограничений: {len(released)}. Не удалось сразу обновить: "
+                f"{result['errors'] + result['not_found']}; фоновая синхронизация "
+                "повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Снято ограничений: {len(released)}. Мониторинг продолжает работу.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/enforce",
+        methods=["POST"],
+    )
+    @login_required
+    def enforce_ip_limit_route(user_id: int):
+        enforced = enforce_xui_ip_limit_user_now(user_id)
+        if not enforced:
+            flash(
+                "Предупреждение не найдено или ограничение уже применено.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        try:
+            configured_limit = max(
+                1,
+                min(int(get_setting("ip_limit_max_ips") or 10), 100),
+            )
+        except (TypeError, ValueError):
+            configured_limit = 10
+
+        try:
+            targets = _ip_limit_targets_for_users([user_id])
+            result = _run_async(
+                _sync_ip_limit_value(targets, configured_limit),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limit was enforced in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                "Ограничение включено в базе. Панель не ответила сразу; "
+                "фоновая синхронизация повторит применение автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                "Ограничение включено. Панель не подтвердила применение; "
+                "фоновая синхронизация повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Принудительное ограничение {configured_limit} IP включено "
+                "на всех конфигурациях пользователя.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/release",
+        methods=["POST"],
+    )
+    @login_required
+    def release_ip_limit_route(user_id: int):
+        return _release_ip_limits_from_admin([user_id])
+
+    @flask_app.route("/settings/ip-limit-users/release-all", methods=["POST"])
+    @login_required
+    def release_all_ip_limits_route():
+        return _release_ip_limits_from_admin(None)
 
     @flask_app.route("/start-shop-bot", methods=["POST"])
     @login_required

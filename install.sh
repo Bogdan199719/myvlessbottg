@@ -188,6 +188,10 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        # Bulk admin actions may wait for several remote 3x-ui panels.
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 300s;
     }
 }
 EOF
