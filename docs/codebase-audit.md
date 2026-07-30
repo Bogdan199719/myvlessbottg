@@ -110,8 +110,8 @@
 - Support-сводка по тикету различает глобальные и обычные ключи, показывает последнюю реальную оплату отдельно от промокодов/служебных операций и указывает неполную выдачу как `3/4`, если включённый хост недоступен.
 - Fallback-проверка pending-платежей теперь обрабатывает свежие записи первыми, чтобы старые неоплаченные счета не блокировали новые зависшие платежи при лимите выборки.
 - Scheduler получил backoff для временно сломанных XUI-хостов, чтобы один недоступный сервер не создавал постоянный поток ошибок каждую минуту.
-- Интеграция 3x-ui приведена к текущему API: Bearer token для v3, официальный `/panel/api/clients/links/:email` для ссылок, fallback на legacy route для старых панелей и protocol-aware `clientId` (`id`, `password`, `email`, `auth`).
-- Hysteria/Hysteria2 поддерживаются через raw JSON API 3x-ui с полем `auth`, потому что установленная версия `py3xui` не моделирует это поле в `Client`.
+- Интеграция 3x-ui приведена к текущему API: `py3xui==0.7.0` использует нативные Bearer token и CSRF-login, официальный `/panel/api/clients/links/:email` формирует ссылки, а legacy routes сохранены для старых панелей.
+- Hysteria/Hysteria2 поддерживаются через raw JSON API 3x-ui с полем `auth`, потому что `py3xui 0.7.0` по-прежнему не моделирует это поле в `Client`.
 
 ### Runtime-решение
 
@@ -329,7 +329,7 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 
 ### Остаточные риски
 
-- Публичный `/sub/<token>` остаётся bearer-link endpoint и может выполнять self-healing provisioning для активных global/trial подписок.
+- Публичный `/sub/<token>` остаётся bearer-link endpoint, но использует только локально сохранённые конфигурации; self-healing provisioning выполняет фоновый scheduler.
 - Нет отдельного per-payment/per-host fulfillment ledger; текущая логика защищает от частичной финализации `ALL`, но наблюдаемость host-level retry всё ещё ограничена.
 - Старые неоплаченные Telegram Stars invoice остаются в истории как `pending`; автоматическая чистка требует отдельного согласованного правила хранения.
 - Production по-прежнему использует bind mount всего проекта в контейнер. Это удобно для горячих правок, но менее строго, чем immutable image + отдельный data volume.
@@ -384,3 +384,21 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 ### Проверка
 
 - Добавлен `scripts/check_payment_analytics.py`: временная копия SQLite проверяет миграцию `paid_date`, backfill старых paid-транзакций, выручку all-time и запись `paid_date` при финализации оплаты.
+
+## 3x-ui 3.6.0 compatibility and runtime audit — 2026-07-30
+
+### Исправлено
+
+- `py3xui` обновлён с `0.4.0` до `0.7.0`; Bearer token передаётся через штатный параметр SDK вместо подмены приватного HTTP-метода.
+- Сохранены явный CSRF/cookie-login и отдельный fallback для старых панелей без CSRF.
+- DB state enforcement восстанавливает активного клиента, случайно удалённого или отсоединённого от inbound, с тем же UUID/auth и абсолютной датой окончания. Истёкшие отсутствующие клиенты автоматически не создаются.
+- Проверка XUI v3 routes покрывает нативный Bearer, legacy login и восстановление только активного клиента.
+
+### Production-проверка
+
+- Все 4 физические панели работают на 3x-ui `3.6.0` и Xray `26.7.28`; доступны все 12 логических inbound: VLESS Reality/TCP, VLESS XHTTP и Hysteria.
+- Для каждого inbound проверены авторизация, чтение клиентов, panel-generated links и traffic API.
+- Проверены все 332 активных subscription endpoints: каждый вернул HTTP 200 и полный набор из 12 серверов, автоматического выбора и Happ routing без повторяющихся конфигураций.
+- В live-БД проверены 3 984 активных XUI-ключа: пустых или синтаксически неверных connection strings нет.
+- Все 22 `scripts/check_*.py`, `compileall`, `pip check`, Black для изменённых Python-файлов и `pylint --errors-only` прошли.
+- Контейнер и `/healthz` были healthy; scheduler завершал DB enforce, host health и IP-limit циклы без текущих ошибок. За предыдущие сутки зафиксированы два восстановившихся сетевых сбоя отдельных панелей; незавершённых активных global subscriptions после retry не осталось.

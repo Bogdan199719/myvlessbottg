@@ -86,9 +86,7 @@ def _is_host_in_failure_backoff(host_name: str) -> bool:
 
 def _mark_host_failure(host_name: str, reason: str) -> None:
     was_in_backoff = _is_host_in_failure_backoff(host_name)
-    _host_failure_backoff[host_name] = (
-        time.monotonic() + _HOST_FAILURE_BACKOFF_SECONDS
-    )
+    _host_failure_backoff[host_name] = time.monotonic() + _HOST_FAILURE_BACKOFF_SECONDS
     if not was_in_backoff:
         logger.warning(
             "Scheduler: Host '%s' temporarily backed off for %s seconds after failure: %s",
@@ -114,9 +112,7 @@ def _is_mtg_host_in_failure_backoff(host_name: str) -> bool:
 
 def _mark_mtg_host_failure(host_name: str, reason: str) -> None:
     was_in_backoff = _is_mtg_host_in_failure_backoff(host_name)
-    _mtg_failure_backoff[host_name] = (
-        time.monotonic() + _MTG_FAILURE_BACKOFF_SECONDS
-    )
+    _mtg_failure_backoff[host_name] = time.monotonic() + _MTG_FAILURE_BACKOFF_SECONDS
     if not was_in_backoff:
         logger.warning(
             "Scheduler: MTG host '%s' temporarily backed off for %s seconds after failure: %s",
@@ -148,9 +144,7 @@ def format_time_left(hours: int) -> str:
             return f"{hours} часов"
 
 
-def _notification_type_for_expiry_cycle(
-    base_type: str, expiry_date: datetime
-) -> str:
+def _notification_type_for_expiry_cycle(base_type: str, expiry_date: datetime) -> str:
     expiry_ms = time_utils.get_timestamp_ms(expiry_date)
     return f"{base_type}:{expiry_ms}"
 
@@ -486,9 +480,7 @@ async def check_idle_onboarding_users(bot: Bot):
             if already_sent:
                 continue
 
-            sent_ok = await send_idle_onboarding_notification(
-                bot, user_id, hours_mark
-            )
+            sent_ok = await send_idle_onboarding_notification(bot, user_id, hours_mark)
             if sent_ok:
                 await asyncio.to_thread(
                     database.mark_notification_sent,
@@ -616,9 +608,7 @@ async def check_expiring_subscriptions(bot: Bot):
                     key
                 )
             elif database.is_global_xui_key(key, global_plan_ids):
-                paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
-                    key
-                )
+                paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(key)
             else:
                 remaining_keys.append(key)
         except Exception:
@@ -770,6 +760,7 @@ async def enforce_clients_state_from_db() -> None:
 
     total_checked = 0
     total_updated = 0
+    total_recreated = 0
     total_already_ok = 0
     total_not_found = 0
     total_errors = 0
@@ -826,13 +817,18 @@ async def enforce_clients_state_from_db() -> None:
                 "enabled": expiry_date > now,
                 "expiry_timestamp_ms": time_utils.get_timestamp_ms(expiry_date),
                 "force_unlimited": True,
+                "recreate_missing": expiry_date > now,
+                "client_identifier": db_key.get("xui_client_uuid"),
+                "telegram_id": str(db_key.get("user_id") or ""),
                 "ip_limit": (
-                    configured_ip_limit
-                    if db_key.get("user_id") in enforced_user_ids
-                    else warning_ip_limit
-                )
-                if ip_limit_enabled
-                else 0,
+                    (
+                        configured_ip_limit
+                        if db_key.get("user_id") in enforced_user_ids
+                        else warning_ip_limit
+                    )
+                    if ip_limit_enabled
+                    else 0
+                ),
             }
 
         if desired_by_email:
@@ -858,6 +854,7 @@ async def enforce_clients_state_from_db() -> None:
                 _mark_host_success(host_name)
             total_checked += int(host_result.get("checked", 0))
             total_updated += int(host_result.get("updated", 0))
+            total_recreated += int(host_result.get("recreated", 0))
             total_already_ok += int(host_result.get("already_ok", 0))
             total_not_found += int(host_result.get("not_found", 0))
             total_traffic_fixed += int(host_result.get("traffic_fixed", 0))
@@ -865,9 +862,10 @@ async def enforce_clients_state_from_db() -> None:
             total_errors += int(host_result.get("errors", 0))
 
     logger.info(
-        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s traffic_fixed=%s ip_limit_fixed=%s expired_preserved=%s errors=%s",
+        "Scheduler: DB enforce finished. checked=%s updated=%s recreated=%s already_ok=%s not_found=%s traffic_fixed=%s ip_limit_fixed=%s expired_preserved=%s errors=%s",
         total_checked,
         total_updated,
+        total_recreated,
         total_already_ok,
         total_not_found,
         total_traffic_fixed,
@@ -895,9 +893,7 @@ def _load_xui_panel_snapshot(host: dict):
         return None
 
     full_inbound_details = api.inbound.get_by_id(inbound.id)
-    if not full_inbound_details or not getattr(
-        full_inbound_details, "settings", None
-    ):
+    if not full_inbound_details or not getattr(full_inbound_details, "settings", None):
         return None
     return full_inbound_details
 
@@ -1312,7 +1308,9 @@ async def auto_provision_new_hosts_for_global_users():
                             f"Scheduler: Successfully created key for user {user_id} on host '{host_name}'"
                         )
                     else:
-                        _mark_host_failure(host_name, "auto-provision returned no result")
+                        _mark_host_failure(
+                            host_name, "auto-provision returned no result"
+                        )
                         logger.error(
                             f"Scheduler: Failed to create key for user {user_id} on host '{host_name}'"
                         )
@@ -1354,9 +1352,9 @@ async def refresh_xui_host_health() -> dict:
     semaphore = asyncio.Semaphore(_HOST_HEALTH_MAX_CONCURRENCY)
     host_groups: dict[str, list[dict]] = {}
     for host in hosts:
-        host_groups.setdefault(str(host.get("host_url") or host["host_name"]), []).append(
-            host
-        )
+        host_groups.setdefault(
+            str(host.get("host_url") or host["host_name"]), []
+        ).append(host)
 
     async def _probe(group_hosts: list[dict]) -> None:
         host_name = group_hosts[0]["host_name"]
@@ -1469,9 +1467,7 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
             host_name = host.get("host_name")
             if not host_name:
                 continue
-            host_keys = await asyncio.to_thread(
-                database.get_keys_for_host, host_name
-            )
+            host_keys = await asyncio.to_thread(database.get_keys_for_host, host_name)
             for key in host_keys:
                 email = key.get("key_email")
                 expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
@@ -1530,10 +1526,7 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                     timestamp = int(item.get("timestamp"))
                 except (TypeError, ValueError):
                     continue
-                if (
-                    fingerprint
-                    and activity_cutoff <= timestamp <= now_timestamp + 60
-                ):
+                if fingerprint and activity_cutoff <= timestamp <= now_timestamp + 60:
                     activity_by_user[user_id].add(fingerprint)
 
     await asyncio.gather(*(_collect(group) for group in host_groups.values()))
@@ -2090,10 +2083,7 @@ async def periodic_subscription_check(bot_controller: BotController):
 
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
-            if (
-                current_time - last_host_health_time
-                >= _HOST_HEALTH_INTERVAL_SECONDS
-            ):
+            if current_time - last_host_health_time >= _HOST_HEALTH_INTERVAL_SECONDS:
                 await refresh_xui_host_health()
                 last_host_health_time = time.time()
 

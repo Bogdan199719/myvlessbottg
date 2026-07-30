@@ -1856,7 +1856,9 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data == "enter_promo_code")
     @registration_required
-    async def enter_promo_code_handler(callback: types.CallbackQuery, state: FSMContext):
+    async def enter_promo_code_handler(
+        callback: types.CallbackQuery, state: FSMContext
+    ):
         if str(get_setting("enable_promo_codes") or "true").lower() != "true":
             await callback.answer("Промокоды сейчас недоступны.", show_alert=True)
             await show_main_menu(callback.message, edit_message=True)
@@ -1897,6 +1899,7 @@ def get_user_router() -> Router:
             return
 
         promo = None
+        promo_id = None
         promo_applied = False
         promo_fulfillment_started = False
         processing_message = None
@@ -1938,23 +1941,29 @@ def get_user_router() -> Router:
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
                 )
                 return
+            assert promo is not None
+            promo_id = int(promo["promo_id"])
+            promo_code = str(promo["code"])
+            promo_duration_days = int(promo["duration_days"])
 
             global_plans = get_plans_for_host("ALL", service_type="xui")
             if not global_plans:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await message.answer(
                     "❌ Администратор ещё не настроил глобальные VPN-тарифы.",
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
                 )
                 return
 
-            plan = sorted(global_plans, key=lambda item: int(item.get("months") or 0))[0]
+            plan = sorted(global_plans, key=lambda item: int(item.get("months") or 0))[
+                0
+            ]
             plan_id = int(plan["plan_id"])
-            duration_days = int(promo["duration_days"])
+            duration_days = promo_duration_days
 
             hosts = get_all_hosts(only_enabled=True)
             if not hosts:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await message.answer(
                     "❌ Сейчас нет доступных VPN-серверов.",
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
@@ -1969,7 +1978,7 @@ def get_user_router() -> Router:
                 user_id=user_id, action="new", host_name="ALL", key_id=0
             )
             if prep_error:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await processing_message.edit_text(prep_error)
                 return
 
@@ -1980,10 +1989,10 @@ def get_user_router() -> Router:
                     user_id, duration_days, hosts_to_process, promo_metadata
                 )
                 target_expiry_ms = set_promo_fulfillment_target(
-                    int(promo["promo_id"]), user_id, calculated_target
+                    promo_id, user_id, calculated_target
                 )
             if not target_expiry_ms:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await processing_message.edit_text(
                     "❌ Не удалось зафиксировать срок подписки по промокоду."
                 )
@@ -2027,7 +2036,7 @@ def get_user_router() -> Router:
                 )
                 return
 
-            if not mark_promo_code_applied(int(promo["promo_id"]), user_id):
+            if not mark_promo_code_applied(promo_id, user_id):
                 await processing_message.edit_text(
                     "❌ Доступ выдан, но применение промокода не зафиксировано. "
                     "Повторите ввод этого же кода позже."
@@ -2040,7 +2049,7 @@ def get_user_router() -> Router:
             log_transaction(
                 username=user_info.get("username", "N/A") if user_info else "N/A",
                 transaction_id=None,
-                payment_id=f"promo-{promo['promo_id']}-{user_id}-{uuid.uuid4()}",
+                payment_id=f"promo-{promo_id}-{user_id}-{uuid.uuid4()}",
                 user_id=user_id,
                 status="paid",
                 amount_rub=0,
@@ -2049,10 +2058,10 @@ def get_user_router() -> Router:
                 payment_method="Promo",
                 metadata=json.dumps(
                     {
-                        "promo_code": promo["code"],
+                        "promo_code": promo_code,
                         "duration_days": duration_days,
                         "plan_id": plan_id,
-                        "plan_name": f"Промокод {promo['code']} ({duration_days} дн.)",
+                        "plan_name": f"Промокод {promo_code} ({duration_days} дн.)",
                         "host_name": "ALL",
                     }
                 ),
@@ -2071,7 +2080,7 @@ def get_user_router() -> Router:
             )
             final_text = (
                 f"🎉 <b>Промокод применён!</b>\n"
-                f"<blockquote>🎟 {html.quote(promo['code'])}\n"
+                f"<blockquote>🎟 {html.quote(promo_code)}\n"
                 f"📅 Подписка активна до {new_expiry_date.strftime('%d.%m.%Y')}\n"
                 f"🔗 Доступно серверов: {len(results)}</blockquote>\n"
             )
@@ -2122,7 +2131,7 @@ def get_user_router() -> Router:
                         "price": 0,
                         "host_name": "ALL",
                         "plan_id": plan_id,
-                        "payment_method": f"Promo {promo['code']}",
+                        "payment_method": f"Promo {promo_code}",
                     },
                 )
             except Exception as e:
@@ -2130,7 +2139,7 @@ def get_user_router() -> Router:
 
         except Exception as e:
             if promo and not promo_applied and not promo_fulfillment_started:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
             logger.error(
                 f"Error applying promo code {code} for user {user_id}: {e}",
                 exc_info=True,
@@ -2522,9 +2531,7 @@ def get_user_router() -> Router:
         if service_type == "xui":
             await _show_global_purchase_plans(
                 callback,
-                keep_source_message=_is_subscription_reminder_message(
-                    callback.message
-                ),
+                keep_source_message=_is_subscription_reminder_message(callback.message),
             )
             return
 
@@ -3081,9 +3088,7 @@ def get_user_router() -> Router:
             "plan_id": data.get("plan_id"),
             "customer_email": data.get("customer_email"),
             "payment_method": "Telegram Stars",
-            "referral_discount_applied": bool(
-                data.get("referral_discount_applied")
-            ),
+            "referral_discount_applied": bool(data.get("referral_discount_applied")),
         }
 
         title = f"Подписка на {plan['months']} мес."
@@ -3157,9 +3162,7 @@ def get_user_router() -> Router:
         transaction = _get_stars_transaction(payment_id) if payment_id else None
         metadata = transaction.get("metadata_dict", {}) if transaction else {}
         payer_user_id = (
-            int(pre_checkout_query.from_user.id)
-            if pre_checkout_query.from_user
-            else 0
+            int(pre_checkout_query.from_user.id) if pre_checkout_query.from_user else 0
         )
         try:
             expected_user_id = int(metadata.get("user_id") or 0)
@@ -3180,7 +3183,11 @@ def get_user_router() -> Router:
             logger.warning(
                 "Stars: Rejected pre-checkout for payload=%s user_id=%s",
                 payment_id,
-                pre_checkout_query.from_user.id if pre_checkout_query.from_user else None,
+                (
+                    pre_checkout_query.from_user.id
+                    if pre_checkout_query.from_user
+                    else None
+                ),
             )
             await bot.answer_pre_checkout_query(
                 pre_checkout_query_id=pre_checkout_query.id,
@@ -3584,9 +3591,7 @@ def get_user_router() -> Router:
             )
 
     @user_router.message(Command(commands=["decline_p2p"]))
-    async def admin_decline_p2p_handler(
-        message: types.Message, command: CommandObject
-    ):
+    async def admin_decline_p2p_handler(message: types.Message, command: CommandObject):
         if not _is_admin(message.from_user.id):
             return
         request_id = _p2p_request_id_from_command(message, command)
@@ -3846,9 +3851,7 @@ async def _create_mtg_proxy_after_payment(
             proxy_name = existing_key["key_email"]
             node_id = int(existing_key["xui_client_uuid"])
             panel_details = await mtg_api.get_proxy_details(host_name, proxy_name)
-            panel_expiry_ms = int(
-                (panel_details or {}).get("expiry_timestamp_ms") or 0
-            )
+            panel_expiry_ms = int((panel_details or {}).get("expiry_timestamp_ms") or 0)
             if not panel_details or panel_expiry_ms <= 0:
                 logger.error(
                     "MTG panel expiry is unavailable for %s; refusing a relative renew",
@@ -4061,9 +4064,7 @@ async def _create_mtg_proxy_after_payment(
                 metadata=json.dumps(
                     {
                         "plan_id": plan_id,
-                        "plan_name": (
-                            metadata.get("plan_name", "Unknown")
-                        ),
+                        "plan_name": (metadata.get("plan_name", "Unknown")),
                         "host_name": host_name,
                         "service_type": "mtg",
                         "customer_email": metadata.get("customer_email"),
@@ -4378,10 +4379,7 @@ async def _execute_payment_for_hosts(
                     )
                     continue
                 results.append(res)
-                if (
-                    purchase_host_name != "ALL"
-                    and primary_key_id is None
-                ):
+                if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(new_key_id)
             elif action == "extend" and purchase_host_name != "ALL":
                 expiry_datetime = time_utils.from_timestamp_ms(
@@ -4604,7 +4602,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         if host_name == "ALL" and len(results) != len(hosts_to_process):
             successful_hosts = {r.get("host_name") for r in results}
             failed_hosts = [
-                host for host, _email in hosts_to_process if host not in successful_hosts
+                host
+                for host, _email in hosts_to_process
+                if host not in successful_hosts
             ]
             logger.error(
                 "Global payment fulfillment incomplete for user %s: %s/%s hosts, failed=%s",

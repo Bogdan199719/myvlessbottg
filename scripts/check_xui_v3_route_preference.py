@@ -73,6 +73,161 @@ def main() -> int:
         if not condition:
             failures.append(message)
 
+    host_url = "https://native-token.example.test"
+    native_api = SimpleNamespace()
+    target_inbound = SimpleNamespace(id=9)
+    xui_api._host_bearer_failure_cache.pop(host_url, None)
+    with (
+        patch.object(xui_api, "Api", return_value=native_api) as api_class,
+        patch.object(xui_api, "_set_api_request_timeouts"),
+        patch.object(
+            xui_api,
+            "_get_inbound_list_compat",
+            return_value=[target_inbound],
+        ),
+    ):
+        actual_api, actual_inbound = xui_api.login_to_host(
+            host_url,
+            "username",
+            "password",
+            target_inbound.id,
+            "native-bearer-token",
+        )
+    expect(
+        api_class.call_args.kwargs.get("token") == "native-bearer-token",
+        "Bearer authentication did not use py3xui's native token parameter",
+    )
+    expect(
+        actual_api is native_api and actual_inbound is target_inbound,
+        "native Bearer authentication did not return the target inbound",
+    )
+
+    legacy_api = SimpleNamespace()
+    with (
+        patch.object(xui_api, "Api", return_value=legacy_api),
+        patch.object(xui_api, "_set_api_request_timeouts"),
+        patch.object(xui_api, "_login_with_csrf", return_value=False),
+        patch.object(xui_api, "_login_without_csrf", return_value=True) as legacy_login,
+        patch.object(
+            xui_api,
+            "_get_inbound_list_compat",
+            return_value=[target_inbound],
+        ),
+    ):
+        actual_api, actual_inbound = xui_api.login_to_host(
+            host_url,
+            "username",
+            "password",
+            target_inbound.id,
+        )
+    expect(
+        legacy_login.call_count == 1,
+        "pre-CSRF cookie login fallback was not attempted",
+    )
+    expect(
+        actual_api is legacy_api and actual_inbound is target_inbound,
+        "pre-CSRF cookie login fallback did not return the target inbound",
+    )
+
+    sync_inbound = SimpleNamespace(
+        id=11,
+        protocol="vless",
+        settings=SimpleNamespace(clients=[]),
+        client_stats=[],
+    )
+    missing_state = {
+        "enabled": True,
+        "expiry_timestamp_ms": 2_000_000_000_000,
+        "force_unlimited": True,
+        "recreate_missing": True,
+        "client_identifier": "11111111-1111-4111-8111-111111111111",
+        "telegram_id": "12345",
+        "ip_limit": 0,
+    }
+    with (
+        patch.object(
+            xui_api,
+            "get_host",
+            return_value={
+                "host_url": host_url,
+                "host_username": "username",
+                "host_pass": "password",
+                "host_inbound_id": sync_inbound.id,
+                "api_token": "token",
+            },
+        ),
+        patch.object(
+            xui_api,
+            "login_to_host",
+            return_value=(native_api, sync_inbound),
+        ),
+        patch.object(
+            xui_api,
+            "_get_inbound_by_id_compat",
+            return_value=sync_inbound,
+        ),
+        patch.object(
+            xui_api,
+            "update_or_create_client_on_panel",
+            return_value=(
+                missing_state["client_identifier"],
+                missing_state["expiry_timestamp_ms"],
+            ),
+        ) as recreate_client,
+    ):
+        sync_result = xui_api._sync_clients_state_on_host_sync(
+            "missing-client-host",
+            {"missing@example.test": missing_state},
+        )
+    expect(
+        sync_result["recreated"] == 1
+        and sync_result["updated"] == 1
+        and sync_result["not_found"] == 0
+        and sync_result["errors"] == 0,
+        "active panel client was not recreated from DB state",
+    )
+    expect(
+        recreate_client.call_args.kwargs.get("client_identifier")
+        == missing_state["client_identifier"],
+        "active panel client recreation did not preserve its stored credential",
+    )
+
+    expired_state = dict(missing_state, enabled=False, recreate_missing=False)
+    with (
+        patch.object(
+            xui_api,
+            "get_host",
+            return_value={
+                "host_url": host_url,
+                "host_username": "username",
+                "host_pass": "password",
+                "host_inbound_id": sync_inbound.id,
+                "api_token": "token",
+            },
+        ),
+        patch.object(
+            xui_api,
+            "login_to_host",
+            return_value=(native_api, sync_inbound),
+        ),
+        patch.object(
+            xui_api,
+            "_get_inbound_by_id_compat",
+            return_value=sync_inbound,
+        ),
+        patch.object(xui_api, "update_or_create_client_on_panel") as recreate_expired,
+    ):
+        sync_result = xui_api._sync_clients_state_on_host_sync(
+            "missing-expired-client-host",
+            {"expired@example.test": expired_state},
+        )
+    expect(
+        sync_result["recreated"] == 0
+        and sync_result["not_found"] == 1
+        and not recreate_expired.called,
+        "expired missing client was unexpectedly recreated",
+    )
+
     api = _api()
     client = _client()
     raw_client = {
@@ -203,9 +358,7 @@ def main() -> int:
         return f"vless://{kwargs['client_identifier']}@example.test:443"
 
     client_rows = [(f"user-{index}", f"id-{index}") for index in range(12)]
-    with patch.object(
-        xui_api, "_connection_string_for_client", side_effect=build_link
-    ):
+    with patch.object(xui_api, "_connection_string_for_client", side_effect=build_link):
         links = xui_api._connection_strings_for_client_rows(
             api=SimpleNamespace(),
             inbound=SimpleNamespace(),
