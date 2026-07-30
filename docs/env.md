@@ -51,7 +51,8 @@ CDN или дополнительный proxy нужно добавить явн
 - `admin_ip_allowlist`
 - `telegram_bot_token`
 - `support_bot_token`
-- `telegram_bot_username`
+- `telegram_bot_username` — username основного бота; используется в том числе
+  для Telegram-ссылок `Support-Url` и `Profile-Web-Page-Url` в карточке Happ
 - `admin_telegram_id`
 - `support_group_id`
 - `domain`
@@ -61,7 +62,8 @@ CDN или дополнительный proxy нужно добавить явн
 
 - `about_text`
 - `support_text`
-- `support_user`
+- `support_user` — URL поддержки для кнопок внутри Telegram-бота; карточка Happ
+  всегда ведёт в основной бот из `telegram_bot_username`
 - `channel_url`
 - `terms_url`
 - `privacy_url`

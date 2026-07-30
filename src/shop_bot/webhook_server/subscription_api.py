@@ -186,6 +186,13 @@ def _build_telegram_renew_url(bot_username: str | None) -> str | None:
     return f"https://t.me/{username}?start=renew"
 
 
+def _build_telegram_bot_url(bot_username: str | None) -> str | None:
+    username = str(bot_username or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    return f"https://t.me/{username}"
+
+
 def _subscription_update_interval_hours(value: str | None) -> int:
     try:
         interval = int(str(value or "").strip())
@@ -662,13 +669,12 @@ def get_subscription(token):
         if userinfo_parts:
             headers["Subscription-Userinfo"] = "; ".join(userinfo_parts)
 
-        support_url = _safe_external_url(get_setting("support_user"))
-        if support_url:
-            headers["Support-Url"] = support_url
+        bot_username = get_setting("telegram_bot_username")
+        bot_url = _build_telegram_bot_url(bot_username)
+        if bot_url:
+            headers["Support-Url"] = bot_url
 
-        renew_url = _build_telegram_renew_url(
-            get_setting("telegram_bot_username")
-        )
+        renew_url = _build_telegram_renew_url(bot_username)
         if renew_url:
             headers["Profile-Web-Page-Url"] = renew_url
 

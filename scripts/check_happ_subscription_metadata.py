@@ -7,6 +7,7 @@ from pathlib import Path
 
 from shop_bot.utils import time_utils
 from shop_bot.webhook_server.subscription_api import (
+    _build_telegram_bot_url,
     _build_telegram_renew_url,
     _safe_external_url,
     _subscription_expiry,
@@ -38,6 +39,11 @@ def main() -> int:
         _build_telegram_renew_url("@stopurban_bot")
         == "https://t.me/stopurban_bot?start=renew"
     )
+    assert (
+        _build_telegram_bot_url("@Stopurban_bot")
+        == "https://t.me/Stopurban_bot"
+    )
+    assert _build_telegram_bot_url("bad name") is None
     assert _build_telegram_renew_url("bad name") is None
     assert _subscription_update_interval_hours("6") == 6
     assert _subscription_update_interval_hours("24") == 24
