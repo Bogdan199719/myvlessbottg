@@ -1719,12 +1719,12 @@ def release_xui_ip_limits(key_ids: list[int] | None = None) -> list[dict]:
         return []
 
 
-def prune_xui_ip_limit_history(retention_days: int = 30) -> int:
+def prune_xui_ip_limit_history(retention_days: int = 7) -> int:
     """Delete completed IP-limit events after the audit retention period."""
     try:
         safe_retention_days = max(1, int(retention_days))
     except (TypeError, ValueError):
-        safe_retention_days = 30
+        safe_retention_days = 7
     cutoff = (
         time_utils.get_msk_now() - timedelta(days=safe_retention_days)
     ).isoformat()
@@ -2183,11 +2183,11 @@ def get_xui_ip_limit_user_events(limit: int = 100) -> list[dict]:
         return []
 
 
-def prune_xui_ip_limit_user_history(retention_days: int = 30) -> int:
+def prune_xui_ip_limit_user_history(retention_days: int = 7) -> int:
     try:
         safe_retention_days = max(1, int(retention_days))
     except (TypeError, ValueError):
-        safe_retention_days = 30
+        safe_retention_days = 7
     cutoff = (
         time_utils.get_msk_now() - timedelta(days=safe_retention_days)
     ).isoformat()

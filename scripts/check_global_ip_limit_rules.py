@@ -182,7 +182,7 @@ with tempfile.TemporaryDirectory(prefix="shopbot-global-ip-limit-") as temp_dir:
     assert bulk == [{"user_id": 1002}]
     assert database.get_enforced_xui_ip_limit_user_ids() == set()
 
-    history_cutoff = time_utils.get_msk_now() - timedelta(days=31)
+    history_cutoff = time_utils.get_msk_now() - timedelta(days=8)
     with sqlite3.connect(database.DB_FILE) as conn:
         conn.execute(
             """
@@ -193,7 +193,7 @@ with tempfile.TemporaryDirectory(prefix="shopbot-global-ip-limit-") as temp_dir:
             (history_cutoff.isoformat(timespec="seconds"),),
         )
         conn.commit()
-    assert database.prune_xui_ip_limit_user_history(30) == 2
+    assert database.prune_xui_ip_limit_user_history(7) == 2
     remaining = database.get_xui_ip_limit_user_events()
     assert [item["user_id"] for item in remaining] == [1001]
 

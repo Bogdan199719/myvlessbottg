@@ -136,14 +136,14 @@ with tempfile.TemporaryDirectory(prefix="shopbot-ip-limit-check-") as temp_dir:
     assert database.get_enforced_xui_ip_limit_key_ids() == set()
     assert database.release_xui_ip_limits() == []
 
-    history_cutoff = time_utils.get_msk_now() - timedelta(days=31)
+    history_cutoff = time_utils.get_msk_now() - timedelta(days=8)
     with sqlite3.connect(database.DB_FILE) as conn:
         conn.execute(
             "UPDATE xui_ip_limit_events SET resolved_at=? WHERE key_id IN (43, 44)",
             (history_cutoff.isoformat(timespec="seconds"),),
         )
         conn.commit()
-    assert database.prune_xui_ip_limit_history(30) == 2
+    assert database.prune_xui_ip_limit_history(7) == 2
     remaining_ids = {
         item["key_id"] for item in database.get_xui_ip_limit_events()
     }
