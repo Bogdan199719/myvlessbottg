@@ -120,6 +120,16 @@ class _BestEffortProcessingMessage:
         return None
 
 
+def _is_payment_fulfillment_retry(metadata: dict | None) -> bool:
+    """Return whether user-visible fulfillment processing already started."""
+    if (metadata or {}).get("fulfillment_status_message_sent_at"):
+        return True
+    try:
+        return int((metadata or {}).get("fulfillment_target_expiry_ms") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
     domain_value = (domain or "").strip()
     token_value = (token or "").strip()
@@ -448,6 +458,82 @@ def _plan_snapshot(plan: dict) -> dict:
         "service_type": str(plan.get("service_type") or "xui"),
         "plan_name": str(plan.get("plan_name") or f"{plan['months']} мес."),
     }
+
+
+def _calculate_plan_quote(plan: dict, user_data: dict | None) -> tuple[Decimal, bool]:
+    """Return an authoritative server-side RUB quote for a payment method."""
+    base_price = Decimal(str(plan["price"]))
+    final_price = base_price
+    user_data = user_data or {}
+    if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
+        try:
+            discount_percentage = Decimal(
+                str(get_setting("referral_discount") or "0")
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            discount_percentage = Decimal("0")
+        if Decimal("0") < discount_percentage < Decimal("100"):
+            discount_amount = (
+                base_price * discount_percentage / Decimal("100")
+            ).quantize(Decimal("0.01"))
+            final_price = base_price - discount_amount
+    return final_price, final_price < base_price
+
+
+def _validate_plan_selection(
+    plan: dict | None,
+    *,
+    host_name: str,
+    action: str,
+    key_id: int,
+    user_id: int,
+) -> tuple[bool, str]:
+    """Validate callback fields against authoritative plan/key records."""
+    if not plan:
+        return False, "Тариф не найден. Откройте список тарифов заново."
+    if action not in {"new", "extend"}:
+        return False, "Некорректное действие с тарифом."
+
+    plan_host = str(plan.get("host_name") or "")
+    service_type = str(plan.get("service_type") or "xui")
+    if service_type == "xui":
+        if host_name != "ALL" or plan_host != "ALL":
+            return False, "Этот VPN-тариф не относится к единой подписке."
+    elif service_type == "mtg":
+        if not host_name or host_name != plan_host:
+            return False, "Тариф не относится к выбранному прокси-серверу."
+    else:
+        return False, "Неизвестный тип услуги."
+
+    if action == "new":
+        if key_id != 0:
+            return False, "Некорректный идентификатор нового подключения."
+        return True, ""
+
+    key = get_key_by_id(key_id)
+    if not key or int(key.get("user_id") or 0) != int(user_id):
+        return False, "Ключ для продления не найден или принадлежит другому пользователю."
+    if str(key.get("service_type") or "xui") != service_type:
+        return False, "Тип ключа не совпадает с выбранным тарифом."
+    if service_type == "mtg" and str(key.get("host_name") or "") != host_name:
+        return False, "Ключ и тариф относятся к разным прокси-серверам."
+    return True, ""
+
+
+def _validate_payment_state_plan(
+    plan: dict | None, data: dict, user_id: int
+) -> tuple[bool, str]:
+    """Revalidate persisted FSM fields immediately before invoice creation."""
+    try:
+        return _validate_plan_selection(
+            plan,
+            host_name=str(data.get("host_name") or ""),
+            action=str(data.get("action") or ""),
+            key_id=int(data.get("key_id") or 0),
+            user_id=user_id,
+        )
+    except (TypeError, ValueError):
+        return False, "Некорректные параметры покупки."
 
 
 def _get_stars_transaction(payment_id: str) -> dict | None:
@@ -1667,6 +1753,12 @@ def get_user_router() -> Router:
     async def trial_period_handler(callback: types.CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         user_db_data = get_user(user_id)
+        if not user_db_data or not user_db_data.get("agreed_to_terms"):
+            await callback.answer(
+                "Сначала подтвердите согласие с условиями через /start.",
+                show_alert=True,
+            )
+            return
         if get_setting("trial_enabled") != "true":
             await callback.answer("Пробный период сейчас недоступен.", show_alert=True)
             return
@@ -1717,6 +1809,7 @@ def get_user_router() -> Router:
         )
 
         results: list[dict] = []
+        panel_mutated = False
         try:
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
@@ -1749,6 +1842,7 @@ def get_user_router() -> Router:
                 )
                 if not result:
                     continue
+                panel_mutated = True
 
                 expiry_datetime = time_utils.from_timestamp_ms(
                     result["expiry_timestamp_ms"]
@@ -1786,7 +1880,13 @@ def get_user_router() -> Router:
                 results.append(result)
 
             if not results:
-                release_trial_claim(user_id)
+                if not panel_mutated:
+                    release_trial_claim(user_id)
+                else:
+                    logger.error(
+                        "Trial panel access changed for user %s but no local key was persisted; claim retained for safe reconciliation.",
+                        user_id,
+                    )
                 await message.edit_text(
                     "❌ Не удалось создать пробный доступ. Ошибка на сервере."
                 )
@@ -1846,7 +1946,7 @@ def get_user_router() -> Router:
             await notify_admin_of_trial(message.bot, user_id, "ALL", trial_days)
 
         except Exception as e:
-            if not results:
+            if not results and not panel_mutated:
                 release_trial_claim(user_id)
             logger.error(
                 f"Error creating trial key for user {user_id} on host {host_name}: {e}",
@@ -1859,6 +1959,13 @@ def get_user_router() -> Router:
     async def enter_promo_code_handler(
         callback: types.CallbackQuery, state: FSMContext
     ):
+        user_data = get_user(callback.from_user.id)
+        if not user_data or not user_data.get("agreed_to_terms"):
+            await callback.answer(
+                "Сначала подтвердите согласие с условиями через /start.",
+                show_alert=True,
+            )
+            return
         if str(get_setting("enable_promo_codes") or "true").lower() != "true":
             await callback.answer("Промокоды сейчас недоступны.", show_alert=True)
             await show_main_menu(callback.message, edit_message=True)
@@ -2555,15 +2662,47 @@ def get_user_router() -> Router:
     async def plan_selection_handler(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
 
-        parts = callback.data.split("_")[1:]
-        action = parts[-2]
-        key_id = int(parts[-1])
-        plan_id = int(parts[-3])
-        host_name = "_".join(parts[:-3])
+        user_data = get_user(callback.from_user.id)
+        if not user_data or not user_data.get("agreed_to_terms"):
+            await callback.message.edit_text(
+                "❌ Сначала подтвердите согласие с условиями через /start."
+            )
+            await state.clear()
+            return
+
+        try:
+            parts = callback.data.split("_")[1:]
+            action = parts[-2]
+            key_id = int(parts[-1])
+            plan_id = int(parts[-3])
+            host_name = "_".join(parts[:-3])
+        except (IndexError, TypeError, ValueError):
+            await callback.message.edit_text(
+                "❌ Некорректный тариф. Откройте список тарифов заново."
+            )
+            await state.clear()
+            return
 
         # Determine service_type from plan to route payment fulfillment correctly
         _plan = get_plan_by_id(plan_id)
-        service_type = _plan.get("service_type", "xui") if _plan else "xui"
+        selection_valid, selection_error = _validate_plan_selection(
+            _plan,
+            host_name=host_name,
+            action=action,
+            key_id=key_id,
+            user_id=callback.from_user.id,
+        )
+        if not selection_valid:
+            logger.warning(
+                "Rejected invalid plan selection user=%s plan_id=%s action=%s",
+                callback.from_user.id,
+                plan_id,
+                action,
+            )
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+        service_type = str(_plan.get("service_type") or "xui")
 
         await state.update_data(
             action=action,
@@ -2607,15 +2746,7 @@ def get_user_router() -> Router:
             return
 
         await state.update_data(customer_email=None)
-        await callback.message.edit_text(
-            message_text,
-            reply_markup=keyboards.create_payment_method_keyboard(
-                payment_methods=payment_methods,
-                action=action,
-                key_id=key_id,
-            ),
-        )
-        await state.set_state(PaymentProcess.waiting_for_payment_method)
+        await show_payment_options(callback.message, state, message_text)
         logger.info(
             f"User {callback.from_user.id}: State set to waiting_for_payment_method"
         )
@@ -2688,7 +2819,11 @@ def get_user_router() -> Router:
         await state.update_data(customer_email=None)
         await _create_yookassa_payment(callback, state)
 
-    async def show_payment_options(message: types.Message, state: FSMContext):
+    async def show_payment_options(
+        message: types.Message,
+        state: FSMContext,
+        base_message: str = CHOOSE_PAYMENT_METHOD_MESSAGE,
+    ):
         data = await state.get_data()
         user_data = get_user(message.chat.id)
         plan = get_plan_by_id(data.get("plan_id"))
@@ -2699,28 +2834,22 @@ def get_user_router() -> Router:
             return
 
         price = Decimal(str(plan["price"]))
-        final_price = price
-        message_text = CHOOSE_PAYMENT_METHOD_MESSAGE
+        final_price, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
+        message_text = base_message
 
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
+        if referral_discount_applied:
             discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-
-            if discount_percentage > 0:
-                discount_amount = (price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                final_price = price - discount_amount
-
-                message_text = (
-                    f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
-                    f"Старая цена: <s>{price:.2f} RUB</s>\n"
-                    f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
-                ) + CHOOSE_PAYMENT_METHOD_MESSAGE
+            message_text = (
+                f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
+                f"Старая цена: <s>{price:.2f} RUB</s>\n"
+                f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
+            ) + base_message
 
         await state.update_data(
             final_price=float(final_price),
-            referral_discount_applied=bool(final_price < price),
+            referral_discount_applied=referral_discount_applied,
         )
 
         methods = get_active_payment_methods(
@@ -2793,17 +2922,17 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
-        base_price = Decimal(str(plan["price"]))
-        price_rub = base_price
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await message_obj.answer(f"❌ {selection_error}")
+            await state.clear()
+            return
 
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
-            discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-            if discount_percentage > 0:
-                discount_amount = (base_price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                price_rub = base_price - discount_amount
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
 
         customer_email = data.get("customer_email")
         if not customer_email:
@@ -2833,7 +2962,6 @@ def get_user_router() -> Router:
         key_id = data.get("key_id")
         months = plan["months"]
         plan_snapshot = _plan_snapshot(plan)
-        referral_discount_applied = bool(price_rub < base_price)
 
         try:
             price_str_for_api = f"{price_rub:.2f}"
@@ -2879,7 +3007,9 @@ def get_user_router() -> Router:
             if receipt:
                 payment_payload["receipt"] = receipt
 
-            payment = Payment.create(payment_payload, uuid.uuid4())
+            payment = await asyncio.to_thread(
+                Payment.create, payment_payload, uuid.uuid4()
+            )
             payment_id = str(getattr(payment, "id", "") or "").strip()
             if not payment_id:
                 raise RuntimeError("YooKassa payment id is missing in API response")
@@ -3044,6 +3174,14 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+
         stars_rate_setting = get_setting("stars_rub_per_star")
         try:
             rub_per_star = (
@@ -3065,7 +3203,9 @@ def get_user_router() -> Router:
                 await state.clear()
                 return
 
-        price_rub = Decimal(str(data.get("final_price", plan["price"])))
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, get_user(user_id)
+        )
         stars_amount = int(
             (price_rub / rub_per_star).to_integral_value(rounding=ROUND_CEILING)
         )
@@ -3088,7 +3228,7 @@ def get_user_router() -> Router:
             "plan_id": data.get("plan_id"),
             "customer_email": data.get("customer_email"),
             "payment_method": "Telegram Stars",
-            "referral_discount_applied": bool(data.get("referral_discount_applied")),
+            "referral_discount_applied": referral_discount_applied,
         }
 
         title = f"Подписка на {plan['months']} мес."
@@ -3309,25 +3449,19 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
-        if not plan:
-            await callback.message.answer("Произошла ошибка при выборе тарифа.")
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
             await state.clear()
             return
 
-        base_price = Decimal(str(plan["price"]))
-        price_rub = base_price
-
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
-            discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-            if discount_percentage > 0:
-                discount_amount = (base_price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                price_rub = base_price - discount_amount
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
         months = plan["months"]
         plan_snapshot = _plan_snapshot(plan)
-        referral_discount_applied = bool(price_rub < base_price)
 
         payment_id = None
         try:
@@ -3422,7 +3556,7 @@ def get_user_router() -> Router:
                 exc_info=True,
             )
             await callback.message.edit_text(
-                f"❌ Не удалось создать счет для оплаты криптовалютой.\n\n<pre>Ошибка: {e}</pre>"
+                "❌ Не удалось создать счет для оплаты криптовалютой. Попробуйте позже."
             )
             await state.clear()
 
@@ -3453,8 +3587,17 @@ def get_user_router() -> Router:
         plan_id = data.get("plan_id")
         plan = get_plan_by_id(plan_id) if plan_id else None
 
-        base_price = Decimal(str(plan["price"])) if plan else Decimal("0")
-        final_price = Decimal(str(data.get("final_price", base_price)))
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+
+        final_price, referral_discount_applied = _calculate_plan_quote(
+            plan, get_user(user_id)
+        )
         price_rub = float(final_price)
 
         created = create_p2p_request(
@@ -3474,9 +3617,7 @@ def get_user_router() -> Router:
                     if plan
                     else None
                 ),
-                "referral_discount_applied": bool(
-                    data.get("referral_discount_applied")
-                ),
+                "referral_discount_applied": referral_discount_applied,
                 "submitted": False,
             },
         )
@@ -3803,7 +3944,8 @@ async def get_usdt_rub_rate() -> Decimal | None:
     params = {"symbol": "USDTRUB"}
 
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10, connect=3, sock_read=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, params=params) as response:
                 response.raise_for_status()
                 data = await response.json()
@@ -4306,6 +4448,7 @@ async def _execute_payment_for_hosts(
     hosts_to_process: list[tuple[str, str]],
     key_id: int,
     target_expiry_ms: int | None = None,
+    preserve_longer_expiry: bool = True,
 ) -> tuple[list[dict], int | None]:
     """Create/extend keys on all target hosts and update DB."""
     results: list[dict] = []
@@ -4326,6 +4469,7 @@ async def _execute_payment_for_hosts(
                     email=h_email,
                     target_expiry_ms=int(target_expiry_ms),
                     telegram_id=str(user_id),
+                    preserve_longer_expiry=preserve_longer_expiry,
                 )
             else:
                 res = await xui_api.create_or_update_key_on_host(
@@ -4407,6 +4551,7 @@ async def _execute_payment_for_hosts(
 
 async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     pending_flag_set = False
+    is_fulfillment_retry = _is_payment_fulfillment_retry(metadata)
     try:
         logger.info(
             "Processing successful payment for user %s provider_payment_id=%s plan_id=%s action=%s",
@@ -4440,7 +4585,10 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         # Additional safety check for keys
         if action in ["extend", "new"] and not host_name:
             logger.error(
-                f"Missing host_name in metadata for action {action}: {metadata}"
+                "Missing host_name in payment metadata provider_payment_id=%s plan_id=%s action=%s",
+                metadata.get("provider_payment_id"),
+                plan_id,
+                action,
             )
             await bot.send_message(
                 user_id,
@@ -4473,7 +4621,11 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
     except (ValueError, TypeError) as e:
         logger.error(
-            f"FATAL: Could not parse metadata. Error: {e}. Metadata: {metadata}"
+            "FATAL: Could not parse payment metadata provider_payment_id=%s plan_id=%s action=%s: %s",
+            metadata.get("provider_payment_id"),
+            metadata.get("plan_id"),
+            metadata.get("action"),
+            e,
         )
         if "user_id" in metadata:
             set_pending_payment(int(metadata["user_id"]), False)
@@ -4503,18 +4655,36 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         except Exception as e:
             logger.warning(f"Could not delete payment message: {e}")
 
-    try:
-        processing_message = await bot.send_message(
-            chat_id=user_id,
-            text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
-        )
-    except Exception as e:
-        logger.warning(
-            "Payment fulfillment for user %s will continue without a processing message: %s",
+    processing_message = _BestEffortProcessingMessage()
+    if is_fulfillment_retry:
+        logger.info(
+            "Suppressing duplicate user status message for payment fulfillment retry user=%s payment=%s.",
             user_id,
-            e,
+            metadata.get("provider_payment_id"),
         )
-        processing_message = _BestEffortProcessingMessage()
+    else:
+        metadata["fulfillment_status_message_sent_at"] = (
+            time_utils.get_msk_now().isoformat()
+        )
+        provider_payment_id = metadata.get("provider_payment_id")
+        if provider_payment_id and not update_reserved_transaction_metadata(
+            str(provider_payment_id), metadata
+        ):
+            logger.warning(
+                "Could not persist user notification checkpoint for payment %s.",
+                provider_payment_id,
+            )
+        try:
+            processing_message = await bot.send_message(
+                chat_id=user_id,
+                text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
+            )
+        except Exception as e:
+            logger.warning(
+                "Payment fulfillment for user %s will continue without a processing message: %s",
+                user_id,
+                e,
+            )
 
     try:
         # ── MTG Proxy branch ──────────────────────────────────────────────
@@ -4592,6 +4762,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             hosts_to_process=hosts_to_process,
             key_id=key_id,
             target_expiry_ms=target_expiry_ms,
+            preserve_longer_expiry=not bool(
+                metadata.get("fulfillment_target_corrected_at")
+            ),
         )
 
         if not results:
@@ -4613,10 +4786,14 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 len(hosts_to_process),
                 failed_hosts,
             )
-            await processing_message.edit_text(
-                "✅ Оплата получена, но не все серверы выданы. "
-                "Я повторю выдачу автоматически; если доступ не появится в ближайшее время, обратитесь в поддержку."
-            )
+            try:
+                await processing_message.delete()
+            except Exception as e:
+                logger.warning(
+                    "Could not remove incomplete global payment status for user %s: %s",
+                    user_id,
+                    e,
+                )
             return False
 
         price = float(metadata.get("price"))

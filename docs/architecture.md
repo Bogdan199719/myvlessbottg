@@ -42,6 +42,7 @@
 - legacy panels use `/panel/api/inbounds/addClient`, `/updateClient`, `/:id/delClient` and traffic endpoints through the py3xui client;
 - current 3x-ui panels also expose `/panel/api/clients/add`, `/update/:email`, `/del/:email`, `/:email/attach`, `/resetTraffic/:email` and `/traffic/:email`;
 - integration code prefers the current clients API and falls back to legacy inbound routes only when those endpoints are unavailable;
+- current panels may return optional `streamSettings` as `null` and default `sniffing` as an empty object; the integration normalises these valid wire values before validation by `py3xui==0.7.0`;
 - Hysteria/Hysteria2 clients still use the raw JSON API because the SDK client model does not expose the panel's `auth` field. Payloads are normalised so numeric fields such as `tgId`, `expiryTime`, `totalGB` and `limitIp` are sent as numbers for newer Go validators.
 
 ### Admin web layer
@@ -60,6 +61,8 @@
 6. Для VPN пользователь получает постоянную `/sub/<token>` ссылку и кнопку `🔌 Подключить в Happ`; отдельные XUI-ключи по хостам остаются техническими записями для 3x-ui, но не продаются и не показываются пользователю как отдельный товар.
 7. Кнопка ведёт на HTTPS endpoint `/happ/<token>`, который проверяет token и отдаёт `302 Location: happ://add/https://<domain>/sub/<token>`.
 8. Scheduler дальше поддерживает срок, статус, уведомления и довыдачу недостающих включённых XUI-хостов для active global paid и active global trial.
+
+Для provider-confirmed платежа локальная metadata является источником durable checkpoint-полей `fulfillment_*`. Повторная проверка YooKassa обновляет исходный invoice snapshot данными провайдера, но не должна затирать абсолютную цель выдачи, стабильный email клиента или checkpoint пользовательского уведомления.
 
 Промокод использует отдельный durable reservation в `promo_code_redemptions`. До обращения к 3x-ui в нём сохраняется абсолютная дата окончания выдачи. Если обработана только часть хостов, пользователь повторно вводит тот же код, а уже успешные хосты получают ту же дату без повторного начисления дней.
 

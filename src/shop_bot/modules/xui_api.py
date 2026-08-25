@@ -386,10 +386,21 @@ def _normalize_inbound_payload(data: dict) -> dict:
     for field_name in ("settings", "streamSettings", "sniffing"):
         if field_name in normalized:
             normalized[field_name] = _json_string_to_dict(normalized[field_name])
-    # Recent 3x-ui versions may serialize disabled sniffing as JSON null,
-    # while py3xui's Inbound model requires a Sniffing object.
-    if normalized.get("sniffing") is None:
+
+    # Current 3x-ui versions expose streamSettings as optional. They may
+    # serialize an absent value as null (or an empty object), while py3xui
+    # 0.7.0 only accepts a modeled object or an empty string.
+    if normalized.get("streamSettings") in (None, {}):
+        normalized["streamSettings"] = ""
+
+    # 3x-ui also permits an empty/default sniffing object. py3xui 0.7.0
+    # still requires the enabled field, so supply the panel's false default
+    # without changing any other sniffing options returned by the panel.
+    sniffing = normalized.get("sniffing")
+    if sniffing in (None, ""):
         normalized["sniffing"] = {"enabled": False}
+    elif isinstance(sniffing, dict) and "enabled" not in sniffing:
+        normalized["sniffing"] = {**sniffing, "enabled": False}
     return normalized
 
 

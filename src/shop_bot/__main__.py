@@ -10,6 +10,7 @@ from shop_bot.webhook_server.restore_manager import (
     apply_pending_restore,
     quarantine_pending_restore,
 )
+from shop_bot.utils.logging_utils import SensitiveUrlFilter
 
 load_dotenv()
 
@@ -86,6 +87,8 @@ def _configure_logging() -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(SensitiveUrlFilter())
     logging.getLogger("aiogram.dispatcher").addFilter(
         _RateLimitedDispatcherNoiseFilter(interval_seconds=60)
     )
@@ -125,18 +128,15 @@ def _register_signal_handlers(
 
 
 def _run_flask_server(flask_app, logger: logging.Logger) -> None:
-    try:
-        from waitress import serve
+    from waitress import serve
 
-        logger.info(
-            "Starting production server (waitress) on http://%s:%s", APP_HOST, APP_PORT
-        )
-        serve(flask_app, host=APP_HOST, port=APP_PORT, _quiet=True)
-    except Exception as e:
-        logger.warning(
-            "Waitress failed to start (%s). Falling back to Flask built-in server.", e
-        )
-        flask_app.run(host=APP_HOST, port=APP_PORT, threaded=True, use_reloader=False)
+    logger.info(
+        "Starting production server (waitress) on http://%s:%s", APP_HOST, APP_PORT
+    )
+    # Production must fail fast if Waitress cannot start.  Silently falling
+    # back would leave the service looking healthy on Flask's development
+    # server with different reliability and security properties.
+    serve(flask_app, host=APP_HOST, port=APP_PORT, _quiet=True)
 
 
 def _log_bot_autostart_result(

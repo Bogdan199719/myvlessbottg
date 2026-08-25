@@ -20,7 +20,11 @@ def main() -> int:
     handlers_source = (root / "src/shop_bot/bot/handlers.py").read_text(
         encoding="utf-8"
     )
+    scheduler_source = (
+        root / "src/shop_bot/data_manager/scheduler.py"
+    ).read_text(encoding="utf-8")
     tree = ast.parse(handlers_source)
+    scheduler_tree = ast.parse(scheduler_source)
     functions = {
         node.name: node
         for node in ast.walk(tree)
@@ -28,6 +32,9 @@ def main() -> int:
     }
     process_source = ast.get_source_segment(
         handlers_source, functions["process_successful_payment"]
+    )
+    retry_source = ast.get_source_segment(
+        handlers_source, functions["_is_payment_fulfillment_retry"]
     )
     mtg_source = ast.get_source_segment(
         handlers_source, functions["_create_mtg_proxy_after_payment"]
@@ -38,6 +45,42 @@ def main() -> int:
     assert "_target_expiry_ms_for_service_payment(" in process_source
     assert 'metadata.get("fulfillment_key_email")' in process_source
     assert 'metadata["fulfillment_key_email"]' in process_source
+    assert "if is_fulfillment_retry:" in process_source
+    assert "Suppressing duplicate user status message" in process_source
+    assert "fulfillment_status_message_sent_at" in process_source
+    assert "update_reserved_transaction_metadata(" in process_source
+    assert "Оплата получена, но не все серверы выданы" not in process_source
+    assert "Could not remove incomplete global payment status" in process_source
+    assert 'metadata.get("fulfillment_target_corrected_at")' in process_source
+    assert "_merge_yookassa_payment_metadata(" in scheduler_source
+
+    retry_namespace: dict = {}
+    exec(retry_source, retry_namespace)
+    is_fulfillment_retry = retry_namespace["_is_payment_fulfillment_retry"]
+    assert not is_fulfillment_retry({})
+    assert is_fulfillment_retry({"fulfillment_target_expiry_ms": 1})
+    assert is_fulfillment_retry(
+        {"fulfillment_status_message_sent_at": "2026-08-25T21:00:00+03:00"}
+    )
+
+    scheduler_functions = {
+        node.name: node
+        for node in scheduler_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    merge_namespace: dict = {}
+    exec(
+        compile(
+            ast.Module(
+                body=[scheduler_functions["_merge_yookassa_payment_metadata"]],
+                type_ignores=[],
+            ),
+            "scheduler_metadata_merge_check",
+            "exec",
+        ),
+        merge_namespace,
+    )
+    merge_yookassa_metadata = merge_namespace["_merge_yookassa_payment_metadata"]
     assert "apply_payment_accounting_once(" in mtg_source
     assert "get_proxy_details(" in mtg_source
     assert "refusing a relative renew" in mtg_source
@@ -50,6 +93,24 @@ def main() -> int:
         os.environ["DB_PATH"] = str(Path(tmp_dir) / "test.db")
         from shop_bot.data_manager import database
         from shop_bot.utils import time_utils
+
+        merged_metadata = merge_yookassa_metadata(
+            {
+                "price": "549.0",
+                "fulfillment_target_expiry_ms": 1_795_000_000_000,
+                "fulfillment_key_email": "stable-client",
+                "accounting_applied": True,
+            },
+            {
+                "price": "549.0",
+                "host_name": "ALL",
+                "fulfillment_target_expiry_ms": 9_999,
+            },
+        )
+        assert merged_metadata["host_name"] == "ALL"
+        assert merged_metadata["fulfillment_target_expiry_ms"] == 1_795_000_000_000
+        assert merged_metadata["fulfillment_key_email"] == "stable-client"
+        assert merged_metadata["accounting_applied"] is True
 
         database.initialize_db()
         database.register_user_if_not_exists(1, "buyer", None)

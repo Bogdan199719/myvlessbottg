@@ -402,3 +402,11 @@ docker exec myvlessbottg-bot-1 python3 scripts/check_xui_connection_equivalence.
 - В live-БД проверены 3 984 активных XUI-ключа: пустых или синтаксически неверных connection strings нет.
 - Все 22 `scripts/check_*.py`, `compileall`, `pip check`, Black для изменённых Python-файлов и `pylint --errors-only` прошли.
 - Контейнер и `/healthz` были healthy; scheduler завершал DB enforce, host health и IP-limit циклы без текущих ошибок. За предыдущие сутки зафиксированы два восстановившихся сетевых сбоя отдельных панелей; незавершённых активных global subscriptions после retry не осталось.
+
+## YooKassa retry and current 3x-ui wire compatibility — 2026-08-25
+
+- Устранено повторное пользовательское уведомление при частичной глобальной выдаче: первый processing-status получает durable checkpoint, последующие попытки выполняются молча, а временное сообщение удаляется при переходе в фоновый retry.
+- YooKassa fallback теперь объединяет provider metadata с локальными `fulfillment_*` checkpoint-полями. Сохранённая абсолютная дата больше не теряется при повторной проверке платежа и уже успешные хосты не получают повторное прибавление срока.
+- Нормализованы допустимые ответы новых 3x-ui, где optional `streamSettings` равен `null`, а default `sniffing` приходит пустым объектом; это сохраняет совместимость с закреплённым `py3xui==0.7.0`.
+- В production восстановлены две затронутые provider-confirmed выдачи: обе финализированы как `paid`, бухгалтерия применена один раз, все 24 клиентские записи на 12 хостах совпадают с SQLite по абсолютному сроку.
+- После исправления все включённые XUI-хосты прошли login/inbound lookup, live health показывает `12/12`, незавершённых provider-confirmed YooKassa-транзакций нет.

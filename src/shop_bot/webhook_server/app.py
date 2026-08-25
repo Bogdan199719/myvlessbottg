@@ -18,7 +18,7 @@ import time as _time
 from collections import defaultdict
 from hmac import compare_digest
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from shop_bot.utils import time_utils, update_manager
 from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
@@ -683,18 +683,6 @@ def _reserve_pending_transaction_for_cryptobot(
         amount_currency=amount_currency,
         currency_name=currency_name,
     )
-
-
-def _extract_cryptobot_secret_from_request() -> str | None:
-    header_secret = (request.headers.get("X-CryptoBot-Secret") or "").strip()
-    if header_secret:
-        return header_secret
-
-    authorization = (request.headers.get("Authorization") or "").strip()
-    if authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-
-    return None
 
 
 def _is_valid_cryptobot_signature() -> bool:
@@ -4590,7 +4578,25 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def add_plan_route():
         service_type = request.form.get("service_type", "xui")
-        host_name = request.form["host_name"]
+        host_name = request.form.get("host_name", "").strip()
+        plan_name = request.form.get("plan_name", "").strip()
+        try:
+            months = int(request.form.get("months", ""))
+            price_decimal = Decimal(request.form.get("price", ""))
+        except (InvalidOperation, ValueError, TypeError):
+            flash("Срок и цена тарифа должны быть числами.", "danger")
+            return redirect(url_for("settings_page"))
+        if (
+            service_type not in {"xui", "mtg"}
+            or not host_name
+            or not plan_name
+            or not 1 <= months <= 120
+            or not price_decimal.is_finite()
+            or price_decimal <= 0
+            or price_decimal > Decimal("1000000")
+        ):
+            flash("Проверьте тип услуги, название, срок и цену тарифа.", "danger")
+            return redirect(url_for("settings_page"))
         if service_type == "xui" and host_name != "ALL":
             flash(
                 "VPN продается только как единая подписка. Добавляйте XUI-тарифы в блоке глобальных тарифов.",
@@ -4600,9 +4606,9 @@ def create_webhook_app(bot_controller_instance):
 
         create_plan(
             host_name=host_name,
-            plan_name=request.form["plan_name"],
-            months=int(request.form["months"]),
-            price=float(request.form["price"]),
+            plan_name=plan_name,
+            months=months,
+            price=float(price_decimal),
             service_type=service_type,
         )
         flash(f"Новый тариф для хоста '{host_name}' добавлен.", "success")
@@ -4860,6 +4866,18 @@ def create_webhook_app(bot_controller_instance):
                 if _is_webhook_processed("yookassa", payment_id):
                     return "OK", 200
 
+                # Do not spend an external API call/thread on arbitrary public
+                # webhook input.  Only locally created pending payments are
+                # eligible for provider verification and fulfillment.
+                local_status = _get_transaction_status(str(payment_id))
+                if local_status in {"paid", "processing"}:
+                    return "OK", 200
+                if local_status != "pending":
+                    logger.warning(
+                        "YooKassa webhook rejected unknown local payment id."
+                    )
+                    return "OK", 200
+
                 Configuration.account_id = shop_id
                 Configuration.secret_key = secret_key
 
@@ -4999,23 +5017,12 @@ def create_webhook_app(bot_controller_instance):
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
             return "Error", 500
 
-    def _cryptobot_webhook_handler_impl(path_secret_valid: bool = False):
+    def _cryptobot_webhook_handler_impl():
         reserved_payment_id: str | None = None
         try:
-            signature_valid = _is_valid_cryptobot_signature()
-
-            configured_secret = get_setting("cryptobot_webhook_secret")
-            request_secret = _extract_cryptobot_secret_from_request()
-            legacy_secret_valid = (
-                not get_setting("cryptobot_token")
-                and bool(configured_secret)
-                and bool(request_secret)
-                and compare_digest(str(request_secret), str(configured_secret))
-            )
-
-            if not signature_valid and not legacy_secret_valid and not path_secret_valid:
+            if not _is_valid_cryptobot_signature():
                 logger.warning(
-                    "CryptoBot Webhook: missing valid signature and legacy secret check failed."
+                    "CryptoBot Webhook: missing or invalid HMAC signature."
                 )
                 return "Forbidden", 403
 
@@ -5232,15 +5239,10 @@ def create_webhook_app(bot_controller_instance):
     def cryptobot_webhook_handler_with_token(token: str):
         configured_secret = get_setting("cryptobot_webhook_secret")
         if configured_secret and compare_digest(str(token), str(configured_secret)):
-            if get_setting("cryptobot_token"):
-                logger.warning(
-                    "CryptoBot Webhook: path secret accepted only as route compatibility; HMAC signature is still required."
-                )
-                return _cryptobot_webhook_handler_impl(path_secret_valid=False)
             logger.warning(
-                "CryptoBot Webhook: path-based secret is deprecated but temporarily accepted without HMAC because cryptobot_token is not configured."
+                "CryptoBot Webhook: path route is deprecated; HMAC signature is required."
             )
-            return _cryptobot_webhook_handler_impl(path_secret_valid=True)
+            return _cryptobot_webhook_handler_impl()
         return "Forbidden", 403
 
     @flask_app.route("/settings/toggle_global_plans", methods=["POST"])

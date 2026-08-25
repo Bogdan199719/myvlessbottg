@@ -2918,6 +2918,22 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            # Referral deep links are untrusted input.  Only persist an existing
+            # user as the referrer; otherwise a fabricated numeric id would
+            # incorrectly make the new account eligible for the first-purchase
+            # referral discount.
+            validated_referrer_id = None
+            try:
+                candidate_referrer_id = int(referrer_id) if referrer_id else None
+            except (TypeError, ValueError):
+                candidate_referrer_id = None
+            if candidate_referrer_id and candidate_referrer_id != int(telegram_id):
+                cursor.execute(
+                    "SELECT 1 FROM users WHERE telegram_id = ?",
+                    (candidate_referrer_id,),
+                )
+                if cursor.fetchone():
+                    validated_referrer_id = candidate_referrer_id
             cursor.execute(
                 "SELECT telegram_id, subscription_token FROM users WHERE telegram_id = ?",
                 (telegram_id,),
@@ -2931,7 +2947,7 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
                         telegram_id,
                         username,
                         time_utils.get_msk_now(),
-                        referrer_id,
+                        validated_referrer_id,
                         token,
                     ),
                 )

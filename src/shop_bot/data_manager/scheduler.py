@@ -49,6 +49,29 @@ _IP_LIMIT_HISTORY_RETENTION_DAYS = 7
 logger = logging.getLogger(__name__)
 
 
+def _merge_yookassa_payment_metadata(
+    stored_metadata: dict | None, provider_metadata: dict | None
+) -> dict:
+    """Keep local fulfillment checkpoints when refreshing payment metadata.
+
+    YooKassa only knows the immutable invoice snapshot. Fields written while
+    provisioning (notably the absolute expiry target) exist only in our DB and
+    must survive every provider status refresh, otherwise a retry can extend
+    already-provisioned hosts again.
+    """
+    stored = dict(stored_metadata or {})
+    merged = dict(stored)
+    merged.update(provider_metadata or {})
+
+    for key, value in stored.items():
+        if key.startswith("fulfillment_") or key in {
+            "accounting_applied",
+            "recovered_from_interrupted_processing_at",
+        }:
+            merged[key] = value
+    return merged
+
+
 def _bool_setting(key: str, default: bool = False) -> bool:
     raw = database.get_setting(key)
     if raw is None:
@@ -1847,11 +1870,15 @@ async def process_pending_yookassa_payments(bot: Bot) -> None:
             )
             continue
 
-        metadata = {}
-        if hasattr(payment, "metadata") and payment.metadata:
-            metadata = dict(payment.metadata)
-        if not metadata:
-            metadata = dict(tx.get("metadata_dict") or {})
+        stored_metadata = dict(tx.get("metadata_dict") or {})
+        provider_metadata = (
+            dict(payment.metadata)
+            if hasattr(payment, "metadata") and payment.metadata
+            else {}
+        )
+        metadata = _merge_yookassa_payment_metadata(
+            stored_metadata, provider_metadata
+        )
         if not metadata:
             logger.error(
                 "Scheduler: YooKassa payment %s succeeded but has no metadata.",

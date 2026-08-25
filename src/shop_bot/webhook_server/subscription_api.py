@@ -38,6 +38,15 @@ _INVALID_TOKEN_LOG_INTERVAL_SECONDS = 60
 _INVALID_TOKEN_MAX_TRACKED_IPS = 2048
 _invalid_token_hits_by_ip: dict[str, list[float]] = {}
 _invalid_token_last_log_by_ip: dict[str, float] = {}
+
+
+def _safe_subscription_header_name(value: object) -> str:
+    """Return a short header-safe display value without control characters."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:100] or "AresVPN"
+
+
 _invalid_token_lock = threading.Lock()
 
 
@@ -640,8 +649,11 @@ def get_subscription(token):
                         f"Failed to fetch stats for key {key.get('key_id')}: {e}"
                     )
 
-        subscription_name = get_setting("subscription_name") or "AresVPN"
-        filename = f"{subscription_name}.txt"
+        subscription_name = _safe_subscription_header_name(
+            get_setting("subscription_name") or "AresVPN"
+        )
+        filename_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", subscription_name)
+        filename = f"{filename_stem.strip('._') or 'AresVPN'}.txt"
 
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
