@@ -410,7 +410,9 @@ def get_subscription(token):
             h.get("host_name") for h in enabled_host_rows if h.get("host_name")
         }
         selector_groups_by_host = {
-            h["host_name"]: str(h.get("host_url") or h["host_name"])
+            h["host_name"]: host_selector.panel_group_key(
+                h.get("host_url"), h["host_name"]
+            )
             for h in enabled_host_rows
             if h.get("host_name")
         }

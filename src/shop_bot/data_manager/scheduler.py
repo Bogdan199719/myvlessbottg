@@ -17,6 +17,7 @@ from shop_bot.data_manager.database import host_slug as _host_slug
 from shop_bot.modules import xui_api
 from shop_bot.modules import mtg_api
 from shop_bot.modules import host_health
+from shop_bot.modules import host_selector
 from shop_bot.bot import handlers
 
 CHECK_INTERVAL_SECONDS = 60
@@ -1376,7 +1377,8 @@ async def refresh_xui_host_health() -> dict:
     host_groups: dict[str, list[dict]] = {}
     for host in hosts:
         host_groups.setdefault(
-            str(host.get("host_url") or host["host_name"]), []
+            host_selector.panel_group_key(host.get("host_url"), host["host_name"]),
+            [],
         ).append(host)
 
     async def _probe(group_hosts: list[dict]) -> None:
@@ -1471,7 +1473,9 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
     # The bulk IP endpoint is panel-wide, so query each physical panel once.
     host_groups: dict[str, list[dict]] = {}
     for host in hosts:
-        group_key = str(host.get("host_url") or host.get("host_name") or "")
+        group_key = host_selector.panel_group_key(
+            host.get("host_url"), host.get("host_name")
+        )
         host_groups.setdefault(group_key, []).append(host)
 
     now = time_utils.get_msk_now()

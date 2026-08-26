@@ -1253,16 +1253,16 @@
 					<label for="auto_selector_enabled">Добавлять сервер «⚡ Автовыбор»</label>
 				</div>
 				<div class="toggle-section" data-toggle-section="auto_selector_enabled">
-					<p class="section-description">Автовыбор использует только включённые серверы со свежей успешной проверкой. Обычные страны остаются в списке.</p>
+					<p class="section-description">Автовыбор использует только включённые серверы со свежей успешной проверкой и применяется при обновлении подписки в клиенте. Обычные страны остаются в списке.</p>
 					<div class="form-group">
-						<label for="auto_selector_max_cpu_percent">Исключать сервер при CPU выше:</label>
+						<label for="auto_selector_max_cpu_percent">Исключать сервер при CPU не ниже:</label>
 						<input type="number" id="auto_selector_max_cpu_percent"
 							name="auto_selector_max_cpu_percent" min="50" max="100" step="1"
 							value="{{ settings.auto_selector_max_cpu_percent or '90' }}" />
-						<small class="field-hint">Рекомендуется 90%. Сервер с большей загрузкой не попадёт в автовыбор.</small>
+						<small class="field-hint">Рекомендуется 90%. Сервер с такой или большей загрузкой не попадёт в автовыбор.</small>
 					</div>
 					<div class="form-group">
-						<label for="auto_selector_max_memory_percent">Исключать сервер при RAM выше:</label>
+						<label for="auto_selector_max_memory_percent">Исключать сервер при RAM не ниже:</label>
 						<input type="number" id="auto_selector_max_memory_percent"
 							name="auto_selector_max_memory_percent" min="50" max="100" step="1"
 							value="{{ settings.auto_selector_max_memory_percent or '90' }}" />

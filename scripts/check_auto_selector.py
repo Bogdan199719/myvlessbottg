@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from shop_bot.modules.host_selector import (  # noqa: E402
     AUTO_SELECTOR_TITLE,
+    panel_group_key,
     replace_config_title,
     select_automatic_host,
 )
@@ -76,7 +77,47 @@ def main() -> int:
         )
         is None
     )
+    threshold_health = [
+        _health("fast", cpu=90, memory=10, online=1, latency=10)
+    ]
+    assert (
+        select_automatic_host(
+            {"fast": configs["fast"]}, threshold_health, "stable-token"
+        )
+        is None
+    )
     assert replace_config_title("not-a-proxy-url", AUTO_SELECTOR_TITLE) is None
+    assert (
+        panel_group_key("HTTPS://Panel.Example:443/secret/")
+        == "https://panel.example/secret"
+    )
+    assert panel_group_key("https://panel.example/secret") == panel_group_key(
+        "HTTPS://PANEL.EXAMPLE:443/secret/"
+    )
+    assert panel_group_key(None, "fallback-host") == "fallback-host"
+
+    malformed_health = [
+        _health("fast", cpu=float("nan"), memory=10, online=1, latency=10)
+    ]
+    assert (
+        select_automatic_host({"fast": configs["fast"]}, malformed_health, "token")
+        is None
+    )
+
+    future_health = [
+        _health("fast", cpu=10, memory=10, online=1, latency=10, age_seconds=-61)
+    ]
+    assert (
+        select_automatic_host({"fast": configs["fast"]}, future_health, "token")
+        is None
+    )
+
+    stopped_xray = [_health("fast", cpu=10, memory=10, online=1, latency=10)]
+    stopped_xray[0]["xray_running"] = 0
+    assert (
+        select_automatic_host({"fast": configs["fast"]}, stopped_xray, "token")
+        is None
+    )
 
     equal_health = [
         _health("fast", cpu=20, memory=30, online=10, latency=50),

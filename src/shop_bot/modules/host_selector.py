@@ -16,6 +16,8 @@ def _bounded_percent(value: object, default: float = 100.0) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
     return max(0.0, min(parsed, 100.0))
 
 
@@ -24,7 +26,45 @@ def _non_negative(value: object, default: float = 0.0) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
     return max(0.0, parsed)
+
+
+def panel_group_key(host_url: object, fallback: object = "") -> str:
+    """Return a stable identity for one physical 3x-ui panel endpoint."""
+    raw_url = str(host_url or "").strip()
+    fallback_value = str(fallback or "").strip()
+    if not raw_url:
+        return fallback_value
+
+    try:
+        parts = urlsplit(raw_url)
+        if not parts.scheme or not parts.hostname:
+            return raw_url.rstrip("/") or fallback_value
+
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname.lower()
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        port = parts.port
+        if port and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)
+        ):
+            hostname = f"{hostname}:{port}"
+
+        return urlunsplit(
+            (
+                scheme,
+                hostname,
+                parts.path.rstrip("/"),
+                parts.query,
+                "",
+            )
+        )
+    except (TypeError, ValueError):
+        return raw_url.rstrip("/") or fallback_value
 
 
 def replace_config_title(connection_string: str, title: str) -> str | None:
