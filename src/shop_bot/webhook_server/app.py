@@ -924,6 +924,12 @@ def create_webhook_app(bot_controller_instance):
             "form-action 'self'",
         )
 
+        if request.endpoint != "static" and (
+            session.get("logged_in") or request.path == "/login"
+        ):
+            response.headers.setdefault("Cache-Control", "no-store, private")
+            response.headers.setdefault("Pragma", "no-cache")
+
         forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
         is_https = request.is_secure or forwarded_proto.lower() == "https"
         if not is_https:

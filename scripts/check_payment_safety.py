@@ -44,6 +44,26 @@ def _has_final_pending_clear(source: str, fn: ast.AsyncFunctionDef) -> bool:
     )
 
 
+def _early_payment_validation_releases_pending_flag(
+    source: str, fn: ast.AsyncFunctionDef
+) -> bool:
+    text = _source_segment(source, fn)
+    for marker in (
+        "Missing host_name in payment metadata",
+        "has neither a service snapshot nor an existing plan",
+    ):
+        marker_index = text.find(marker)
+        if marker_index < 0:
+            return False
+        next_return = text.find("return False", marker_index)
+        if next_return < 0:
+            return False
+        branch = text[marker_index:next_return]
+        if "set_pending_payment(user_id, False)" not in branch:
+            return False
+    return True
+
+
 def _has_broad_cleanup_guard(
     source: str, fn: ast.AsyncFunctionDef, marker: str
 ) -> bool:
@@ -174,6 +194,10 @@ def main() -> int:
         if not _has_final_pending_clear(source, process_fn):
             failures.append(
                 "process_successful_payment must clear pending_payment in finally"
+            )
+        if not _early_payment_validation_releases_pending_flag(source, process_fn):
+            failures.append(
+                "early payment validation failures must release pending_payment"
             )
         if not _has_broad_cleanup_guard(
             source, process_fn, "await bot.delete_message("

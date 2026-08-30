@@ -1,5 +1,52 @@
 # Codebase Audit
 
+## Production-аудит — 2026-08-30
+
+### Исправлено
+
+- Nginx больше не записывает bearer-токены из `/sub/`, `/happ/` и legacy
+  `/cryptobot-webhook/` в access log. Та же защита добавлена в installer и
+  deployment-документацию, включая безопасный HTTP redirect.
+- Частично настроенные onboarding-ссылки больше не отключают обязательную
+  подписку и принятие доступных legal-документов. Клавиатура корректно
+  собирается для любой комбинации channel/terms/privacy.
+- Ранние ошибки payment fulfillment освобождают `pending_payment`, поэтому
+  пользователь не остаётся заблокированным до перезапуска.
+- Заявка на вывод принимает только непустой текст, экранирует Telegram HTML и
+  сообщает об успехе только после доставки хотя бы одному администратору.
+- Startup migration больше не скрывает ошибки, не удаляет конфликтующие XUI
+  hosts и не заменяет legacy transaction history пустой таблицей. Неоднозначная
+  миграция останавливает запуск и требует явного ручного преобразования.
+- Уникальность платного ключа учитывает `service_type`, поэтому одинаковые
+  имена XUI- и MTG-хостов не смешивают записи. DB update теперь сообщает об
+  отсутствии строки, а удаление пользователя очищает subscription-wide
+  IP-limit state.
+- Приватные страницы, exports и backup responses админки получают
+  `Cache-Control: no-store, private` и `Pragma: no-cache`.
+- Версия приложения увеличена до `2.4.23`.
+
+### Проверено
+
+- Все репозиторные `scripts/check_*.py`, включая новые проверки onboarding и
+  неразрушающих миграций.
+- `python3 -m compileall -q src scripts`, `bash -n install.sh`,
+  `docker compose config --quiet`, `git diff --check`.
+- Миграция SQLite-копии production с сохранением количества users, keys,
+  transactions и hosts; `PRAGMA quick_check = ok`.
+- Nginx config test, reload, прямой и HTTPS healthcheck, а также контрольный
+  запрос, секретный URI которого не появился в access log.
+
+### Оставшиеся архитектурные задачи
+
+- Реферальные выплаты требуют durable withdrawal ledger с зафиксированной
+  суммой и атомарными статусами; текущий Telegram-only процесс допускает race
+  между заявкой, новой наградой и подтверждением.
+- Долгие payment/admin операции следует вынести из Waitress request workers в
+  очередь задач; в production уже наблюдалась кратковременная очередь workers.
+- Для XUI read-modify-write нужен общий per-inbound lock или client-level API,
+  чтобы исключить lost update между scheduler, платежом и admin action.
+- Смена panel password должна инвалидировать уже выданные admin sessions.
+
 ## Автовыбор серверов — 2026-08-26
 
 - Версия приложения увеличена до `2.4.22`.

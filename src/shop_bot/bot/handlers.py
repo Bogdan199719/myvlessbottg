@@ -824,15 +824,10 @@ def get_user_router() -> Router:
         privacy_url = get_setting("privacy_url")
         channel_url = get_setting("channel_url")
 
-        if not channel_url or not terms_url or not privacy_url:
-            set_terms_agreed(user_id)
-            await show_main_menu(message)
-            return
-
         is_subscription_forced = get_setting("force_subscription") == "true"
 
         show_welcome_screen = (is_subscription_forced and channel_url) or (
-            terms_url and privacy_url
+            terms_url or privacy_url
         )
 
         if not show_welcome_screen:
@@ -1438,7 +1433,10 @@ def get_user_router() -> Router:
         user_id = message.from_user.id
         user = get_user(user_id)
         balance = user.get("referral_balance", 0)
-        details = message.text.strip()
+        details = (message.text or "").strip()
+        if not details:
+            await message.answer("❌ Отправьте реквизиты текстовым сообщением.")
+            return
         if balance < 100:
             await message.answer("❌ Ваш баланс менее 100 руб. Вывод недоступен.")
             await state.clear()
@@ -1453,13 +1451,22 @@ def get_user_router() -> Router:
             return
         text = (
             f"💸 <b>Заявка на вывод реферальных средств</b>\n"
-            f"👤 Пользователь: @{user.get('username', 'N/A')} (ID: <code>{user_id}</code>)\n"
+            f"👤 Пользователь: @{html.quote(str(user.get('username') or 'N/A'))} "
+            f"(ID: <code>{user_id}</code>)\n"
             f"💰 Сумма: <b>{balance:.2f} RUB</b>\n"
-            f"📄 Реквизиты: <code>{details}</code>\n\n"
+            f"📄 Реквизиты: <code>{html.quote(details)}</code>\n\n"
             f"/approve_withdraw_{user_id} /decline_withdraw_{user_id}"
         )
-        await message.answer("Ваша заявка отправлена администратору. Ожидайте ответа.")
-        await _send_to_admins(message.bot, text, parse_mode="HTML")
+        sent_count = await _send_to_admins(message.bot, text, parse_mode="HTML")
+        if sent_count:
+            await message.answer(
+                "Ваша заявка отправлена администратору. Ожидайте ответа."
+            )
+        else:
+            await message.answer(
+                "❌ Не удалось доставить заявку администратору. "
+                "Пожалуйста, обратитесь в поддержку."
+            )
         await state.clear()
 
     @user_router.message(F.text.regexp(r"^/approve_withdraw_\d+(?:@\w+)?$"))
@@ -4594,6 +4601,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 user_id,
                 "❌ Произошла ошибка при обработке платежа: не указан сервер. Обратитесь в поддержку.",
             )
+            set_pending_payment(user_id, False)
+            pending_flag_set = False
             return False
 
         # The invoice snapshot is authoritative: changing/deleting a plan after
@@ -4612,6 +4621,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 user_id,
                 "❌ Не удалось определить тип оплаченной услуги. Обратитесь в поддержку.",
             )
+            set_pending_payment(user_id, False)
+            pending_flag_set = False
             return False
         metadata.setdefault("service_type", str(service_type))
         metadata.setdefault(

@@ -435,6 +435,7 @@ def initialize_db():
         clear_all_pending_payments()
     except sqlite3.Error as e:
         logging.error(f"Database error on initialization: {e}")
+        raise
 
 
 def run_migration():
@@ -750,15 +751,19 @@ def run_migration():
             except sqlite3.OperationalError:
                 logging.info(" -> Index on users.is_banned already exists.")
 
-            # Hard guard: one paid key per user per host.
+            # Hard guard: one paid key per user, service and host.
             # Prevents accidental duplicates that inflate "servers count" and break global expiry logic.
             try:
                 cursor.execute(
+                    "DROP INDEX IF EXISTS idx_vpn_keys_user_host_paid_unique"
+                )
+                cursor.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_vpn_keys_user_host_paid_unique "
-                    "ON vpn_keys(user_id, host_name) WHERE plan_id > 0"
+                    "ON vpn_keys(user_id, service_type, host_name) WHERE plan_id > 0"
                 )
                 logging.info(
-                    " -> Partial unique index on paid keys (user_id, host_name) created."
+                    " -> Partial unique index on paid keys "
+                    "(user_id, service_type, host_name) created."
                 )
             except sqlite3.OperationalError as e:
                 logging.warning(f" -> Could not create paid-keys unique index: {e}")
@@ -801,20 +806,9 @@ def run_migration():
                         "The 'Transactions' table already has a new structure. Migration is not required."
                     )
                 else:
-                    backup_name = (
-                        f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    )
-                    logging.warning(
-                        f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ..."
-                    )
-                    cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
-
-                    logging.info(
-                        "I create a new table 'Transactions' with the correct structure ..."
-                    )
-                    create_new_transactions_table(cursor)
-                    logging.info(
-                        "The new table 'Transactions' has been successfully created. The old data is saved."
+                    raise sqlite3.OperationalError(
+                        "Unsupported legacy transactions schema; automatic migration "
+                        "was stopped to preserve payment history"
                     )
             else:
                 logging.info("TRANSACTIONS table was not found. I create a new one ...")
@@ -1010,13 +1004,14 @@ def run_migration():
                     ),
                 )
 
-            # Ensure xui_hosts has a UNIQUE constraint on host_name.
-            # First remove any duplicate rows that would block index creation (keep lowest rowid).
-            cursor.execute("""
-                DELETE FROM xui_hosts WHERE rowid NOT IN (
-                    SELECT MIN(rowid) FROM xui_hosts GROUP BY host_name
+            # Never guess which duplicate host configuration is authoritative.
+            cursor.execute(
+                "SELECT host_name FROM xui_hosts GROUP BY host_name HAVING COUNT(*) > 1 LIMIT 1"
+            )
+            if cursor.fetchone():
+                raise sqlite3.IntegrityError(
+                    "Duplicate xui_hosts names require an explicit manual merge"
                 )
-            """)
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_xui_hosts_name ON xui_hosts(host_name)"
             )
@@ -1028,6 +1023,7 @@ def run_migration():
 
     except sqlite3.Error as e:
         logging.error(f"An error occurred during migration: {e}")
+        raise
 
 
 def create_new_transactions_table(cursor: sqlite3.Cursor):
@@ -4035,7 +4031,7 @@ def add_new_key(
             return None
         if (
             "idx_vpn_keys_user_host_paid_unique" in message
-            or "UNIQUE constraint failed: vpn_keys.user_id, vpn_keys.host_name"
+            or "UNIQUE constraint failed: vpn_keys.user_id, vpn_keys.service_type, vpn_keys.host_name"
             in message
         ):
             try:
@@ -4043,8 +4039,8 @@ def add_new_key(
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     cursor.execute(
-                        "SELECT key_id, key_email FROM vpn_keys WHERE user_id = ? AND host_name = ? AND plan_id > 0 ORDER BY key_id DESC LIMIT 1",
-                        (user_id, host_name),
+                        "SELECT key_id, key_email FROM vpn_keys WHERE user_id = ? AND service_type = ? AND host_name = ? AND plan_id > 0 ORDER BY key_id DESC LIMIT 1",
+                        (user_id, service_type, host_name),
                     )
                     existing = cursor.fetchone()
                 if existing:
@@ -4106,11 +4102,14 @@ def update_key_by_email(
                     "UPDATE vpn_keys SET host_name = ?, xui_client_uuid = ?, expiry_date = ?, plan_id = ? WHERE key_email = ?",
                     (host_name, xui_client_uuid, expiry_date, plan_id, key_email),
                 )
+            updated_count = cursor.rowcount
+            if updated_count != 1:
+                return False
             cursor.execute(
                 "DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,)
             )
             conn.commit()
-            return True
+            return updated_count == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to update key by email {key_email}: {e}")
         return False
@@ -5031,6 +5030,9 @@ def delete_user_keys(user_id: int) -> bool:
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
             )
+            cursor.execute(
+                "DELETE FROM xui_ip_limit_user_events WHERE user_id = ?", (user_id,)
+            )
             cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
             conn.commit()
             return True
@@ -5076,6 +5078,9 @@ def delete_user_everywhere(user_id: int) -> bool:
             # historical revenue and invalidate closed profit distributions.
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
+            )
+            cursor.execute(
+                "DELETE FROM xui_ip_limit_user_events WHERE user_id = ?", (user_id,)
             )
             cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
             cursor.execute(

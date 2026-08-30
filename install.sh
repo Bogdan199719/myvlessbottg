@@ -182,6 +182,19 @@ server {
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
+    # These URL paths contain bearer credentials and must never reach access logs.
+    location ~ ^/(?:sub|happ|cryptobot-webhook)/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:1488;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 300s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:1488;
         proxy_set_header Host \$host;
