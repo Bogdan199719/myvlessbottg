@@ -567,9 +567,9 @@
 				</p>
 				<div class="host-health" aria-label="Состояние сервера">
 					{% if host.health_state == 'healthy' %}
-					<span class="health-chip is-healthy">● Доступен для автовыбора</span>
+					<span class="health-chip is-healthy">● Панель доступна, Xray работает</span>
 					{% elif host.health_state == 'unhealthy' %}
-					<span class="health-chip is-unhealthy">● Недоступен для автовыбора</span>
+					<span class="health-chip is-unhealthy">● Панель или Xray недоступны</span>
 					{% elif host.health_state == 'stale' %}
 					<span class="health-chip is-stale">● Данные устарели</span>
 					{% else %}

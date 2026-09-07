@@ -352,8 +352,14 @@ document.addEventListener('DOMContentLoaded', function () {
 			const isVerySmall = window.innerWidth <= 470
 
 			charts.forEach(chart => {
-				if (chart.options.scales) {
-					Object.assign(chart.options.scales, baseScaleOptions())
+				if (chart.config.type === 'bar') {
+					Object.assign(chart.options.scales.x, baseScaleOptions().x)
+					for (const name of ['revenue', 'count']) {
+						const scale = chart.options.scales[name]
+						scale.ticks.display = !isVerySmall
+						scale.ticks.font = { size: isMobile ? 10 : 12 }
+						scale.title.display = !isVerySmall
+					}
 				}
 				if (chart.options.plugins && chart.options.plugins.legend) {
 					chart.options.plugins.legend.display = !isVerySmall

@@ -3508,3 +3508,12 @@ button:focus-visible {
 		transition-duration: 0.01ms !important;
 	}
 }
+
+/* Keep mobile filter rows within their toolbar. */
+@media (max-width: 768px) {
+	.table-toolbar,
+	.table-tools {
+		min-width: 0;
+		max-width: 100%;
+	}
+}
