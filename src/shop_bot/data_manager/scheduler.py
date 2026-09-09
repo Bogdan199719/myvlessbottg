@@ -916,7 +916,9 @@ def _load_xui_panel_snapshot(host: dict):
     if not api or not inbound:
         return None
 
-    full_inbound_details = api.inbound.get_by_id(inbound.id)
+    # Use the same compatibility layer as provisioning: the SDK alone can
+    # lose raw transport settings (including XHTTP) or use a legacy API route.
+    full_inbound_details = xui_api._get_inbound_by_id_compat(api, inbound.id)
     if not full_inbound_details or not getattr(full_inbound_details, "settings", None):
         return None
     return full_inbound_details

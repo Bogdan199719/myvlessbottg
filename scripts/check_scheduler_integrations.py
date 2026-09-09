@@ -6,6 +6,8 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +61,58 @@ async def check_xui_snapshot_does_not_block_loop() -> None:
     finally:
         scheduler.database.get_all_hosts = original_get_hosts
         scheduler._load_xui_panel_snapshot = original_loader
+        scheduler._host_failure_backoff.clear()
+
+
+def check_snapshot_uses_transport_preserving_loader() -> None:
+    api = object()
+    inbound = SimpleNamespace(id=7)
+    snapshot = SimpleNamespace(settings=SimpleNamespace(clients=[]))
+    host = dict(
+        host_url="https://example.invalid", host_username="test",
+        host_pass="test", host_inbound_id=7,
+    )
+    with (
+        patch.object(scheduler.xui_api, "login_to_host", return_value=(api, inbound)),
+        patch.object(
+            scheduler.xui_api, "_get_inbound_by_id_compat", return_value=snapshot
+        ) as loader,
+    ):
+        assert scheduler._load_xui_panel_snapshot(host) is snapshot
+        loader.assert_called_once_with(api, 7)
+
+
+async def check_sync_repairs_flow_without_changing_expiry() -> None:
+    expiry = scheduler.time_utils.parse_iso_to_msk("2099-01-01T00:00:00+03:00")
+    client = SimpleNamespace(
+        email="check@example.invalid", id="test-id",
+        expiry_time=int(expiry.timestamp() * 1000),
+    )
+    old = "vless://test-id@example.invalid:443?type=tcp&security=reality"
+    new = old + "&flow=xtls-rprx-vision"
+    host = {"host_name": "test-flow", "host_url": "https://example.invalid"}
+    key = dict(
+        key_id=1, key_email=client.email, expiry_date=expiry.isoformat(),
+        xui_client_uuid=client.id, connection_string=old,
+    )
+    snapshot = SimpleNamespace(settings=SimpleNamespace(clients=[client]))
+    scheduler._host_failure_backoff.clear()
+    try:
+        with (
+            patch.object(scheduler.database, "get_all_hosts", return_value=[host]),
+            patch.object(scheduler.database, "get_keys_for_host", return_value=[key]),
+            patch.object(scheduler.database, "purge_missing_key"),
+            patch.object(scheduler.database, "update_key_info") as update,
+            patch.object(scheduler.database, "update_key_status_from_server") as status,
+            patch.object(scheduler.database, "mark_key_missing") as missing,
+            patch.object(scheduler, "_load_xui_panel_snapshot", return_value=snapshot),
+            patch.object(scheduler.xui_api, "get_connection_string", return_value=new),
+        ):
+            await scheduler.sync_keys_with_panels()
+            update.assert_called_once_with(1, expiry, new)
+            status.assert_not_called()
+            missing.assert_not_called()
+    finally:
         scheduler._host_failure_backoff.clear()
 
 
@@ -193,6 +247,8 @@ async def check_mtg_login_is_single_flight() -> None:
 
 async def main() -> None:
     check_client_state_reconciliation_interval()
+    check_snapshot_uses_transport_preserving_loader()
+    await check_sync_repairs_flow_without_changing_expiry()
     await check_xui_snapshot_does_not_block_loop()
     await check_mtg_concurrency_and_backoff()
     await check_mtg_login_is_single_flight()

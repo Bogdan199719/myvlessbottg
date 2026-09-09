@@ -72,6 +72,12 @@ def main() -> int:
             BASE.replace("type=tcp", "type=xhttp"),
             False,
         ),
+        (
+            "missing Vision flow requires saved link refresh",
+            BASE.replace("&flow=xtls-rprx-vision", ""),
+            BASE,
+            False,
+        ),
     ]
 
     failures = []
