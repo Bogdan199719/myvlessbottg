@@ -263,6 +263,33 @@ def redirect_to_happ(token):
     return Response(status=302, headers={"Location": deeplink_url})
 
 
+@subscription_bp.route("/incy/<token>", methods=["GET"])
+def redirect_to_incy(token):
+    user = get_user_by_token(token)
+    if not user:
+        if _record_invalid_token_request("Incy deeplink", token):
+            abort(429, "Too many invalid subscription requests")
+        abort(404, "Subscription not found")
+    if user.get("is_banned"):
+        logger.warning(
+            "Blocked Incy deeplink for banned subscription (token prefix: %s)",
+            _token_prefix(token),
+        )
+        abort(403, "Subscription is disabled")
+
+    subscription_url = _build_subscription_link(get_setting("domain"), token)
+    if not subscription_url:
+        logger.error(
+            "Failed to build Incy deeplink (token prefix: %s): domain or token missing",
+            _token_prefix(token),
+        )
+        abort(500, "Subscription domain is not configured")
+
+    deeplink_url = f"incy://import/{subscription_url}"
+    logger.info("Redirecting to Incy deeplink (token prefix: %s)", _token_prefix(token))
+    return Response(status=302, headers={"Location": deeplink_url})
+
+
 def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
     try:
         future = _SUBSCRIPTION_EXECUTOR.submit(func, *args, **kwargs)

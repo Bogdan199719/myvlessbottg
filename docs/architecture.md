@@ -34,7 +34,7 @@
 
 - `src/shop_bot/modules/xui_api.py` — 3x-ui login/API-token auth, create/update/delete client, connection strings, panel sync.
 - `src/shop_bot/modules/mtg_api.py` — MTG token cache, create/renew/delete/toggle proxy.
-- `src/shop_bot/webhook_server/subscription_api.py` — `/sub/<token>` для глобальной подписки и active global trial; `/happ/<token>` для HTTPS-редиректа в Happ deeplink.
+- `src/shop_bot/webhook_server/subscription_api.py` — `/sub/<token>` для глобальной подписки и active global trial; `/happ/<token>` и `/incy/<token>` для HTTPS-редиректов в deeplink соответствующего приложения.
 
 3x-ui API compatibility:
 
@@ -58,8 +58,8 @@
 3. После webhook или Telegram payment вызывается `process_successful_payment`.
 4. Выдача происходит через 3x-ui или MTG.
 5. Результат пишется в `vpn_keys` и `transactions`.
-6. Для VPN пользователь получает постоянную `/sub/<token>` ссылку и кнопку `🔌 Подключить в Happ`; отдельные XUI-ключи по хостам остаются техническими записями для 3x-ui, но не продаются и не показываются пользователю как отдельный товар.
-7. Кнопка ведёт на HTTPS endpoint `/happ/<token>`, который проверяет token и отдаёт `302 Location: happ://add/https://<domain>/sub/<token>`.
+6. Для VPN пользователь получает постоянную `/sub/<token>` ссылку и расположенные в одном ряду кнопки `🔌 Happ` и `📲 Incy`; отдельные XUI-ключи по хостам остаются техническими записями для 3x-ui, но не продаются и не показываются пользователю как отдельный товар.
+7. Кнопки ведут на HTTPS endpoints `/happ/<token>` и `/incy/<token>`. После проверки token сервер отвечает соответственно `302 Location: happ://add/https://<domain>/sub/<token>` или `302 Location: incy://import/https://<domain>/sub/<token>`.
 8. Scheduler дальше поддерживает срок, статус, уведомления и довыдачу недостающих включённых XUI-хостов для active global paid и active global trial.
 
 Для provider-confirmed платежа локальная metadata является источником durable checkpoint-полей `fulfillment_*`. Повторная проверка YooKassa обновляет исходный invoice snapshot данными провайдера, но не должна затирать абсолютную цель выдачи, стабильный email клиента или checkpoint пользовательского уведомления.

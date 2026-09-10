@@ -42,7 +42,7 @@ server {
 
     # Токены подписок и legacy webhook secrets находятся в URL.
     # Не записывайте эти пути в access log.
-    location ~ ^/(?:sub|happ|cryptobot-webhook)/ {
+    location ~ ^/(?:sub|happ|incy|cryptobot-webhook)/ {
         access_log off;
         proxy_pass http://127.0.0.1:1488;
         proxy_set_header Host $host;
@@ -76,7 +76,7 @@ sudo certbot --nginx -d vpn.example.com --redirect
 
 Проверьте `https://vpn.example.com/healthz`, затем войдите в админку по `https://vpn.example.com/login` с `PANEL_LOGIN` и `PANEL_PASSWORD`. Если перед Nginx есть CDN или другой proxy, добавьте его непосредственный CIDR в `TRUSTED_PROXY_CIDRS`; не доверяйте произвольному `X-Forwarded-For`.
 
-После настройки Certbot убедитесь, что HTTPS- и HTTP-серверы сохраняют отдельный `location` с `access_log off` для `/sub/`, `/happ/` и `/cryptobot-webhook/`. Если HTTP перенаправляется на HTTPS, размещайте `return 301` внутри `location /`: директива `return` на уровне `server` выполняется до выбора location и снова раскроет секретный URI в общем access log.
+После настройки Certbot убедитесь, что HTTPS- и HTTP-серверы сохраняют отдельный `location` с `access_log off` для `/sub/`, `/happ/`, `/incy/` и `/cryptobot-webhook/`. Если HTTP перенаправляется на HTTPS, размещайте `return 301` внутри `location /`: директива `return` на уровне `server` выполняется до выбора location и снова раскроет секретный URI в общем access log.
 
 Альтернатива: `bash install.sh` автоматизирует установку Docker, Nginx и Let's Encrypt на Ubuntu/Debian. Запускайте его только на сервере, где домен уже резолвится на этот хост.
 
@@ -126,6 +126,7 @@ docker compose exec -T bot python3 scripts/check_payment_safety.py
 docker compose exec -T bot python3 scripts/check_profit_accounting.py
 docker compose exec -T bot python3 scripts/check_auto_selector.py
 docker compose exec -T bot python3 scripts/check_happ_subscription_metadata.py
+docker compose exec -T bot python3 scripts/check_incy_deeplink.py
 docker compose exec -T bot python3 scripts/check_ip_limit_rules.py
 docker compose exec -T bot python3 scripts/check_proxy_keyboard.py
 docker compose exec -T bot python3 scripts/check_scheduler_integrations.py

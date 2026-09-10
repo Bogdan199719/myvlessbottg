@@ -140,6 +140,14 @@ def _build_subscription_link(domain: str | None, token: str | None) -> str | Non
     return f"{domain_value.rstrip('/')}/sub/{token_value}"
 
 
+def _subscription_clients_hint() -> str:
+    return (
+        "<blockquote>Одна ссылка для обоих приложений.\n"
+        "Выберите приложение кнопкой ниже — подписка откроется в нём автоматически."
+        "</blockquote>"
+    )
+
+
 def _build_payment_context(
     service_type: str | None, host_name: str | None
 ) -> str | None:
@@ -1015,9 +1023,7 @@ def get_user_router() -> Router:
         await callback.message.answer(
             "🔗 <b>Ссылка-подписка:</b>\n"
             f"<code>{sub_link}</code>\n\n"
-            "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-            "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>",
+            f"{_subscription_clients_hint()}",
             reply_markup=keyboards.create_global_link_keyboard(sub_link, token),
             disable_web_page_preview=True,
         )
@@ -1028,13 +1034,9 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>🌍 Что такое глобальная подписка</b>\n\n"
             "Это одна ссылка вида <code>https://.../sub/...</code>, в которой уже собраны все ваши серверы.\n"
-            "Её удобно добавлять в <a href='https://www.happ.su/main/ru'>Happ</a> как одну подписку.\n\n"
-            "<b>Как подключить:</b>\n"
-            "1. Нажмите кнопку <b>🔌 Подключить в Happ</b> рядом со ссылкой подписки.\n"
-            "2. Подтвердите добавление в Happ.\n"
-            "3. Нажмите <b>Обновить подписку</b>, если Happ попросит обновление.\n"
-            "4. Выберите любой сервер из списка и подключитесь.\n\n"
-            "<b>Запасной способ:</b> скопируйте ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
+            "Она одинаково подходит для <a href='https://www.happ.su/main/ru'>Happ</a> и <a href='https://incy.cc'>Incy</a>.\n\n"
+            "Нажмите <b>🔌 Happ</b> или <b>📲 Incy</b> — выбранное приложение сразу откроет добавление подписки.\n\n"
+            "После импорта выберите любой сервер и подключитесь.\n\n"
             "<b>Важно:</b> обычный ключ <code>vless://</code> добавляет один сервер,\n"
             "а ссылка <code>https://.../sub/...</code> добавляет сразу всю подписку целиком.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
@@ -1166,6 +1168,7 @@ def get_user_router() -> Router:
             parts.append(
                 f"\n🔗 <b>{profile_link_label}:</b>\n<code>{profile_vpn_link}</code>"
             )
+            parts.append("\n🔌 <b>Подключить:</b>")
 
         final_text = "\n".join(parts)
 
@@ -1173,24 +1176,43 @@ def get_user_router() -> Router:
         profile_kb = InlineKeyboardBuilder()
 
         if is_global_active and subscription_token:
+            client_buttons = []
             happ_url = keyboards.build_happ_redirect_url(subscription_token)
             if happ_url:
-                profile_kb.button(
-                    text="🔌 Подключить в Happ",
-                    url=happ_url,
+                client_buttons.append(
+                    types.InlineKeyboardButton(text="🔌 Happ", url=happ_url)
                 )
-            profile_kb.button(
-                text="🔗 Ссылка подписки",
-                callback_data=f"global_link_{subscription_token}",
+            incy_url = keyboards.build_incy_redirect_url(subscription_token)
+            if incy_url:
+                client_buttons.append(
+                    types.InlineKeyboardButton(text="📲 Incy", url=incy_url)
+                )
+            if client_buttons:
+                profile_kb.row(*client_buttons)
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text="🔗 Показать ссылку",
+                    callback_data=f"global_link_{subscription_token}",
+                )
             )
         if active_paid_keys or active_trial_keys or xui_paid_keys or trial_keys:
-            profile_kb.button(text="📦 Мои подписки", callback_data="manage_keys")
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text="📦 Мои подписки", callback_data="manage_keys"
+                )
+            )
         if mtg_keys:
             label = "📡 Мой Proxy" if active_mtg_keys else "📡 Продлить Proxy"
-            profile_kb.button(text=label, callback_data="show_proxy_keys")
-        profile_kb.button(text="🏠 В меню", callback_data="back_to_main_menu")
-
-        profile_kb.adjust(1)
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text=label, callback_data="show_proxy_keys"
+                )
+            )
+        profile_kb.row(
+            types.InlineKeyboardButton(
+                text="🏠 В меню", callback_data="back_to_main_menu"
+            )
+        )
         await callback.message.edit_text(
             final_text, reply_markup=profile_kb.as_markup()
         )
@@ -1921,10 +1943,8 @@ def get_user_router() -> Router:
             if sub_link:
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.\n"
-                    "После окончания пробного периода можно будет продлить эту же глобальную подписку.</blockquote>"
+                    f"{_subscription_clients_hint()}\n\n"
+                    "После окончания пробного периода можно будет продлить эту же глобальную подписку."
                 )
             else:
                 final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена в админке."
@@ -2203,7 +2223,7 @@ def get_user_router() -> Router:
             if sub_link:
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Нажмите <b>🔌 Подключить в Happ</b> или скопируйте ссылку и добавьте её вручную.</blockquote>"
+                    f"{_subscription_clients_hint()}"
                 )
             else:
                 final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена."
@@ -2371,21 +2391,15 @@ def get_user_router() -> Router:
 
         await callback.message.edit_text(
             "<b>📖 Инструкция по подключению</b>\n\n"
-            "<b>Рекомендуемое приложение:</b> <a href='https://www.happ.su/main/ru'>Happ</a>\n\n"
-            "<b>Если Happ недоступен:</b> используйте <a href='https://incy.cc'>Incy</a>. "
-            "Версии для поддерживаемых платформ собраны в <a href='https://github.com/INCY-DEV/incy-platforms'>официальном репозитории Incy</a>.\n\n"
+            "<b>Приложения:</b> <a href='https://www.happ.su/main/ru'>Happ</a> или <a href='https://incy.cc'>Incy</a>.\n\n"
             "<b>Что вы получаете в боте:</b>\n"
             "1. <code>vless://...</code> — один ключ доступа.\n"
             "2. <code>https://.../sub/...</code> — ссылка подписки со всеми серверами.\n\n"
-            "<b>Самый простой сценарий:</b>\n"
-            "1. Установите Happ на ваше устройство.\n"
-            "2. Если у вас есть ссылка подписки <code>https://.../sub/...</code>, нажмите <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Выберите сервер и включите подключение.\n\n"
-            "<b>Запасной способ:</b> скопируйте ключ или ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
-            "<b>Подключение через Incy:</b> скопируйте ссылку подписки <code>https://.../sub/...</code>, "
-            "откройте Incy и добавьте подписку по URL. После импорта выберите сервер и включите подключение.\n\n"
+            "<b>Подключение:</b>\n"
+            "1. Установите Happ или Incy на ваше устройство.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки в приложении.\n"
+            "4. Выберите сервер и включите подключение.\n\n"
             "Выберите платформу ниже:",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
@@ -2397,16 +2411,10 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на Android</b>\n\n"
-            "1. Установите <a href='https://play.google.com/store/apps/details?id=com.happproxy'>Happ из Google Play</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится список серверов.\n\n"
-            "<b>Если Happ недоступен:</b> установите <a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Incy из Google Play</a> "
-            "или скачайте <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>APK с официального GitHub</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
+            "1. Установите <a href='https://play.google.com/store/apps/details?id=com.happproxy'>Happ</a> или <a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Incy</a> из Google Play. Для Incy также доступен <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>официальный APK</a>.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки.\n"
+            "4. Выберите сервер и включите подключение.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2417,16 +2425,10 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
-            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Happ из App Store</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится готовый список серверов.\n\n"
-            "<b>Если Happ удалён из App Store:</b> установите <a href='https://apps.apple.com/ru/app/incy/id6756943388'>Incy из App Store</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL. "
-            "Подробнее — на <a href='https://incy.cc'>официальном сайте Incy</a>.",
+            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Happ</a> или <a href='https://apps.apple.com/ru/app/incy/id6756943388'>Incy</a> из App Store.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки.\n"
+            "4. Выберите сервер и включите подключение.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2437,16 +2439,10 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на macOS</b>\n\n"
-            "1. Установите Happ: <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>скачать dmg</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
-            "<b>Если Happ недоступен:</b> установите Incy из <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> "
-            "или скачайте сборку для macOS из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
+            "1. Установите Happ из <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>DMG</a>, либо Incy из <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> или <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов</a>.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки.\n"
+            "4. Выберите сервер и включите подключение.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -2457,15 +2453,10 @@ def get_user_router() -> Router:
         await callback.answer()
         await callback.message.edit_text(
             "<b>Подключение на Windows</b>\n\n"
-            "1. Установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ для Windows</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
-            "<b>Если Happ недоступен:</b> скачайте Incy для Windows из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов на GitHub</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
+            "1. Установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ</a> или скачайте Incy из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов</a>.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки.\n"
+            "4. Выберите сервер и включите подключение.",
             reply_markup=keyboards.create_howto_vless_keyboard(),
             disable_web_page_preview=True,
         )
@@ -4977,9 +4968,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>"
+                    f"{_subscription_clients_hint()}"
                 )
 
             # Report failures if any
