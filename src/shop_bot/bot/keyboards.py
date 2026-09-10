@@ -545,16 +545,29 @@ def create_global_info_keyboard(subscription_token: str) -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
-def create_howto_vless_keyboard() -> InlineKeyboardMarkup:
+def create_howto_vless_keyboard(
+    subscription_token: str | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🌍 Что такое подписка", callback_data="global_howto")
-    builder.button(text="📱 Android", callback_data="howto_android")
-    builder.button(text="📱 iOS", callback_data="howto_ios")
-    builder.button(text="💻 Windows", callback_data="howto_windows")
-    builder.button(text="🍎 MacOS", callback_data="howto_macos")
-    builder.button(text="🐧 Linux", callback_data="howto_linux")
-    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
-    builder.adjust(1, 2, 2, 1)
+    if subscription_token:
+        _add_subscription_client_buttons(builder, subscription_token)
+    builder.row(
+        InlineKeyboardButton(
+            text="🌍 Что такое подписка", callback_data="global_howto"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="📱 Android", callback_data="howto_android"),
+        InlineKeyboardButton(text="📱 iOS", callback_data="howto_ios"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="💻 Windows", callback_data="howto_windows"),
+        InlineKeyboardButton(text="🍎 MacOS", callback_data="howto_macos"),
+    )
+    builder.row(InlineKeyboardButton(text="🐧 Linux", callback_data="howto_linux"))
+    builder.row(
+        InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main_menu")
+    )
     return builder.as_markup()
 
 

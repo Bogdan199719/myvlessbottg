@@ -148,6 +148,32 @@ def _subscription_clients_hint() -> str:
     )
 
 
+def _device_subscription_guide(title: str, install_text: str) -> str:
+    return (
+        f"<b>{title}</b>\n\n"
+        f"<b>1. Установите приложение</b>\n{install_text}\n\n"
+        "<b>2. Выберите способ подключения</b>\n"
+        "• Нажмите <b>🔌 Happ</b> — приложение откроется и предложит добавить подписку.\n"
+        "• Нажмите <b>📲 Incy</b> — приложение откроется сразу на импорте подписки.\n\n"
+        "<b>3. Подтвердите импорт</b>\n"
+        "Разрешите открыть выбранное приложение и подтвердите добавление подписки.\n\n"
+        "<b>4. Подключитесь</b>\n"
+        "Дождитесь появления списка серверов, выберите сервер и включите VPN. "
+        "Если список не появился, обновите подписку внутри приложения.\n\n"
+        "<b>Если приложение не открылось:</b> зайдите в «Мой профиль» → "
+        "«Показать ссылку», скопируйте URL и добавьте его в приложении вручную "
+        "как подписку."
+    )
+
+
+def _active_subscription_token(user_id: int) -> str | None:
+    paid_keys = get_active_paid_keys(user_id)
+    trial_keys = get_active_trial_keys(user_id)
+    if not has_active_global_access(paid_keys, trial_keys):
+        return None
+    return get_or_create_subscription_token(user_id)
+
+
 def _build_payment_context(
     service_type: str | None, host_name: str | None
 ) -> str | None:
@@ -1039,7 +1065,9 @@ def get_user_router() -> Router:
             "После импорта выберите любой сервер и подключитесь.\n\n"
             "<b>Важно:</b> обычный ключ <code>vless://</code> добавляет один сервер,\n"
             "а ссылка <code>https://.../sub/...</code> добавляет сразу всю подписку целиком.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
         )
 
     @user_router.callback_query(F.data == "back_to_main_menu")
@@ -2401,7 +2429,9 @@ def get_user_router() -> Router:
             "3. Подтвердите добавление подписки в приложении.\n"
             "4. Выберите сервер и включите подключение.\n\n"
             "Выберите платформу ниже:",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2410,12 +2440,15 @@ def get_user_router() -> Router:
     async def howto_android_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Android</b>\n\n"
-            "1. Установите <a href='https://play.google.com/store/apps/details?id=com.happproxy'>Happ</a> или <a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Incy</a> из Google Play. Для Incy также доступен <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>официальный APK</a>.\n"
-            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
-            "3. Подтвердите добавление подписки.\n"
-            "4. Выберите сервер и включите подключение.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "📱 Подключение на Android",
+                "<a href='https://play.google.com/store/apps/details?id=com.happproxy'>Скачать Happ из Google Play</a>\n"
+                "<a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Скачать Incy из Google Play</a>\n"
+                "Если Google Play недоступен: <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>официальный APK Incy</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2424,12 +2457,14 @@ def get_user_router() -> Router:
     async def howto_ios_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
-            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Happ</a> или <a href='https://apps.apple.com/ru/app/incy/id6756943388'>Incy</a> из App Store.\n"
-            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
-            "3. Подтвердите добавление подписки.\n"
-            "4. Выберите сервер и включите подключение.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "📱 Подключение на iPhone/iPad",
+                "<a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Скачать Happ из App Store</a>\n"
+                "<a href='https://apps.apple.com/ru/app/incy/id6756943388'>Скачать Incy из App Store</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2438,12 +2473,14 @@ def get_user_router() -> Router:
     async def howto_macos_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на macOS</b>\n\n"
-            "1. Установите Happ из <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>DMG</a>, либо Incy из <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> или <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов</a>.\n"
-            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
-            "3. Подтвердите добавление подписки.\n"
-            "4. Выберите сервер и включите подключение.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "🍎 Подключение на macOS",
+                "Happ: <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>DMG</a>\n"
+                "Incy: <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> или <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальный релиз</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2452,12 +2489,14 @@ def get_user_router() -> Router:
     async def howto_windows_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Windows</b>\n\n"
-            "1. Установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ</a> или скачайте Incy из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов</a>.\n"
-            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
-            "3. Подтвердите добавление подписки.\n"
-            "4. Выберите сервер и включите подключение.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "💻 Подключение на Windows",
+                "<a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Скачать Happ для Windows</a>\n"
+                "<a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>Скачать Incy из официальных релизов</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2466,22 +2505,20 @@ def get_user_router() -> Router:
     async def howto_linux_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Linux</b>\n\n"
-            "1. <b>Скачайте и распакуйте Nekoray:</b> Перейдите в <a href='https://github.com/MatsuriDayo/Nekoray/releases'>релизы Nekoray на GitHub</a> и скачайте архив для Linux. Распакуйте его в удобную папку.\n"
-            "2. <b>Запустите Nekoray:</b> Откройте терминал, перейдите в папку с Nekoray и выполните <code>./nekoray</code> (или используйте графический запуск, если доступен).\n"
-            "3. <b>Скопируйте в боте</b> либо ключ <code>vless://...</code>, либо ссылку подписки <code>https://.../sub/...</code>.\n"
-            "4. <b>Импортируйте:</b>\n"
-            "   • В Nekoray нажмите «Сервер» (Server).\n"
-            "   • Для <code>vless://</code> выберите «Импортировать из буфера обмена».\n"
-            "   • Для <code>/sub/</code> добавьте Subscription URL.\n"
-            "5. <b>Обновите подписку</b> (Server/Subscription Update).\n"
-            "6. Включите <b>TUN Mode</b>.\n"
-            "7. <b>Выберите сервер</b> и нажмите «Подключить».\n"
-            "8. <b>Проверьте IP</b> на <a href='https://whatismyipaddress.com/'>WhatIsMyIPAddress</a>.\n\n"
-            "<b>Резервный вариант — Incy:</b> если основной клиент установить не получается, "
-            "скачайте подходящую сборку из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            "<b>🐧 Подключение на Linux</b>\n\n"
+            "<b>1. Установите Incy</b>\n"
+            "Скачайте версию для Linux из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>.\n\n"
+            "<b>2. Добавьте подписку</b>\n"
+            "Нажмите <b>📲 Incy</b> ниже и разрешите браузеру открыть приложение.\n\n"
+            "<b>3. Подтвердите импорт</b>\n"
+            "В Incy подтвердите добавление подписки и дождитесь списка серверов.\n\n"
+            "<b>4. Подключитесь</b>\n"
+            "Выберите сервер и включите VPN. Если список не появился, обновите подписку в приложении.\n\n"
+            "<b>Если Incy не открылся:</b> зайдите в «Мой профиль» → «Показать ссылку», "
+            "скопируйте URL и добавьте его в Incy вручную как подписку.",
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
