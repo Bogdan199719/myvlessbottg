@@ -3237,8 +3237,18 @@ def create_webhook_app(bot_controller_instance):
     def adjust_key_duration(key_id):
         """Adjust key duration by days and/or hours. Supports negative values to reduce duration."""
         try:
-            days_to_adjust = int(request.form.get("days", 0))
-            hours_to_adjust = int(request.form.get("hours", 0))
+            try:
+                days_to_adjust = int((request.form.get("days") or "0").strip())
+                hours_to_adjust = int((request.form.get("hours") or "0").strip())
+            except (AttributeError, ValueError):
+                flash("Дни и часы должны быть целыми числами.", "warning")
+                return redirect(url_for("keys_page"))
+            if not -365 <= days_to_adjust <= 365 or not -23 <= hours_to_adjust <= 23:
+                flash(
+                    "Допустимо от -365 до 365 дней и от -23 до 23 часов.",
+                    "warning",
+                )
+                return redirect(url_for("keys_page"))
 
             # Calculate total seconds to adjust
             total_seconds = days_to_adjust * 86400 + hours_to_adjust * 3600
@@ -3287,6 +3297,17 @@ def create_webhook_app(bot_controller_instance):
 
             success_count = 0
             new_expiry_date = None
+            positive_target_ms = None
+            if total_seconds > 0:
+                stored_expiries = [
+                    time_utils.parse_iso_to_msk(item.get("expiry_date"))
+                    for item in keys_to_adjust
+                ]
+                stored_expiries = [value for value in stored_expiries if value]
+                duration_base = max([time_utils.get_msk_now(), *stored_expiries])
+                positive_target_ms = time_utils.get_timestamp_ms(
+                    duration_base + timedelta(seconds=total_seconds)
+                )
 
             for k in keys_to_adjust:
                 if k.get("service_type") == "mtg":
@@ -3299,21 +3320,34 @@ def create_webhook_app(bot_controller_instance):
                             k.get("xui_client_uuid"),
                         )
                         continue
-                    current_expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
-                    current_expiry_ms = (
-                        int(current_expiry.timestamp() * 1000)
-                        if current_expiry
-                        else 0
+                    panel_details = _run_async(
+                        mtg_api.get_proxy_details(k["host_name"], k["key_email"])
                     )
-                    new_expiry_ms = _run_async(
-                        mtg_api.renew_proxy_for_user(
-                            k["host_name"],
-                            k["key_email"],
-                            node_id,
-                            days_to_adjust,
-                            current_expiry_ms,
+                    panel_expiry_ms = int(
+                        (panel_details or {}).get("expiry_timestamp_ms") or 0
+                    )
+                    if panel_expiry_ms <= 0 or positive_target_ms is None:
+                        logger.error(
+                            "Cannot safely extend MTG key_id=%s: panel expiry is unavailable.",
+                            k.get("key_id"),
                         )
-                    )
+                        continue
+                    if panel_expiry_ms >= positive_target_ms:
+                        new_expiry_ms = panel_expiry_ms
+                    else:
+                        remaining_ms = positive_target_ms - panel_expiry_ms
+                        renew_days = max(
+                            1, (remaining_ms + 86_400_000 - 1) // 86_400_000
+                        )
+                        new_expiry_ms = _run_async(
+                            mtg_api.renew_proxy_for_user(
+                                k["host_name"],
+                                k["key_email"],
+                                node_id,
+                                renew_days,
+                                panel_expiry_ms,
+                            )
+                        )
                     if not new_expiry_ms:
                         continue
                     expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
@@ -3329,15 +3363,25 @@ def create_webhook_app(bot_controller_instance):
                     new_expiry_date = expiry_dt
                     continue
 
-                # Call XUI logic to adjust on panel using seconds for precision.
-                result = _run_async(
-                    xui_api.create_or_update_key_on_host_seconds(
-                        host_name=k["host_name"],
-                        email=k["key_email"],
-                        seconds_to_add=total_seconds,
-                        telegram_id=None,  # Admin adjustment, no telegram_id available
+                if positive_target_ms is not None:
+                    result = _run_async(
+                        xui_api.create_or_update_key_on_host_absolute_expiry(
+                            host_name=k["host_name"],
+                            email=k["key_email"],
+                            target_expiry_ms=positive_target_ms,
+                            telegram_id=None,
+                            preserve_longer_expiry=True,
+                        )
                     )
-                )
+                else:
+                    result = _run_async(
+                        xui_api.create_or_update_key_on_host_seconds(
+                            host_name=k["host_name"],
+                            email=k["key_email"],
+                            seconds_to_add=total_seconds,
+                            telegram_id=None,
+                        )
+                    )
 
                 if result:
                     # Update local DB with new expiry from result
@@ -4042,9 +4086,123 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def issue_key_route(user_id):
         try:
+            custom_days_raw = (request.form.get("custom_days") or "").strip()
             plan_id = request.form.get("plan_id")
+
+            user = get_user(user_id)
+            if not user:
+                flash("Ошибка: Пользователь не найден.", "danger")
+                return redirect(url_for("users_page"))
+
+            # A custom number of days is a bonus extension of the subscription
+            # the user already has. It deliberately does not change plan IDs or
+            # replace expiry dates.
+            if custom_days_raw:
+                try:
+                    custom_days = int(custom_days_raw)
+                except ValueError:
+                    flash("Количество дней должно быть целым числом.", "danger")
+                    return redirect(url_for("users_page"))
+                if not 1 <= custom_days <= 3650:
+                    flash("Укажите от 1 до 3650 дней.", "warning")
+                    return redirect(url_for("users_page"))
+
+                user_keys = get_user_keys(user_id)
+                if not user_keys:
+                    flash(
+                        "У пользователя ещё нет подписки. Сначала выдайте тариф.",
+                        "warning",
+                    )
+                    return redirect(url_for("users_page"))
+
+                stored_expiries = [
+                    time_utils.parse_iso_to_msk(key.get("expiry_date"))
+                    for key in user_keys
+                ]
+                stored_expiries = [value for value in stored_expiries if value]
+                bonus_base_dt = max([time_utils.get_msk_now(), *stored_expiries])
+                bonus_target_ms = time_utils.get_timestamp_ms(
+                    bonus_base_dt + timedelta(days=custom_days)
+                )
+                updated_count = 0
+                for key in user_keys:
+                    try:
+                        if key.get("service_type") == "mtg":
+                            node_id = int(key.get("xui_client_uuid") or 0)
+                            panel_details = _run_async(
+                                mtg_api.get_proxy_details(
+                                    key["host_name"], key["key_email"]
+                                )
+                            )
+                            panel_expiry_ms = int(
+                                (panel_details or {}).get("expiry_timestamp_ms") or 0
+                            )
+                            if node_id <= 0 or panel_expiry_ms <= 0:
+                                continue
+                            if panel_expiry_ms >= bonus_target_ms:
+                                expiry_ms = panel_expiry_ms
+                            else:
+                                remaining_ms = bonus_target_ms - panel_expiry_ms
+                                renew_days = max(
+                                    1,
+                                    (remaining_ms + 86_400_000 - 1) // 86_400_000,
+                                )
+                                expiry_ms = _run_async(
+                                    mtg_api.renew_proxy_for_user(
+                                        key["host_name"],
+                                        key["key_email"],
+                                        node_id,
+                                        renew_days,
+                                        panel_expiry_ms,
+                                    )
+                                )
+                            if expiry_ms and update_key_info(
+                                key["key_id"], time_utils.from_timestamp_ms(expiry_ms)
+                            ):
+                                updated_count += 1
+                            continue
+
+                        result = _run_async(
+                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                                host_name=key["host_name"],
+                                email=key["key_email"],
+                                target_expiry_ms=bonus_target_ms,
+                                telegram_id=str(user_id),
+                                preserve_longer_expiry=True,
+                            )
+                        )
+                        if result and update_key_info(
+                            key["key_id"],
+                            time_utils.from_timestamp_ms(
+                                result["expiry_timestamp_ms"]
+                            ),
+                            result.get("connection_string"),
+                        ):
+                            updated_count += 1
+                    except Exception:
+                        logger.exception(
+                            "Manual bonus failed for user=%s key_id=%s",
+                            user_id,
+                            key.get("key_id"),
+                        )
+
+                if updated_count != len(user_keys):
+                    flash(
+                        f"Бонус применён не полностью: {updated_count} из {len(user_keys)} ключей. "
+                        "Не повторяйте общую операцию: продлите только оставшиеся ключи в разделе «Ключи».",
+                        "warning" if updated_count else "danger",
+                    )
+                    return redirect(url_for("users_page"))
+
+                flash(
+                    f"Пользователю добавлено {custom_days} дн. без потери текущего срока "
+                    f"({updated_count} ключей).",
+                    "success",
+                )
+                return redirect(url_for("users_page"))
+
             if not plan_id:
-                flash("Ошибка: не выбран тариф.", "danger")
+                flash("Выберите тариф или укажите количество бонусных дней.", "danger")
                 return redirect(url_for("users_page"))
 
             plan = get_plan_by_id(int(plan_id))
@@ -4056,11 +4214,6 @@ def create_webhook_app(bot_controller_instance):
                     "VPN можно выдать только как единую глобальную подписку.",
                     "warning",
                 )
-                return redirect(url_for("users_page"))
-
-            user = get_user(user_id)
-            if not user:
-                flash("Ошибка: Пользователь не найден.", "danger")
                 return redirect(url_for("users_page"))
 
             month_qty = plan["months"]
@@ -4088,9 +4241,82 @@ def create_webhook_app(bot_controller_instance):
 
             issued_count = 0
 
-            if plan["host_name"] == "ALL":
+            if plan.get("service_type") == "mtg":
+                host_name = plan["host_name"]
+                existing_key_db = next(
+                    (
+                        key
+                        for key in user_keys
+                        if key.get("service_type") == "mtg"
+                        and key.get("host_name") == host_name
+                    ),
+                    None,
+                )
+                if existing_key_db:
+                    try:
+                        node_id = int(existing_key_db.get("xui_client_uuid") or 0)
+                    except (TypeError, ValueError):
+                        node_id = 0
+                    if node_id <= 0:
+                        flash(
+                            "У существующего Telegram Proxy некорректный ID узла.",
+                            "danger",
+                        )
+                        return redirect(url_for("users_page"))
+                    expiry_ms = _run_async(
+                        mtg_api.renew_proxy_for_user(
+                            host_name,
+                            existing_key_db["key_email"],
+                            node_id,
+                            days_to_add,
+                        )
+                    )
+                    if expiry_ms:
+                        updated = update_key_info(
+                            existing_key_db["key_id"],
+                            time_utils.from_timestamp_ms(expiry_ms),
+                        )
+                        updated = updated and update_key_plan_id(
+                            existing_key_db["key_id"], int(plan["plan_id"])
+                        )
+                        issued_count = 1 if updated else 0
+                else:
+                    key_number = get_next_key_number(user_id)
+                    email = f"user{user_id}key{key_number}mtg"
+                    result = _run_async(
+                        mtg_api.create_proxy_for_user(host_name, email, days_to_add)
+                    )
+                    if result:
+                        new_key_id = add_new_key(
+                            user_id=user_id,
+                            host_name=host_name,
+                            xui_client_uuid=str(result["node_id"]),
+                            key_email=email,
+                            expiry_timestamp_ms=result["expiry_timestamp_ms"],
+                            connection_string=result["connection_string"],
+                            plan_id=plan["plan_id"],
+                            service_type="mtg",
+                        )
+                        issued_count = 1 if new_key_id else 0
+
+                if not issued_count:
+                    flash("Не удалось выдать или продлить Telegram Proxy.", "danger")
+                    return redirect(url_for("users_page"))
+                msg = "Telegram Proxy успешно выдан или продлён!"
+
+            elif plan["host_name"] == "ALL":
                 # Global Plan
                 hosts = get_all_hosts(only_enabled=True)
+                current_expiries = [
+                    time_utils.parse_iso_to_msk(key.get("expiry_date"))
+                    for key in user_keys
+                    if key.get("service_type", "xui") == "xui"
+                ]
+                current_expiries = [value for value in current_expiries if value]
+                global_base_dt = max([time_utils.get_msk_now(), *current_expiries])
+                global_target_expiry_ms = time_utils.get_timestamp_ms(
+                    global_base_dt + timedelta(days=days_to_add)
+                )
 
                 # We need a key number for any NEW keys we might create
                 # To be consistent with existing logic, we fetch it once
@@ -4103,16 +4329,15 @@ def create_webhook_app(bot_controller_instance):
                         )
 
                         if existing_key_db:
-                            # Manual issuance should set the exact plan duration from now,
-                            # not extend the user's remaining time. Reuse trial keys too,
-                            # otherwise admin issuance creates duplicate clients on the panel.
+                            # A manual plan grant is additive: paid time already on the
+                            # account must never be shortened or replaced.
                             result = _run_async(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=existing_key_db["key_email"],
-                                    target_expiry_ms=target_expiry_ms,
+                                    target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
-                                    preserve_longer_expiry=False,
+                                    preserve_longer_expiry=True,
                                 )
                             )
                             if result:
@@ -4142,7 +4367,7 @@ def create_webhook_app(bot_controller_instance):
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=email,
-                                    target_expiry_ms=target_expiry_ms,
+                                    target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
                                     preserve_longer_expiry=False,
                                 )
@@ -4183,7 +4408,8 @@ def create_webhook_app(bot_controller_instance):
                     )
                     flash(
                         f"Подписка выдана не полностью: {issued_count} из {len(hosts)} серверов. "
-                        "Статистика не начислена; проверьте недоступные хосты и повторите операцию.",
+                        "Статистика не начислена. Не повторяйте общую выдачу: после проверки серверов "
+                        "обработайте только отставшие ключи в разделе «Ключи».",
                         "warning",
                     )
                     return redirect(url_for("users_page"))
@@ -4198,16 +4424,13 @@ def create_webhook_app(bot_controller_instance):
                     existing_key_db = _find_existing_manual_issue_key(host_name)
 
                     if existing_key_db:
-                        # Manual issuance should set the exact plan duration from now,
-                        # not extend the user's remaining time. Reuse trial keys too,
-                        # otherwise admin issuance creates duplicate clients on the panel.
+                        # Preserve the existing remainder and add the tariff duration.
                         result = _run_async(
-                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                            xui_api.create_or_update_key_on_host_seconds(
                                 host_name=host_name,
                                 email=existing_key_db["key_email"],
-                                target_expiry_ms=target_expiry_ms,
+                                seconds_to_add=days_to_add * 86400,
                                 telegram_id=str(user_id),
-                                preserve_longer_expiry=False,
                             )
                         )
                         if result:
