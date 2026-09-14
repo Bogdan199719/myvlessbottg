@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
-from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
 import requests
@@ -33,6 +33,7 @@ _BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
 _LINK_FETCH_MAX_WORKERS = 6
+_SERVER_REMARK_MAX_LENGTH = 100
 _IP_ACTIVITY_FINGERPRINT_KEY = secrets.token_bytes(32)
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
     "connection aborted",
@@ -147,13 +148,25 @@ def get_country_flag_by_host(host_name: str) -> str:
 
 
 def _build_server_remark(host_name: str) -> str:
+    """Build a client-visible server name without discarding Unicode.
+
+    An explicitly supplied country flag is part of the administrator's chosen
+    name and must not be duplicated. Names without a known flag keep their
+    original text and receive the country detected from their city/country
+    alias. Only URI-breaking control characters are replaced.
+    """
     country_flag = get_country_flag_by_host(host_name)
-    clean_server_name = (
-        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
+    display_name = "".join(
+        " " if ord(character) < 32 or ord(character) == 127 else character
+        for character in str(host_name or "")
     )
-    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
-    clean_server_name = clean_server_name.lstrip("_")
-    return f"{country_flag}{clean_server_name}"
+    display_name = display_name.strip()[:_SERVER_REMARK_MAX_LENGTH]
+
+    if any(flag in display_name for flag in COUNTRY_FLAGS):
+        return display_name
+    if not display_name:
+        return country_flag
+    return f"{country_flag} {display_name}"[:_SERVER_REMARK_MAX_LENGTH]
 
 
 def _replace_link_remark(connection_string: str, remark: str) -> str:
@@ -208,7 +221,10 @@ def connection_strings_equivalent(left: str | None, right: str | None) -> bool:
             result[key] = value
         return result
 
-    return _stable_query(left_parts.query) == _stable_query(right_parts.query)
+    return (
+        _stable_query(left_parts.query) == _stable_query(right_parts.query)
+        and unquote(left_parts.fragment) == unquote(right_parts.fragment)
+    )
 
 
 def _log_host_error(host_url: str, error: Exception) -> None:

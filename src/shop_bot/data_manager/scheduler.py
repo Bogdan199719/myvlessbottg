@@ -978,18 +978,7 @@ async def sync_keys_with_panels():
 
                 if server_client:
                     await asyncio.to_thread(database.purge_missing_key, key_email)
-                    # Determine country flag based on server name
-                    country_flag = xui_api.get_country_flag_by_host(host_name)
-                    # Clean server name
-                    clean_server_name = (
-                        host_name.replace(" ", "")
-                        .encode("ascii", "ignore")
-                        .decode("ascii")
-                    )
-                    clean_server_name = "".join(
-                        c for c in clean_server_name if c.isalnum() or c == "_"
-                    ).lstrip("_")
-                    server_remark = f"{country_flag}{clean_server_name}"
+                    server_remark = xui_api._build_server_remark(host_name)
 
                     # Generate fresh connection string
                     new_connection_string = xui_api.get_connection_string(
