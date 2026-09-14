@@ -30,6 +30,10 @@ def main() -> None:
     assert "mtg_api.create_proxy_for_user(" in route
     assert 'name="custom_days"' in USERS
     assert 'name="plan_id" id="planSelect" required' not in USERS
+    assert "@single_manual_issue_per_user" in APP
+    assert "_manual_issue_users_lock" in APP
+    assert 'issueKeyForm.dataset.submitting === "1"' in USERS
+    assert 'submitButton.disabled = true' in USERS
     assert 'request.form.get("days") or "0"' in adjust_route
     assert "Дни и часы должны быть целыми числами." in adjust_route
     assert "positive_target_ms" in adjust_route

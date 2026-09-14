@@ -986,6 +986,33 @@ def create_webhook_app(bot_controller_instance):
 
         return decorated_function
 
+    _manual_issue_users: set[int] = set()
+    _manual_issue_users_lock = threading.Lock()
+
+    def single_manual_issue_per_user(f):
+        """Reject overlapping admin subscription operations for one user."""
+
+        @wraps(f)
+        def decorated_function(user_id, *args, **kwargs):
+            normalized_user_id = int(user_id)
+            with _manual_issue_users_lock:
+                if normalized_user_id in _manual_issue_users:
+                    flash(
+                        "Для этого пользователя уже выполняется ручная выдача. "
+                        "Дождитесь её завершения.",
+                        "warning",
+                    )
+                    return redirect(url_for("users_page"))
+                _manual_issue_users.add(normalized_user_id)
+
+            try:
+                return f(user_id, *args, **kwargs)
+            finally:
+                with _manual_issue_users_lock:
+                    _manual_issue_users.discard(normalized_user_id)
+
+        return decorated_function
+
     def _verify_and_upgrade_panel_password(
         plain_password: str, stored_password: str | None
     ) -> bool:
@@ -4084,6 +4111,7 @@ def create_webhook_app(bot_controller_instance):
 
     @flask_app.route("/users/issue-key/<int:user_id>", methods=["POST"])
     @login_required
+    @single_manual_issue_per_user
     def issue_key_route(user_id):
         try:
             custom_days_raw = (request.form.get("custom_days") or "").strip()

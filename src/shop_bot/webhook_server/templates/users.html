@@ -305,6 +305,21 @@
 
 <script nonce="{{ csp_nonce() }}">
 	var lastFocusedElement = null;
+	var issueKeyForm = document.getElementById("issueKeyForm");
+	if (issueKeyForm) {
+		issueKeyForm.addEventListener("submit", function (event) {
+			if (issueKeyForm.dataset.submitting === "1") {
+				event.preventDefault();
+				return;
+			}
+			issueKeyForm.dataset.submitting = "1";
+			var submitButton = issueKeyForm.querySelector('button[type="submit"]');
+			if (submitButton) {
+				submitButton.disabled = true;
+				submitButton.textContent = "Выполняется…";
+			}
+		});
+	}
 
 	function openIssueModal(userId, username) {
 		var modal = document.getElementById("issueKeyModal");
