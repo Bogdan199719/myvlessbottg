@@ -119,25 +119,18 @@ docker compose ps
 
 ```bash
 docker compose exec -T bot python3 -m compileall -q src scripts
-docker compose exec -T bot python3 scripts/check_callbacks.py
-docker compose exec -T bot python3 scripts/check_fsm_transitions.py
-docker compose exec -T bot python3 scripts/check_host_cleanup.py
-docker compose exec -T bot python3 scripts/check_payment_safety.py
-docker compose exec -T bot python3 scripts/check_profit_accounting.py
-docker compose exec -T bot python3 scripts/check_auto_selector.py
-docker compose exec -T bot python3 scripts/check_happ_subscription_metadata.py
-docker compose exec -T bot python3 scripts/check_incy_deeplink.py
-docker compose exec -T bot python3 scripts/check_ip_limit_rules.py
-docker compose exec -T bot python3 scripts/check_proxy_keyboard.py
-docker compose exec -T bot python3 scripts/check_scheduler_integrations.py
-docker compose exec -T bot python3 scripts/check_subscription_business_rules.py
-docker compose exec -T bot python3 scripts/check_subscription_consistency.py
-docker compose exec -T bot python3 scripts/check_xui_connection_equivalence.py
-docker compose exec -T bot python3 scripts/check_settings_defaults.py
+for check_script in scripts/check_*.py; do
+    docker compose exec -T bot python3 "$check_script" || exit $?
+done
 bash -n install.sh
 docker compose config --quiet
 git diff --check
 ```
+
+Цикл намеренно подхватывает все существующие `scripts/check_*.py`, поэтому список
+в документации не устаревает при добавлении новой проверки. Некоторые проверки
+читают production-style БД без изменений; запускайте их только в доверенном
+окружении и не публикуйте вывод с идентификаторами.
 
 `check_subscription_consistency.py` читает live-БД и проверяет, что каждый active trial и active paid global пользователь имеет ключ на каждом включённом XUI-хосте. По умолчанию скрипт маскирует идентификаторы; `--show-identities` предназначен только для доверенной локальной диагностики.
 
