@@ -2965,7 +2965,10 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     """
     from shop_bot.data_manager.database import get_all_hosts
 
-    all_hosts = get_all_hosts(only_enabled=True)
+    # Database access and py3xui both use blocking I/O. Keep the existing
+    # sequential host order, but never block the application's shared asyncio
+    # loop (Telegram polling, payments and scheduler timers run on it too).
+    all_hosts = await asyncio.to_thread(get_all_hosts, only_enabled=True)
     if not all_hosts:
         logger.warning("No hosts configured in database. XTLS sync skipped.")
         return {"status": "no_hosts"}
@@ -2975,7 +2978,7 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     for host_info in all_hosts:
         host_name = host_info.get("host_name")
         logger.info(f"Starting XTLS sync for host: {host_name}")
-        results[host_name] = _sync_xtls_for_host(host_info)
+        results[host_name] = await asyncio.to_thread(_sync_xtls_for_host, host_info)
 
     return results
 

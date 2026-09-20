@@ -1871,20 +1871,19 @@ def get_user_router() -> Router:
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
             hosts_to_process = get_all_hosts(only_enabled=True)
+            trial_keys_by_host = {
+                key.get("host_name"): key
+                for key in get_user_trial_keys(user_id)
+                if key.get("service_type", "xui") == "xui"
+                and key.get("host_name")
+            }
             target_expiry_ms = time_utils.get_timestamp_ms(
                 time_utils.get_msk_now() + timedelta(days=int(trial_days))
             )
 
             for host in hosts_to_process:
                 current_host_name = host["host_name"]
-                existing_trial_key = None
-                for key in get_user_trial_keys(user_id):
-                    if (
-                        key.get("service_type", "xui") == "xui"
-                        and key.get("host_name") == current_host_name
-                    ):
-                        existing_trial_key = key
-                        break
+                existing_trial_key = trial_keys_by_host.get(current_host_name)
 
                 email = (
                     existing_trial_key["key_email"]

@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 from yookassa import Configuration
 from yookassa import Payment
 
-from shop_bot.modules import mtg_api, xui_api
+from shop_bot.modules import host_selector, mtg_api, xui_api
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
 from shop_bot.webhook_server.restore_manager import (
@@ -141,6 +141,7 @@ ADMIN_LIST_DEFAULT_PER_PAGE = 50
 ADMIN_LIST_ALLOWED_PER_PAGE = {25, 50, 100}
 XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS = 120
 XUI_FIX_HOST_TIMEOUT_SECONDS = 60
+XUI_MAINTENANCE_PANEL_CONCURRENCY = 3
 
 
 def _admin_list_request_args(allowed_statuses: set[str]) -> tuple[str, str, int, int]:
@@ -954,6 +955,21 @@ def create_webhook_app(bot_controller_instance):
         "fix_parameters": {"status": "idle", "message": "Не запускалась"},
         "maintenance": {"status": "idle", "message": "Не запускалась"},
     }
+    maintenance_task_lock = threading.Lock()
+    maintenance_task_active = False
+
+    def _try_start_maintenance_task() -> bool:
+        nonlocal maintenance_task_active
+        with maintenance_task_lock:
+            if maintenance_task_active:
+                return False
+            maintenance_task_active = True
+            return True
+
+    def _finish_maintenance_task() -> None:
+        nonlocal maintenance_task_active
+        with maintenance_task_lock:
+            maintenance_task_active = False
 
     def _task_status_snapshot() -> dict:
         with task_status_lock:
@@ -988,6 +1004,29 @@ def create_webhook_app(bot_controller_instance):
 
     _manual_issue_users: set[int] = set()
     _manual_issue_users_lock = threading.Lock()
+    _bulk_xui_action_lock = threading.Lock()
+
+    def single_bulk_xui_action(redirect_endpoint: str):
+        """Reject overlapping bulk panel mutations from retries or other tabs."""
+
+        def decorator(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                if not _bulk_xui_action_lock.acquire(blocking=False):
+                    flash(
+                        "Другая массовая операция уже выполняется. "
+                        "Дождитесь её завершения.",
+                        "warning",
+                    )
+                    return redirect(url_for(redirect_endpoint))
+                try:
+                    return f(*args, **kwargs)
+                finally:
+                    _bulk_xui_action_lock.release()
+
+            return decorated_function
+
+        return decorator
 
     def single_manual_issue_per_user(f):
         """Reject overlapping admin subscription operations for one user."""
@@ -2282,37 +2321,55 @@ def create_webhook_app(bot_controller_instance):
                 continue
             keys_by_host.setdefault(host_name, []).append(key)
 
-        total_updated = 0
-        total_hosts = 0
-        total_errors = 0
-        hosts = [h["host_name"] for h in get_all_hosts(only_enabled=True)]
-        for host_name in hosts:
-            if host_name not in keys_by_host:
+        host_groups: dict[str, list[dict]] = defaultdict(list)
+        for host in get_all_hosts(only_enabled=True):
+            host_name = host.get("host_name")
+            if not host_name or host_name not in keys_by_host:
                 continue
-            total_hosts += 1
-            try:
-                mapping = await asyncio.wait_for(
-                    xui_api.get_connection_strings_for_host(host_name),
-                    timeout=XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS,
-                )
-            except Exception as k_e:
-                total_errors += 1
-                logger.warning(
-                    f"Failed to sync host '{host_name}': {k_e!r}", exc_info=True
-                )
-                await asyncio.sleep(0.5)
-                continue
+            group_key = host_selector.panel_group_key(host.get("host_url"), host_name)
+            host_groups[group_key].append(host)
 
-            for key in keys_by_host[host_name]:
-                email = key.get("key_email")
-                if not email:
-                    continue
-                conn = mapping.get(email)
-                if conn:
-                    update_key_connection_string(key["key_id"], conn)
-                    total_updated += 1
+        semaphore = asyncio.Semaphore(XUI_MAINTENANCE_PANEL_CONCURRENCY)
 
-            await asyncio.sleep(0.5)
+        async def _sync_panel(group_hosts: list[dict]) -> dict[str, int]:
+            panel_updated = 0
+            panel_errors = 0
+            async with semaphore:
+                # Logical hosts on one physical panel share its API and are kept
+                # sequential to avoid login/session and inbound update races.
+                for host in group_hosts:
+                    host_name = host["host_name"]
+                    try:
+                        mapping = await asyncio.wait_for(
+                            xui_api.get_connection_strings_for_host(host_name),
+                            timeout=XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS,
+                        )
+                    except Exception as k_e:
+                        panel_errors += 1
+                        logger.warning(
+                            f"Failed to sync host '{host_name}': {k_e!r}",
+                            exc_info=True,
+                        )
+                        continue
+
+                    for key in keys_by_host[host_name]:
+                        email = key.get("key_email")
+                        if not email:
+                            continue
+                        conn = mapping.get(email)
+                        if conn:
+                            await asyncio.to_thread(
+                                update_key_connection_string, key["key_id"], conn
+                            )
+                            panel_updated += 1
+            return {"updated": panel_updated, "errors": panel_errors}
+
+        panel_results = await asyncio.gather(
+            *(_sync_panel(group) for group in host_groups.values())
+        )
+        total_updated = sum(result["updated"] for result in panel_results)
+        total_errors = sum(result["errors"] for result in panel_results)
+        total_hosts = sum(len(group) for group in host_groups.values())
 
         return {
             "updated": total_updated,
@@ -2321,25 +2378,42 @@ def create_webhook_app(bot_controller_instance):
         }
 
     async def _fix_clients_job() -> dict:
-        total_fixed = 0
-        total_hosts = 0
-        total_errors = 0
-        hosts = [h["host_name"] for h in get_all_hosts(only_enabled=True)]
-        for host_name in hosts:
-            total_hosts += 1
-            try:
-                fixed = await asyncio.wait_for(
-                    xui_api.fix_all_client_parameters_on_host(host_name),
-                    timeout=XUI_FIX_HOST_TIMEOUT_SECONDS,
-                )
-                total_fixed += int(fixed)
-            except Exception as k_e:
-                total_errors += 1
-                logger.warning(
-                    f"Failed to fix clients on host '{host_name}': {k_e!r}",
-                    exc_info=True,
-                )
-            await asyncio.sleep(1)
+        host_groups: dict[str, list[dict]] = defaultdict(list)
+        for host in get_all_hosts(only_enabled=True):
+            host_name = host.get("host_name")
+            if not host_name:
+                continue
+            group_key = host_selector.panel_group_key(host.get("host_url"), host_name)
+            host_groups[group_key].append(host)
+
+        semaphore = asyncio.Semaphore(XUI_MAINTENANCE_PANEL_CONCURRENCY)
+
+        async def _fix_panel(group_hosts: list[dict]) -> dict[str, int]:
+            panel_fixed = 0
+            panel_errors = 0
+            async with semaphore:
+                for host in group_hosts:
+                    host_name = host["host_name"]
+                    try:
+                        fixed = await asyncio.wait_for(
+                            xui_api.fix_all_client_parameters_on_host(host_name),
+                            timeout=XUI_FIX_HOST_TIMEOUT_SECONDS,
+                        )
+                        panel_fixed += int(fixed)
+                    except Exception as k_e:
+                        panel_errors += 1
+                        logger.warning(
+                            f"Failed to fix clients on host '{host_name}': {k_e!r}",
+                            exc_info=True,
+                        )
+            return {"fixed": panel_fixed, "errors": panel_errors}
+
+        panel_results = await asyncio.gather(
+            *(_fix_panel(group) for group in host_groups.values())
+        )
+        total_fixed = sum(result["fixed"] for result in panel_results)
+        total_errors = sum(result["errors"] for result in panel_results)
+        total_hosts = sum(len(group) for group in host_groups.values())
 
         return {
             "fixed": total_fixed,
@@ -3203,6 +3277,7 @@ def create_webhook_app(bot_controller_instance):
 
     @flask_app.route("/keys/bulk", methods=["POST"])
     @login_required
+    @single_bulk_xui_action("keys_page")
     def bulk_keys_route():
         if (request.form.get("bulk_action") or "").strip() != "revoke":
             flash("Выберите действие для отмеченных ключей.", "warning")
@@ -3494,10 +3569,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/sync", methods=["POST"])
     @login_required
     def sync_keys_configs():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3526,10 +3610,14 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "sync_configs", "error", f"Ошибка синхронизации: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_sync_all_keys_wrapper(), loop)
             flash("Синхронизация ключей запущена в фоне. Проверьте логи позже.", "info")
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Error syncing keys: {e}", exc_info=True)
             _set_task_status("sync_configs", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить синхронизацию ключей.", "danger")
@@ -3539,10 +3627,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/fix-parameters", methods=["POST"])
     @login_required
     def fix_client_parameters():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3571,12 +3668,16 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "fix_parameters", "error", f"Ошибка исправления: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_fix_all_clients_wrapper(), loop)
             flash(
                 "Исправление параметров запущено в фоне. Проверьте логи позже.", "info"
             )
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Fix parameters error: {e}", exc_info=True)
             _set_task_status("fix_parameters", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить исправление параметров клиентов.", "danger")
@@ -3585,10 +3686,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/maintenance", methods=["POST"])
     @login_required
     def maintenance_route():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3647,10 +3757,14 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "maintenance", "error", f"Ошибка обслуживания: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_maintenance_wrapper(), loop)
             flash("Комплексное обслуживание запущено в фоне.", "info")
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Maintenance route error: {e}", exc_info=True)
             _set_task_status("maintenance", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить комплексное обслуживание.", "danger")
@@ -4055,6 +4169,7 @@ def create_webhook_app(bot_controller_instance):
 
     @flask_app.route("/users/bulk", methods=["POST"])
     @login_required
+    @single_bulk_xui_action("users_page")
     def bulk_users_route():
         action = (request.form.get("bulk_action") or "").strip()
         user_ids = _requested_bulk_ids("user_ids")

@@ -729,6 +729,14 @@ def run_migration():
 
             try:
                 cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_vpn_keys_host_name ON vpn_keys(host_name)"
+                )
+                logging.info(" -> Index on vpn_keys.host_name created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on vpn_keys.host_name already exists.")
+
+            try:
+                cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_vpn_keys_expiry ON vpn_keys(expiry_date)"
                 )
                 logging.info(" -> Index on vpn_keys.expiry_date created.")
