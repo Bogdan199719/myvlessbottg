@@ -29,7 +29,7 @@
 		<strong>{{ summary.period_orders }}</strong>
 		<small>сегодня: {{ summary.today_orders }}, клиентов: {{ summary.period_paid_transaction_users }}, промокодов: {{ summary.period_free_promos }}</small>
 	</div>
-	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+	<a href="{{ url_for('users_page', status='paid') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Активные оплаченные подписки</span>
 		<strong>{{ summary.active_paid_subscriptions }}</strong>
 		<small>активных клиентов; уникальных оплативших за всю историю: {{ summary.paid_transaction_users }}</small>
@@ -306,42 +306,42 @@
 			<a class="button button-small button-secondary" href="{{ url_for('users_page') }}">Пользователи</a>
 		</div>
 		<div class="subscription-state-grid">
-			<div class="subscription-state-item is-active">
+			<a class="subscription-state-item is-active" href="{{ url_for('users_page', status='paid') }}">
 				<span>Активные оплаченные подписки</span>
 				<strong>{{ summary.active_paid_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item is-expired">
+			</a>
+			<a class="subscription-state-item is-expired" href="{{ url_for('users_page', status='paid_expired') }}">
 				<span>Истекшие платные подписки</span>
 				<strong>{{ summary.expired_paid_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='free') }}">
 				<span>Активный бесплатный доступ</span>
 				<strong>{{ summary.active_free_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item is-trial">
+			</a>
+			<a class="subscription-state-item is-trial" href="{{ url_for('users_page', status='trial') }}">
 				<span>Активные пробные подписки</span>
 				<strong>{{ summary.active_trial_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_used') }}">
 				<span>Пробник взяли всего</span>
 				<strong>{{ summary.trial_used_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_expired') }}">
 				<span>Пробники истекли</span>
 				<strong>{{ summary.expired_trial_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='paid_ever') }}">
 				<span>Уникальные оплатившие клиенты</span>
 				<strong>{{ summary.paid_transaction_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="#completed-purchases">
 				<span>Денежные оплаты</span>
 				<strong>{{ summary.all_time_orders }}</strong>
-			</div>
-			<div class="subscription-state-item is-trial">
+			</a>
+			<a class="subscription-state-item is-trial" href="{{ url_for('settings_page') }}#promo-codes">
 				<span>Бесплатные промокоды</span>
 				<strong>{{ summary.all_time_free_promos }}</strong>
-			</div>
+			</a>
 		</div>
 	</section>
 
@@ -384,11 +384,11 @@
 		{% endif %}
 	</section>
 
-	<section class="analytics-panel analytics-panel-wide paid-transactions-panel">
+	<section id="completed-purchases" class="analytics-panel analytics-panel-wide paid-transactions-panel">
 		<div class="section-head">
 			<div>
 				<h2>Все завершённые покупки</h2>
-				<span class="panel-note">денежные оплаты и бесплатные промокоды, последние сверху; всего {{ analytics.paid_transactions|length }}</span>
+				<span class="panel-note">денежные оплаты и бесплатные промокоды, последние сверху; показано {{ analytics.paid_transactions|length }} из {{ summary.completed_transactions }}</span>
 			</div>
 			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
 		</div>

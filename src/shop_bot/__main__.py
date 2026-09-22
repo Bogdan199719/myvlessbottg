@@ -208,10 +208,14 @@ def main():
         try:
             logger.info("Attempting to auto-start Telegram Bot and Support Bot...")
             _log_bot_autostart_result(
-                logger, "Telegram Bot", bot_controller.start_shop_bot()
+                logger,
+                "Telegram Bot",
+                await asyncio.to_thread(bot_controller.start_shop_bot),
             )
             _log_bot_autostart_result(
-                logger, "Support Bot", bot_controller.start_support_bot()
+                logger,
+                "Support Bot",
+                await asyncio.to_thread(bot_controller.start_support_bot),
             )
         except Exception as e:
             logger.error("Error during bot auto-start: %s", e, exc_info=True)

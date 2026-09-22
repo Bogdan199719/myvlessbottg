@@ -1,7 +1,9 @@
 import asyncio
 import logging
-import requests
+import threading
+from functools import wraps
 
+import requests
 from yookassa import Configuration
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -17,6 +19,15 @@ from shop_bot.utils.admin_ids import parse_admin_telegram_ids
 logger = logging.getLogger(__name__)
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_STARS_RUB_RATE = 1.6
+
+
+def _serialize_lifecycle(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lifecycle_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _fetch_bot_username_sync(token: str) -> str:
@@ -45,6 +56,7 @@ def _parse_float(value, default: float = 0.0) -> float:
 class BotController:
     def __init__(self):
         self._loop = None
+        self._lifecycle_lock = threading.RLock()
 
         self.shop_bot = None
         self.shop_dp = None
@@ -97,9 +109,17 @@ class BotController:
                     retry_delay = 5
         finally:
             logger.info("BotController: Polling for '%s' has gracefully stopped.", name)
-            if bot:
-                await bot.close()
-            self._reset_bot_state(name)
+            try:
+                if bot:
+                    await bot.close()
+            except Exception:
+                logger.error(
+                    "BotController: Failed to close '%s' session.",
+                    name,
+                    exc_info=True,
+                )
+            finally:
+                self._reset_bot_state(name, expected_bot=bot)
 
     def _is_bot_marked_running(self, name: str) -> bool:
         if name == "ShopBot":
@@ -108,14 +128,18 @@ class BotController:
             return self.support_is_running
         return False
 
-    def _reset_bot_state(self, name: str) -> None:
+    def _reset_bot_state(self, name: str, expected_bot=None) -> None:
         if name == "ShopBot":
+            if expected_bot is not None and self.shop_bot is not expected_bot:
+                return
             self.shop_is_running = False
             self.shop_task = None
             self.shop_bot = None
             self.shop_dp = None
             return
         if name == "SupportBot":
+            if expected_bot is not None and self.support_bot is not expected_bot:
+                return
             self.support_is_running = False
             self.support_task = None
             self.support_bot = None
@@ -152,8 +176,11 @@ class BotController:
 
         return yookassa_enabled, stars_enabled, cryptobot_enabled, stars_rub_per_star
 
+    @_serialize_lifecycle
     def start_shop_bot(self):
-        if self.shop_is_running:
+        if self.shop_is_running or (
+            self.shop_task is not None and not self.shop_task.done()
+        ):
             return {"status": "error", "message": "Бот уже запущен."}
 
         if not self._loop or not self._loop.is_running():
@@ -229,8 +256,11 @@ class BotController:
             self._reset_bot_state("ShopBot")
             return {"status": "error", "message": f"Ошибка при запуске: {e}"}
 
+    @_serialize_lifecycle
     def start_support_bot(self):
-        if self.support_is_running:
+        if self.support_is_running or (
+            self.support_task is not None and not self.support_task.done()
+        ):
             return {"status": "error", "message": "Бот-Саппорт уже запущен."}
 
         if not self._loop or not self._loop.is_running():
@@ -275,6 +305,7 @@ class BotController:
             logger.error("Failed to start Support Bot: %s", e, exc_info=True)
             return {"status": "error", "message": f"Error starting Support Bot: {e}"}
 
+    @_serialize_lifecycle
     def stop_shop_bot(self):
         if not self.shop_is_running:
             return {"status": "error", "message": "Бот не запущен."}
@@ -292,6 +323,7 @@ class BotController:
 
         return {"status": "success", "message": "Команда на остановку бота отправлена."}
 
+    @_serialize_lifecycle
     def stop_support_bot(self):
         if not self.support_is_running:
             return {"status": "error", "message": "Бот не запущен."}

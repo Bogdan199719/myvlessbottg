@@ -956,6 +956,19 @@ a.analytics-kpi-card:hover {
 	background: rgba(8, 12, 18, 0.38);
 }
 
+a.subscription-state-item {
+	color: inherit;
+	text-decoration: none;
+	transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+}
+
+a.subscription-state-item:hover,
+a.subscription-state-item:focus-visible {
+	transform: translateY(-2px);
+	border-color: rgba(77, 163, 255, 0.5);
+	box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+}
+
 .subscription-state-item span,
 .status-summary-item span {
 	display: block;

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
-from urllib.parse import parse_qsl, quote, unquote, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
 import requests
@@ -221,10 +221,23 @@ def connection_strings_equivalent(left: str | None, right: str | None) -> bool:
             result[key] = value
         return result
 
-    return (
-        _stable_query(left_parts.query) == _stable_query(right_parts.query)
-        and unquote(left_parts.fragment) == unquote(right_parts.fragment)
-    )
+    if _stable_query(left_parts.query) != _stable_query(right_parts.query):
+        return False
+
+    if left_parts.fragment == right_parts.fragment:
+        return True
+
+    # 3x-ui may rotate sid/spx and return its own remark in the same refresh.
+    # Treat that combined response as equivalent, but keep a remark-only change
+    # significant so an intentional host rename is saved for clients.
+    def _volatile_query(query: str) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in parse_qsl(query, keep_blank_values=True)
+            if key in volatile_params
+        }
+
+    return _volatile_query(left_parts.query) != _volatile_query(right_parts.query)
 
 
 def _log_host_error(host_url: str, error: Exception) -> None:

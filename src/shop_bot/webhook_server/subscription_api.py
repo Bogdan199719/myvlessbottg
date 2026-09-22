@@ -29,6 +29,7 @@ subscription_bp = Blueprint("subscription", __name__)
 _XTLS_SYNC_INTERVAL_SECONDS = 300
 _last_xtls_sync_by_host: dict[str, float] = {}
 _SUBSCRIPTION_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+_SUBSCRIPTION_EXECUTOR_SLOTS = threading.BoundedSemaphore(4)
 _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
@@ -291,10 +292,30 @@ def redirect_to_incy(token):
 
 
 def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
+    if not _SUBSCRIPTION_EXECUTOR_SLOTS.acquire(blocking=False):
+        logger.warning(
+            "Subscription: background worker capacity exhausted for %s",
+            getattr(func, "__name__", "callable"),
+        )
+        return None
+
     try:
         future = _SUBSCRIPTION_EXECUTOR.submit(func, *args, **kwargs)
+    except Exception as e:
+        _SUBSCRIPTION_EXECUTOR_SLOTS.release()
+        logger.error(
+            "Subscription: failed to submit %s: %s",
+            getattr(func, "__name__", "callable"),
+            e,
+            exc_info=True,
+        )
+        return None
+
+    future.add_done_callback(lambda _future: _SUBSCRIPTION_EXECUTOR_SLOTS.release())
+    try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
+        future.cancel()
         logger.warning(
             f"Subscription: timeout calling {getattr(func, '__name__', 'callable')} after {timeout_seconds}s"
         )

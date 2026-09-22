@@ -1698,6 +1698,7 @@ def create_webhook_app(bot_controller_instance):
                 "expired_trial_users": 0,
                 "paying_users": 0,
                 "paid_transaction_users": 0,
+                "completed_transactions": 0,
                 "period_paid_transaction_users": 0,
                 "paid_subscription_users": 0,
                 "active_subscriptions": 0,
@@ -1922,7 +1923,7 @@ def create_webhook_app(bot_controller_instance):
                 }
                 paid_transactions: list[dict] = []
 
-                for row in cursor.fetchall():
+                for row in cursor:
                     status = str(row["status"] or "unknown")
                     status_counts[status] = status_counts.get(status, 0) + 1
                     transaction_date = row["paid_date"] or row["created_date"]
@@ -1935,6 +1936,8 @@ def create_webhook_app(bot_controller_instance):
 
                     if status != "paid":
                         continue
+
+                    analytics["summary"]["completed_transactions"] += 1
 
                     is_free_promo = method == "Promo" and amount <= 0
                     is_monetary_payment = amount > 0 and not is_free_promo
@@ -1985,19 +1988,20 @@ def create_webhook_app(bot_controller_instance):
                         plan_bucket["revenue"] += amount
                         plan_bucket["orders"] += 1
 
-                    paid_transactions.append(
-                        {
-                            "payment_id": row["payment_id"],
-                            "user_id": row["user_id"],
-                            "username": row["username"] or "N/A",
-                            "amount": amount,
-                            "method": method,
-                            "plan": plan_name,
-                            "date": transaction_date,
-                            "date_label": _format_transaction_dt(transaction_date),
-                            "is_free_promo": is_free_promo,
-                        }
-                    )
+                    if len(paid_transactions) < 200:
+                        paid_transactions.append(
+                            {
+                                "payment_id": row["payment_id"],
+                                "user_id": row["user_id"],
+                                "username": row["username"] or "N/A",
+                                "amount": amount,
+                                "method": method,
+                                "plan": plan_name,
+                                "date": transaction_date,
+                                "date_label": _format_transaction_dt(transaction_date),
+                                "is_free_promo": is_free_promo,
+                            }
+                        )
 
                 period_revenue = sum(analytics["series"]["revenue"].values())
                 period_orders = sum(analytics["series"]["orders"].values())
@@ -2075,11 +2079,7 @@ def create_webhook_app(bot_controller_instance):
                     key=lambda item: item["revenue"],
                     reverse=True,
                 )[:5]
-                analytics["paid_transactions"] = sorted(
-                    paid_transactions,
-                    key=lambda item: str(item.get("date") or ""),
-                    reverse=True,
-                )
+                analytics["paid_transactions"] = paid_transactions
                 analytics["transaction_statuses"] = [
                     {
                         "status": status,
@@ -2732,15 +2732,44 @@ def create_webhook_app(bot_controller_instance):
             "support_only",
             "no_subscription",
             "banned",
+            "trial_used",
+            "paid_ever",
         }
         query, selected_status, requested_page, per_page = (
             _admin_list_request_args(allowed_statuses)
         )
         normalized_query = query.casefold()
+        paid_user_ids: set[int] = set()
+        if selected_status == "paid_ever":
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    paid_user_ids = {
+                        int(row[0])
+                        for row in conn.execute(
+                            """
+                            SELECT DISTINCT user_id
+                            FROM transactions
+                            WHERE status = 'paid' AND COALESCE(amount_rub, 0) > 0
+                            """
+                        )
+                    }
+            except sqlite3.Error as e:
+                logger.error("Failed to load paying users: %s", e, exc_info=True)
+
         filtered_users = []
         for user in users:
             summary = user["subscription_summary"]
-            if selected_status != "all" and summary["status"] != selected_status:
+            if selected_status == "trial_used" and not user.get("trial_used"):
+                continue
+            if (
+                selected_status == "paid_ever"
+                and int(user["telegram_id"]) not in paid_user_ids
+            ):
+                continue
+            if (
+                selected_status not in {"all", "trial_used", "paid_ever"}
+                and summary["status"] != selected_status
+            ):
                 continue
             searchable = " ".join(
                 str(value or "")

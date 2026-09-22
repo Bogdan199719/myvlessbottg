@@ -73,7 +73,7 @@
 		</form>
 		<div class="table-tools">
 			<div class="filter-group">
-				{% for value, label in [('all', 'Все'), ('paid', 'Платные'), ('paid_expired', 'Платные истекли'), ('free', 'Бесплатный доступ'), ('trial', 'Пробные'), ('trial_expired', 'Пробные истекли'), ('payment_pending', 'Счёт не оплачен'), ('free_expired', 'Бесплатный доступ истёк'), ('support_only', 'Поддержка без подписки'), ('no_subscription', 'Без подписки'), ('banned', 'Забаненные')] %}
+				{% for value, label in [('all', 'Все'), ('paid', 'Платные'), ('paid_ever', 'Оплачивали когда-либо'), ('paid_expired', 'Платные истекли'), ('free', 'Бесплатный доступ'), ('trial', 'Пробные'), ('trial_used', 'Пробник брали'), ('trial_expired', 'Пробные истекли'), ('payment_pending', 'Счёт не оплачен'), ('free_expired', 'Бесплатный доступ истёк'), ('support_only', 'Поддержка без подписки'), ('no_subscription', 'Без подписки'), ('banned', 'Забаненные')] %}
 				<a class="filter-chip {{ 'is-active' if selected_status == value else '' }}" href="{{ url_for('users_page', q=list_query, status=value, per_page=pagination.per_page) }}">{{ label }}</a>
 				{% endfor %}
 			</div>
