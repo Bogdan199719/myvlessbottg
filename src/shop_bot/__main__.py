@@ -40,7 +40,10 @@ except Exception:
     )
 
 from shop_bot.webhook_server.app import create_webhook_app
-from shop_bot.data_manager.scheduler import periodic_subscription_check
+from shop_bot.data_manager.scheduler import (
+    periodic_payment_check,
+    periodic_subscription_check,
+)
 from shop_bot.data_manager import database
 from shop_bot.modules import xui_api
 from shop_bot.bot_controller import BotController
@@ -259,6 +262,7 @@ def main():
         logger.info("Application is running. Bots are auto-started if configured.")
 
         asyncio.create_task(periodic_subscription_check(bot_controller))
+        asyncio.create_task(periodic_payment_check(bot_controller))
 
         await asyncio.Future()
 

@@ -21,6 +21,7 @@ from shop_bot.modules import host_selector
 from shop_bot.bot import handlers
 
 CHECK_INTERVAL_SECONDS = 60
+_STARTUP_DELAY_SECONDS = 10
 _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS = 300
 PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}
 TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}
@@ -2064,9 +2065,31 @@ async def expire_stale_unpaid_stars_payments() -> None:
         )
 
 
+async def periodic_payment_check(bot_controller: BotController) -> None:
+    """Keep payment recovery moving even when a maintenance panel is slow."""
+    logger.info("Payment recovery scheduler has been started.")
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            if bot_controller.get_status().get("is_running"):
+                bot = bot_controller.get_bot_instance()
+                if bot:
+                    await recover_interrupted_payment_processing()
+                    await process_pending_yookassa_payments(bot)
+                    await process_pending_paid_provider_retries(bot)
+                    await expire_stale_unpaid_stars_payments()
+                else:
+                    logger.warning(
+                        "Payment scheduler: Bot is marked as running, but instance is not available."
+                    )
+        except Exception:
+            logger.exception("Payment scheduler: cycle failed")
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
-    await asyncio.sleep(10)
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
 
     # Track when XTLS sync was last performed (run every 5 min instead of every CHECK_INTERVAL)
     xtls_sync_interval = 300  # 5 minutes
@@ -2129,10 +2152,6 @@ async def periodic_subscription_check(bot_controller: BotController):
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
-                    await recover_interrupted_payment_processing()
-                    await process_pending_yookassa_payments(bot)
-                    await process_pending_paid_provider_retries(bot)
-                    await expire_stale_unpaid_stars_payments()
                     await check_expiring_subscriptions(bot)
                     await check_idle_onboarding_users(bot)
                 else:

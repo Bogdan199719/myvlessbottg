@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
+import threading
+from functools import wraps
 from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
@@ -21,8 +23,52 @@ from shop_bot.data_manager.database import (
     get_keys_for_host,
     update_key_by_email,
 )
+from shop_bot.modules.host_selector import panel_group_key
 
 logger = logging.getLogger(__name__)
+
+# A panel can replace an entire inbound from a stale snapshot. Keep every
+# read-modify-write on that physical panel in one worker thread at a time.
+# The lock belongs to the worker, so cancelling an awaiting coroutine cannot
+# release it while the HTTP request is still running.
+_panel_write_locks: dict[str, threading.Lock] = {}
+_panel_write_locks_guard = threading.Lock()
+
+
+def _get_panel_write_lock(host_url: str) -> threading.Lock:
+    panel_key = panel_group_key(host_url)
+    with _panel_write_locks_guard:
+        return _panel_write_locks.setdefault(panel_key, threading.Lock())
+
+
+def _serialize_host_write(operation):
+    @wraps(operation)
+    def guarded(host_name: str, *args, **kwargs):
+        host = get_host(host_name)
+        if not host:
+            return operation(host_name, *args, **kwargs)
+        with _get_panel_write_lock(host["host_url"]):
+            return operation(host_name, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_host_info_write(operation):
+    @wraps(operation)
+    def guarded(host_info: dict, *args, **kwargs):
+        with _get_panel_write_lock(host_info["host_url"]):
+            return operation(host_info, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_preflight_write(operation):
+    @wraps(operation)
+    def guarded(host_url: str, *args, **kwargs):
+        with _get_panel_write_lock(host_url):
+            return operation(host_url, *args, **kwargs)
+
+    return guarded
 
 
 # Error rate limiting: track last error per host to avoid log spam
@@ -1549,6 +1595,7 @@ def _client_traffic_is_disabled(api: Api, email: str) -> bool:
         return False
 
 
+@_serialize_preflight_write
 def validate_host_write_access(
     host_url: str,
     username: str,
@@ -2182,6 +2229,7 @@ async def create_or_update_key_on_host_absolute_expiry(
     )
 
 
+@_serialize_host_write
 def _create_or_update_key_on_host_sync(
     host_name: str,
     email: str,
@@ -2380,6 +2428,7 @@ async def fix_client_parameters_on_host(host_name: str, client_email: str) -> bo
     )
 
 
+@_serialize_host_write
 def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bool:
     """Sync version of fix_client_parameters_on_host"""
     host_data = get_host(host_name)
@@ -2462,6 +2511,7 @@ async def fix_all_client_parameters_on_host(host_name: str) -> int:
     return await asyncio.to_thread(_fix_all_client_parameters_on_host_sync, host_name)
 
 
+@_serialize_host_write
 def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
     host_data = get_host(host_name)
     if not host_data:
@@ -2603,6 +2653,7 @@ async def sync_clients_state_on_host(
     )
 
 
+@_serialize_host_write
 def _sync_clients_state_on_host_sync(
     host_name: str, desired_by_email: dict[str, dict]
 ) -> dict:
@@ -2915,6 +2966,7 @@ async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     return await asyncio.to_thread(_delete_client_on_host_sync, host_name, client_email)
 
 
+@_serialize_host_write
 def _delete_client_on_host_sync(host_name: str, client_email: str) -> bool:
     host_data = get_host(host_name)
     if not host_data:
@@ -2996,6 +3048,7 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     return results
 
 
+@_serialize_host_info_write
 def _sync_xtls_for_host(host_info: dict) -> dict:
     """
     Synchronize XTLS settings for a single host.

@@ -1,0 +1,6 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Moscow
+TZ=Europe/Moscow
+
+0 2 * * * root /usr/bin/bash /root/myvlessbottg/scripts/backup_project.sh

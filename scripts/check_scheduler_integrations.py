@@ -245,6 +245,59 @@ async def check_mtg_login_is_single_flight() -> None:
         mtg_api._token_locks.clear()
 
 
+async def check_payment_recovery_is_independent_of_maintenance() -> None:
+    maintenance_started = asyncio.Event()
+    release_maintenance = asyncio.Event()
+    payment_checked = asyncio.Event()
+    calls: list[str] = []
+
+    class Controller:
+        def get_status(self):
+            return {"is_running": True}
+
+        def get_bot_instance(self):
+            return object()
+
+    async def slow_maintenance():
+        maintenance_started.set()
+        await release_maintenance.wait()
+
+    async def recover():
+        calls.append("recover")
+
+    async def check_yookassa(_bot):
+        calls.append("yookassa")
+
+    async def retry_paid(_bot):
+        calls.append("retry")
+
+    async def expire_stars():
+        calls.append("stars")
+        payment_checked.set()
+
+    controller = Controller()
+    with (
+        patch.object(scheduler, "_STARTUP_DELAY_SECONDS", 0),
+        patch.object(scheduler, "enforce_clients_state_from_db", slow_maintenance),
+        patch.object(scheduler, "recover_interrupted_payment_processing", recover),
+        patch.object(scheduler, "process_pending_yookassa_payments", check_yookassa),
+        patch.object(scheduler, "process_pending_paid_provider_retries", retry_paid),
+        patch.object(scheduler, "expire_stale_unpaid_stars_payments", expire_stars),
+    ):
+        maintenance = asyncio.create_task(scheduler.periodic_subscription_check(controller))
+        payment = asyncio.create_task(scheduler.periodic_payment_check(controller))
+        try:
+            await asyncio.wait_for(maintenance_started.wait(), timeout=2)
+            await asyncio.wait_for(payment_checked.wait(), timeout=2)
+            assert calls == ["recover", "yookassa", "retry", "stars"]
+            assert not release_maintenance.is_set()
+        finally:
+            release_maintenance.set()
+            maintenance.cancel()
+            payment.cancel()
+            await asyncio.gather(maintenance, payment, return_exceptions=True)
+
+
 async def main() -> None:
     check_client_state_reconciliation_interval()
     check_snapshot_uses_transport_preserving_loader()
@@ -252,6 +305,7 @@ async def main() -> None:
     await check_xui_snapshot_does_not_block_loop()
     await check_mtg_concurrency_and_backoff()
     await check_mtg_login_is_single_flight()
+    await check_payment_recovery_is_independent_of_maintenance()
     print("Scheduler integration checks passed.")
 
 

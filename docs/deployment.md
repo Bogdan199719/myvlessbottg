@@ -3,6 +3,7 @@
 ## Требования
 
 - Docker Engine с Docker Compose;
+- образ приложения использует Python 3.12 на Debian 13;
 - домен с A/AAAA-записью на сервер;
 - открытые снаружи порты `80` и `443`;
 - токен Telegram-бота, Telegram ID администратора и учётные данные 3x-ui.
@@ -83,9 +84,23 @@ sudo certbot --nginx -d vpn.example.com --redirect
 ## Состояние, backup и restore
 
 - `.env`, `users.db` и backup-файлы — runtime-данные, а не исходный код;
-- храните `.env` с правами `600` и делайте резервные копии вне сервера;
+- храните `.env` с правами `600`;
 - backup/import из админки включает `.env` только при явном выборе в форме;
 - restore сначала сохраняется как pending, а перед стартом Flask, ботов и scheduler применяется с rollback-копиями БД и `.env`.
+
+На этом сервере cron (`/etc/cron.d/backup_my_project`, шаблон
+`scripts/backup_project.cron`) запускает `scripts/backup_project.sh` ежедневно
+в 05:00 МСК.
+Архивы находятся в `/bacupmyproject/`; после успешной проверки нового архива
+остаются три последние завершённые копии. Архив включает файлы проекта и `.env`.
+Рабочая `users.db` попадает в `backup_extra/sqlite/users.db` как согласованный
+SQLite-снимок; рядом сохраняется SQL-дамп этого же снимка. Живые файлы
+`users.db`, `users.db-wal` и `users.db-shm` повторно не архивируются.
+Скрипт проверяет SQLite, gzip, состав архива и создаёт SHA-256; при ошибке
+сохраняет предыдущие завершённые копии. Проверка без production-БД:
+`python3 scripts/check_backup_project.py`. Ручной запуск на сервере:
+`TZ=Europe/Moscow bash scripts/backup_project.sh`; результат смотрите в
+`/var/log/backup_my_project.log`. Этот cron хранит копии только на данном сервере.
 
 ## Обновление
 
