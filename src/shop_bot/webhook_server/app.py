@@ -307,6 +307,7 @@ def _summarize_user_subscription(
     active_total = 0
     paid_keys_total = 0
     latest_paid_expiry = None
+    earliest_active_expiry = None
 
     for key in keys:
         if not _is_xui_key(key):
@@ -323,6 +324,8 @@ def _summarize_user_subscription(
             continue
 
         active_total += 1
+        if earliest_active_expiry is None or expiry < earliest_active_expiry:
+            earliest_active_expiry = expiry
 
         if is_trial_key:
             trial_active += 1
@@ -383,6 +386,7 @@ def _summarize_user_subscription(
         "label": label,
         "css_class": css_class,
         "active_total": active_total,
+        "earliest_active_expiry": earliest_active_expiry,
         "paid_active": paid_active,
         "trial_active": trial_active,
         "paid_keys_total": paid_keys_total,
@@ -4266,9 +4270,8 @@ def create_webhook_app(bot_controller_instance):
                 flash("Ошибка: Пользователь не найден.", "danger")
                 return redirect(url_for("users_page"))
 
-            # A custom number of days is a bonus extension of the subscription
-            # the user already has. It deliberately does not change plan IDs or
-            # replace expiry dates.
+            # A custom number of days sets one expiry for every existing key.
+            # Keep plan IDs so a trial grant does not become a paid purchase.
             if custom_days_raw:
                 try:
                     custom_days = int(custom_days_raw)
@@ -4287,63 +4290,38 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return redirect(url_for("users_page"))
 
-                stored_expiries = [
-                    time_utils.parse_iso_to_msk(key.get("expiry_date"))
-                    for key in user_keys
-                ]
-                stored_expiries = [value for value in stored_expiries if value]
-                bonus_base_dt = max([time_utils.get_msk_now(), *stored_expiries])
-                bonus_target_ms = time_utils.get_timestamp_ms(
-                    bonus_base_dt + timedelta(days=custom_days)
+                if any(key.get("service_type") == "mtg" for key in user_keys):
+                    flash(
+                        "Для Telegram Proxy нельзя установить точный срок через эту форму.",
+                        "warning",
+                    )
+                    return redirect(url_for("users_page"))
+
+                target_expiry_ms = time_utils.get_timestamp_ms(
+                    time_utils.get_msk_now() + timedelta(days=custom_days)
                 )
                 updated_count = 0
                 for key in user_keys:
                     try:
-                        if key.get("service_type") == "mtg":
-                            node_id = int(key.get("xui_client_uuid") or 0)
-                            panel_details = _run_async(
-                                mtg_api.get_proxy_details(
-                                    key["host_name"], key["key_email"]
-                                )
-                            )
-                            panel_expiry_ms = int(
-                                (panel_details or {}).get("expiry_timestamp_ms") or 0
-                            )
-                            if node_id <= 0 or panel_expiry_ms <= 0:
-                                continue
-                            if panel_expiry_ms >= bonus_target_ms:
-                                expiry_ms = panel_expiry_ms
-                            else:
-                                remaining_ms = bonus_target_ms - panel_expiry_ms
-                                renew_days = max(
-                                    1,
-                                    (remaining_ms + 86_400_000 - 1) // 86_400_000,
-                                )
-                                expiry_ms = _run_async(
-                                    mtg_api.renew_proxy_for_user(
-                                        key["host_name"],
-                                        key["key_email"],
-                                        node_id,
-                                        renew_days,
-                                        panel_expiry_ms,
-                                    )
-                                )
-                            if expiry_ms and update_key_info(
-                                key["key_id"], time_utils.from_timestamp_ms(expiry_ms)
-                            ):
-                                updated_count += 1
-                            continue
-
                         result = _run_async(
                             xui_api.create_or_update_key_on_host_absolute_expiry(
                                 host_name=key["host_name"],
                                 email=key["key_email"],
-                                target_expiry_ms=bonus_target_ms,
+                                target_expiry_ms=target_expiry_ms,
                                 telegram_id=str(user_id),
-                                preserve_longer_expiry=True,
+                                preserve_longer_expiry=False,
                             )
                         )
-                        if result and update_key_info(
+                        if not result or abs(
+                            int(result["expiry_timestamp_ms"]) - target_expiry_ms
+                        ) > 1000:
+                            logger.error(
+                                "Manual duration grant did not reach target for user=%s key_id=%s",
+                                user_id,
+                                key["key_id"],
+                            )
+                            continue
+                        if update_key_info(
                             key["key_id"],
                             time_utils.from_timestamp_ms(
                                 result["expiry_timestamp_ms"]
@@ -4353,21 +4331,21 @@ def create_webhook_app(bot_controller_instance):
                             updated_count += 1
                     except Exception:
                         logger.exception(
-                            "Manual bonus failed for user=%s key_id=%s",
+                            "Manual duration grant failed for user=%s key_id=%s",
                             user_id,
                             key.get("key_id"),
                         )
 
                 if updated_count != len(user_keys):
                     flash(
-                        f"Бонус применён не полностью: {updated_count} из {len(user_keys)} ключей. "
-                        "Не повторяйте общую операцию: продлите только оставшиеся ключи в разделе «Ключи».",
+                        f"Срок установлен не для всех ключей: {updated_count} из {len(user_keys)}. "
+                        "Проверьте сроки в разделе «Ключи» и повторите установку срока.",
                         "warning" if updated_count else "danger",
                     )
                     return redirect(url_for("users_page"))
 
                 flash(
-                    f"Пользователю добавлено {custom_days} дн. без потери текущего срока "
+                    f"Пользователю установлен срок {custom_days} дн. от текущего момента "
                     f"({updated_count} ключей).",
                     "success",
                 )

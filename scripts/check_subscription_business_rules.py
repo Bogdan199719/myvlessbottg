@@ -239,6 +239,9 @@ def main() -> int:
             now,
         )
         assert free_summary["status"] == "free"
+        assert free_summary["earliest_active_expiry"] == time_utils.parse_iso_to_msk(
+            active_expiry
+        )
 
         paid_summary = _summarize_user_subscription(
             {"paid_transaction_count": 1, "free_transaction_count": 0},
@@ -273,6 +276,15 @@ def main() -> int:
             now,
         )
         assert expired_free_summary["status"] == "free_expired"
+
+        assert database.is_global_xui_key(
+            {"service_type": "xui", "plan_id": 0, "key_email": "user101-global-host"},
+            set(),
+        )
+        assert not database.is_global_xui_key(
+            {"service_type": "xui", "plan_id": 0, "key_email": "user101-local-host"},
+            set(),
+        )
 
     print("Subscription business-rule checks: OK")
     return 0

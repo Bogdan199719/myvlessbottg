@@ -140,7 +140,7 @@
 						<div class="subscription-cell">
 							{% if subscription.status == 'paid' %}
 							<strong>Активная</strong>
-							<small>платная подписка</small>
+							<small>платная подписка{% if subscription.earliest_active_expiry %} до {{ subscription.earliest_active_expiry.strftime('%d.%m.%Y %H:%M') }}{% endif %}</small>
 							{% elif subscription.status == 'paid_expired' %}
 							<strong>Истекла</strong>
 							<small>
@@ -148,10 +148,10 @@
 							</small>
 							{% elif subscription.status == 'free' %}
 							<strong>Активная</strong>
-							<small>бесплатная выдача или промокод</small>
+							<small>бесплатная выдача или промокод{% if subscription.earliest_active_expiry %} до {{ subscription.earliest_active_expiry.strftime('%d.%m.%Y %H:%M') }}{% endif %}</small>
 							{% elif subscription.status == 'trial' %}
 							<strong>Активная</strong>
-							<small>пробная подписка</small>
+							<small>пробная подписка{% if subscription.earliest_active_expiry %} до {{ subscription.earliest_active_expiry.strftime('%d.%m.%Y %H:%M') }}{% endif %}</small>
 							{% elif subscription.status == 'trial_expired' %}
 							<strong>Истекла</strong>
 							<small>пробная подписка</small>
@@ -289,10 +289,10 @@
 			</div>
 
 			<div class="form-group">
-				<label for="customDays">Или добавьте бонусные дни к имеющейся подписке:</label>
+				<label for="customDays">Или установите срок существующей подписки в днях:</label>
 				<input type="number" name="custom_days" id="customDays" min="1" max="3650"
 					class="form-control" placeholder="Например, 7" />
-				<small>Если указаны дни, тариф не используется. Текущая дата окончания сохранится и будет продлена.</small>
+				<small>Срок отсчитывается от выдачи и устанавливается для всех серверов. Если текущий срок длиннее, он сократится. Тариф не используется.</small>
 			</div>
 
 			<div class="form-actions">

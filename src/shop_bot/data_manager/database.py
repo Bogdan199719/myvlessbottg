@@ -2883,7 +2883,7 @@ def is_global_xui_key(
         return True
 
     key_email = str(key.get("key_email") or "").lower()
-    if plan_id > 0 and "-global-" in key_email:
+    if "-global-" in key_email:
         return True
 
     if enabled_host_names is not None:

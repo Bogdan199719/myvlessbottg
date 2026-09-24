@@ -15,6 +15,9 @@ def main() -> None:
     route = APP.split("def issue_key_route(user_id):", 1)[1].split(
         '@flask_app.route("/users/delete/', 1
     )[0]
+    days_route = route.split("if custom_days_raw:", 1)[1].split(
+        "if not plan_id:", 1
+    )[0]
     adjust_route = APP.split("def adjust_key_duration(key_id):", 1)[1].split(
         '@flask_app.route("/keys/sync', 1
     )[0]
@@ -29,6 +32,12 @@ def main() -> None:
     assert "mtg_api.renew_proxy_for_user(" in route
     assert "mtg_api.create_proxy_for_user(" in route
     assert 'name="custom_days"' in USERS
+    assert 'time_utils.get_msk_now() + timedelta(days=custom_days)' in days_route
+    assert 'for key in user_keys:' in days_route
+    assert 'target_expiry_ms=target_expiry_ms' in days_route
+    assert 'preserve_longer_expiry=False' in days_route
+    assert 'if any(key.get("service_type") == "mtg" for key in user_keys)' in days_route
+    assert "Срок отсчитывается от выдачи и устанавливается для всех серверов." in USERS
     assert 'name="plan_id" id="planSelect" required' not in USERS
     assert "@single_manual_issue_per_user" in APP
     assert "_manual_issue_users_lock" in APP
