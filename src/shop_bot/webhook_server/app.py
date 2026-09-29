@@ -3431,6 +3431,7 @@ def create_webhook_app(bot_controller_instance):
                         keys_to_adjust.append(k)
 
             success_count = 0
+            failed_hosts = []
             new_expiry_date = None
             positive_target_ms = None
             if total_seconds > 0:
@@ -3498,25 +3499,33 @@ def create_webhook_app(bot_controller_instance):
                     new_expiry_date = expiry_dt
                     continue
 
-                if positive_target_ms is not None:
-                    result = _run_async(
-                        xui_api.create_or_update_key_on_host_absolute_expiry(
-                            host_name=k["host_name"],
-                            email=k["key_email"],
-                            target_expiry_ms=positive_target_ms,
-                            telegram_id=None,
-                            preserve_longer_expiry=True,
+                try:
+                    if positive_target_ms is not None:
+                        result = _run_async(
+                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                                host_name=k["host_name"],
+                                email=k["key_email"],
+                                target_expiry_ms=positive_target_ms,
+                                telegram_id=None,
+                                preserve_longer_expiry=True,
+                            )
                         )
-                    )
-                else:
-                    result = _run_async(
-                        xui_api.create_or_update_key_on_host_seconds(
-                            host_name=k["host_name"],
-                            email=k["key_email"],
-                            seconds_to_add=total_seconds,
-                            telegram_id=None,
+                    else:
+                        result = _run_async(
+                            xui_api.create_or_update_key_on_host_seconds(
+                                host_name=k["host_name"],
+                                email=k["key_email"],
+                                seconds_to_add=total_seconds,
+                                telegram_id=None,
+                            )
                         )
+                except TimeoutError:
+                    logger.exception(
+                        "Timed out adjusting key_id=%s on host %s",
+                        k["key_id"], k["host_name"],
                     )
+                    failed_hosts.append(k["host_name"])
+                    continue
 
                 if result:
                     # Update local DB with new expiry from result
@@ -3535,6 +3544,16 @@ def create_webhook_app(bot_controller_instance):
                         continue
                     success_count += 1
                     new_expiry_date = expiry_dt
+                else:
+                    failed_hosts.append(k["host_name"])
+
+            if failed_hosts:
+                flash(
+                    f"Не удалось обновить {len(failed_hosts)} ключ(а): "
+                    + ", ".join(failed_hosts)
+                    + ". Проверьте сроки перед повторной попыткой.",
+                    "warning",
+                )
 
             if success_count > 0:
                 # Format the change message
@@ -3550,7 +3569,7 @@ def create_webhook_app(bot_controller_instance):
 
                 # Notify User
                 bot = _bot_controller.get_bot_instance()
-                if bot:
+                if bot and not failed_hosts:
                     user_id = key_data["user_id"]
                     if total_seconds > 0:
                         msg_text = (
@@ -3573,7 +3592,12 @@ def create_webhook_app(bot_controller_instance):
                             bot.send_message(user_id, msg_text, parse_mode="HTML"), loop
                         )
 
-                if is_global:
+                if is_global and failed_hosts:
+                    flash(
+                        f"Частично обновлено {success_count} из {len(keys_to_adjust)} ключей.",
+                        "warning",
+                    )
+                elif is_global:
                     flash(
                         f"Глобальная подписка {action_text}! Обновлено {success_count} ключей на {time_str}.",
                         "success",
