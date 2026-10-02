@@ -1929,12 +1929,21 @@ def update_or_create_client_on_panel(
     absolute_expiry_ms: int | None = None,
     preserve_longer_expiry: bool = True,
     client_identifier: str | None = None,
+    loaded_inbound: Inbound | None = None,
 ) -> tuple[str | None, int | None]:
     def _is_record_not_found_error(exc: Exception) -> bool:
         return "record not found" in str(exc).lower()
 
     try:
-        inbound_to_modify = _get_inbound_by_id_compat(api, inbound_id)
+        # Issuance already loaded this inbound while holding the panel write
+        # lock. Other callers retain the fresh-read behavior by default.
+        inbound_to_modify = (
+            loaded_inbound
+            if loaded_inbound is not None
+            else _get_inbound_by_id_compat(api, inbound_id)
+        )
+        if loaded_inbound is not None and loaded_inbound.id != inbound_id:
+            raise ValueError("Loaded inbound does not match the requested inbound")
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound_id}")
 
@@ -2266,6 +2275,7 @@ def _create_or_update_key_on_host_sync(
         telegram_id=telegram_id,
         absolute_expiry_ms=absolute_expiry_ms,
         preserve_longer_expiry=preserve_longer_expiry,
+        loaded_inbound=inbound,
     )
     if not client_uuid:
         logger.error(

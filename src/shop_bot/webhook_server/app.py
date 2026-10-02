@@ -52,6 +52,7 @@ from yookassa import Configuration
 from yookassa import Payment
 
 from shop_bot.modules import host_selector, mtg_api, xui_api
+from shop_bot.modules.panel_jobs import run_panel_jobs
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
 from shop_bot.webhook_server.restore_manager import (
@@ -4325,16 +4326,19 @@ def create_webhook_app(bot_controller_instance):
                     time_utils.get_msk_now() + timedelta(days=custom_days)
                 )
                 updated_count = 0
-                for key in user_keys:
+
+                async def update_duration(key):
+                    nonlocal updated_count
                     try:
-                        result = _run_async(
+                        result = await asyncio.wait_for(
                             xui_api.create_or_update_key_on_host_absolute_expiry(
                                 host_name=key["host_name"],
                                 email=key["key_email"],
                                 target_expiry_ms=target_expiry_ms,
                                 telegram_id=str(user_id),
                                 preserve_longer_expiry=False,
-                            )
+                            ),
+                            timeout=45,
                         )
                         if not result or abs(
                             int(result["expiry_timestamp_ms"]) - target_expiry_ms
@@ -4344,8 +4348,9 @@ def create_webhook_app(bot_controller_instance):
                                 user_id,
                                 key["key_id"],
                             )
-                            continue
-                        if update_key_info(
+                            return
+                        if await asyncio.to_thread(
+                            update_key_info,
                             key["key_id"],
                             time_utils.from_timestamp_ms(
                                 result["expiry_timestamp_ms"]
@@ -4359,6 +4364,13 @@ def create_webhook_app(bot_controller_instance):
                             user_id,
                             key.get("key_id"),
                         )
+
+                _run_async(
+                    run_panel_jobs(
+                        user_keys, lambda key: key["host_name"], update_duration
+                    ),
+                    timeout=45 * (len(user_keys) + 1),
+                )
 
                 if updated_count != len(user_keys):
                     flash(
@@ -4496,7 +4508,8 @@ def create_webhook_app(bot_controller_instance):
                 # To be consistent with existing logic, we fetch it once
                 key_number = get_next_key_number(user_id)
 
-                for h in hosts:
+                async def issue_host(h):
+                    nonlocal issued_count
                     try:
                         existing_key_db = _find_existing_manual_issue_key(
                             h["host_name"]
@@ -4505,25 +4518,28 @@ def create_webhook_app(bot_controller_instance):
                         if existing_key_db:
                             # A manual plan grant is additive: paid time already on the
                             # account must never be shortened or replaced.
-                            result = _run_async(
+                            result = await asyncio.wait_for(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=existing_key_db["key_email"],
                                     target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
                                     preserve_longer_expiry=True,
-                                )
+                                ),
+                                timeout=45,
                             )
                             if result:
                                 expiry_dt = time_utils.from_timestamp_ms(
                                     result["expiry_timestamp_ms"]
                                 )
-                                updated = update_key_info(
+                                updated = await asyncio.to_thread(
+                                    update_key_info,
                                     existing_key_db["key_id"],
                                     expiry_dt,
                                     result["connection_string"],
                                 )
-                                updated = updated and update_key_plan_id(
+                                updated = updated and await asyncio.to_thread(
+                                    update_key_plan_id,
                                     existing_key_db["key_id"], int(plan["plan_id"])
                                 )
                                 if not updated:
@@ -4532,22 +4548,24 @@ def create_webhook_app(bot_controller_instance):
                                         h["host_name"],
                                         existing_key_db["key_id"],
                                     )
-                                    continue
+                                    return
                                 issued_count += 1
                         else:
                             # Create new key
                             email = f"user{user_id}-global-{h['host_name'].replace(' ', '').lower()}"
-                            result = _run_async(
+                            result = await asyncio.wait_for(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=email,
                                     target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
                                     preserve_longer_expiry=False,
-                                )
+                                ),
+                                timeout=45,
                             )
                             if result:
-                                new_key_id = add_new_key(
+                                new_key_id = await asyncio.to_thread(
+                                    add_new_key,
                                     user_id=user_id,
                                     host_name=h["host_name"],
                                     xui_client_uuid=result["client_uuid"],
@@ -4561,12 +4579,18 @@ def create_webhook_app(bot_controller_instance):
                                         "Manual global issue created host %s but DB persistence failed.",
                                         h["host_name"],
                                     )
-                                    continue
+                                    return
                                 issued_count += 1
                     except Exception as e_h:
                         logger.error(
                             f"Failed to issue manual key on host {h['host_name']}: {e_h}"
                         )
+
+                _run_async(
+                    run_panel_jobs(hosts, lambda h: h["host_name"], issue_host),
+                    timeout=45 * (len(hosts) + 1),
+                )
+
                 if issued_count == 0:
                     flash(
                         "Не удалось создать/обновить ни один ключ на серверах XUI.",

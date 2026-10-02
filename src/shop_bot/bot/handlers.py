@@ -27,6 +27,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from shop_bot.bot import keyboards
 from shop_bot.modules import xui_api
+from shop_bot.modules.panel_jobs import run_panel_jobs
 from shop_bot.modules import mtg_api
 from shop_bot.data_manager.database import (
     get_user,
@@ -4488,7 +4489,9 @@ async def _execute_payment_for_hosts(
     results: list[dict] = []
     primary_key_id: int | None = None
 
-    for h_name, h_email in hosts_to_process:
+    async def process_host(item):
+        nonlocal primary_key_id
+        h_name, h_email = item
         try:
             existing_key_db = None
             if purchase_host_name == "ALL" or action == "new":
@@ -4513,7 +4516,7 @@ async def _execute_payment_for_hosts(
                     telegram_id=str(user_id),
                 )
             if not res:
-                continue
+                return
 
             if existing_key_db:
                 expiry_datetime = time_utils.from_timestamp_ms(
@@ -4535,7 +4538,7 @@ async def _execute_payment_for_hosts(
                         h_name,
                         existing_key_db["key_id"],
                     )
-                    continue
+                    return
                 results.append(res)
                 if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(existing_key_db["key_id"])
@@ -4555,7 +4558,7 @@ async def _execute_payment_for_hosts(
                         h_name,
                         res.get("email"),
                     )
-                    continue
+                    return
                 results.append(res)
                 if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(new_key_id)
@@ -4573,13 +4576,16 @@ async def _execute_payment_for_hosts(
                         h_name,
                         key_id,
                     )
-                    continue
+                    return
                 results.append(res)
                 if primary_key_id is None:
                     primary_key_id = int(key_id)
         except Exception as e:
             logger.error(f"Failed to process key on host {h_name}: {e}")
 
+    await run_panel_jobs(hosts_to_process, lambda item: item[0], process_host)
+    host_order = {name: index for index, (name, _email) in enumerate(hosts_to_process)}
+    results.sort(key=lambda result: host_order[result["host_name"]])
     return results, primary_key_id
 
 

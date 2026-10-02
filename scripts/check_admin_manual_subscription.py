@@ -33,7 +33,10 @@ def main() -> None:
     assert "mtg_api.create_proxy_for_user(" in route
     assert 'name="custom_days"' in USERS
     assert 'time_utils.get_msk_now() + timedelta(days=custom_days)' in days_route
-    assert 'for key in user_keys:' in days_route
+    assert 'async def update_duration(key):' in days_route
+    assert 'user_keys, lambda key: key["host_name"], update_duration' in days_route
+    assert 'run_panel_jobs(hosts,' in route
+    assert 'timeout=45,' in days_route
     assert 'target_expiry_ms=target_expiry_ms' in days_route
     assert 'preserve_longer_expiry=False' in days_route
     assert 'if any(key.get("service_type") == "mtg" for key in user_keys)' in days_route
