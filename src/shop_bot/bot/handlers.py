@@ -52,6 +52,7 @@ from shop_bot.data_manager.database import (
     create_pending_transaction,
     reserve_pending_transaction,
     update_reserved_transaction_metadata,
+    is_reserved_transaction_owner,
     apply_payment_accounting_once,
     finalize_reserved_transaction,
     mark_pending_transaction_status,
@@ -129,6 +130,13 @@ def _is_payment_fulfillment_retry(metadata: dict | None) -> bool:
         return int((metadata or {}).get("fulfillment_target_expiry_ms") or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _payment_attempt_is_current(metadata: dict | None) -> bool:
+    provider_payment_id = (metadata or {}).get("provider_payment_id")
+    return not provider_payment_id or is_reserved_transaction_owner(
+        str(provider_payment_id), metadata
+    )
 
 
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
@@ -4017,6 +4025,8 @@ async def _create_mtg_proxy_after_payment(
         update_key_plan_id,
     )
 
+    if not _payment_attempt_is_current(metadata):
+        return False
     days = months * 30
     try:
         if action == "extend" and key_id:
@@ -4028,6 +4038,8 @@ async def _create_mtg_proxy_after_payment(
             proxy_name = existing_key["key_email"]
             node_id = int(existing_key["xui_client_uuid"])
             panel_details = await mtg_api.get_proxy_details(host_name, proxy_name)
+            if not _payment_attempt_is_current(metadata):
+                return False
             panel_expiry_ms = int((panel_details or {}).get("expiry_timestamp_ms") or 0)
             if not panel_details or panel_expiry_ms <= 0:
                 logger.error(
@@ -4050,6 +4062,8 @@ async def _create_mtg_proxy_after_payment(
                 new_expiry_ms = await mtg_api.renew_proxy_for_user(
                     host_name, proxy_name, node_id, days, current_expiry_ms
                 )
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if not new_expiry_ms:
                     await processing_message.edit_text(
                         "❌ Не удалось продлить прокси. Обратитесь в поддержку."
@@ -4120,6 +4134,8 @@ async def _create_mtg_proxy_after_payment(
                     return False
             else:
                 result = await mtg_api.get_proxy_details(host_name, proxy_name)
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if result and not all(
                     (
                         result.get("node_id") is not None,
@@ -4136,6 +4152,8 @@ async def _create_mtg_proxy_after_payment(
                     result = await mtg_api.create_proxy_for_user(
                         host_name, proxy_name, days
                     )
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if not result:
                     await processing_message.edit_text(
                         "❌ Не удалось создать прокси. Обратитесь в поддержку."
@@ -4189,6 +4207,8 @@ async def _create_mtg_proxy_after_payment(
                 float(reward),
                 metadata,
             )
+            if accounting_applied_now is None:
+                return False
             if not accounting_applied_now and not metadata.get("accounting_applied"):
                 logger.error(
                     "Could not atomically apply MTG accounting for payment %s",
@@ -4484,6 +4504,7 @@ async def _execute_payment_for_hosts(
     key_id: int,
     target_expiry_ms: int | None = None,
     preserve_longer_expiry: bool = True,
+    metadata: dict | None = None,
 ) -> tuple[list[dict], int | None]:
     """Create/extend keys on all target hosts and update DB."""
     results: list[dict] = []
@@ -4493,6 +4514,8 @@ async def _execute_payment_for_hosts(
         nonlocal primary_key_id
         h_name, h_email = item
         try:
+            if metadata is not None and not _payment_attempt_is_current(metadata):
+                return
             existing_key_db = None
             if purchase_host_name == "ALL" or action == "new":
                 # Reuse existing key on the same host to preserve trial/global clients.
@@ -4515,6 +4538,8 @@ async def _execute_payment_for_hosts(
                     days_to_add=days_to_add,
                     telegram_id=str(user_id),
                 )
+            if metadata is not None and not _payment_attempt_is_current(metadata):
+                return
             if not res:
                 return
 
@@ -4591,6 +4616,9 @@ async def _execute_payment_for_hosts(
 
 async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     pending_flag_set = False
+    attempt_owner = metadata.get("processing_attempt_id")
+    if not _payment_attempt_is_current(metadata):
+        return False
     is_fulfillment_retry = _is_payment_fulfillment_retry(metadata)
     try:
         logger.info(
@@ -4605,7 +4633,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
         # ========== RACE CONDITION PROTECTION ==========
         # Atomically acquire the per-user processing flag.
-        if not set_pending_payment(user_id, True):
+        if not set_pending_payment(user_id, True, owner=attempt_owner):
             logger.warning(
                 f"Payment already being processed for user {user_id}. Ignoring duplicate webhook."
             )
@@ -4634,7 +4662,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 user_id,
                 "❌ Произошла ошибка при обработке платежа: не указан сервер. Обратитесь в поддержку.",
             )
-            set_pending_payment(user_id, False)
+            set_pending_payment(user_id, False, owner=attempt_owner)
             pending_flag_set = False
             return False
 
@@ -4654,7 +4682,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 user_id,
                 "❌ Не удалось определить тип оплаченной услуги. Обратитесь в поддержку.",
             )
-            set_pending_payment(user_id, False)
+            set_pending_payment(user_id, False, owner=attempt_owner)
             pending_flag_set = False
             return False
         metadata.setdefault("service_type", str(service_type))
@@ -4671,8 +4699,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             metadata.get("action"),
             e,
         )
-        if "user_id" in metadata:
-            set_pending_payment(int(metadata["user_id"]), False)
+        if pending_flag_set:
+            set_pending_payment(user_id, False, owner=attempt_owner)
         return False
     except Exception as e:
         logger.error(
@@ -4680,8 +4708,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             exc_info=True,
         )
         _err_user_id = metadata.get("user_id")
+        if pending_flag_set:
+            set_pending_payment(user_id, False, owner=attempt_owner)
         if _err_user_id:
-            set_pending_payment(int(_err_user_id), False)
             try:
                 await bot.send_message(
                     int(_err_user_id),
@@ -4718,6 +4747,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 "Could not persist user notification checkpoint for payment %s.",
                 provider_payment_id,
             )
+            if not _payment_attempt_is_current(metadata):
+                set_pending_payment(user_id, False, owner=attempt_owner)
+                return False
         try:
             processing_message = await bot.send_message(
                 chat_id=user_id,
@@ -4731,6 +4763,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             )
 
     try:
+        if not _payment_attempt_is_current(metadata):
+            return False
         # ── MTG Proxy branch ──────────────────────────────────────────────
         if service_type == "mtg":
             target_expiry_ms = _target_expiry_ms_for_service_payment(
@@ -4809,6 +4843,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             preserve_longer_expiry=not bool(
                 metadata.get("fulfillment_target_corrected_at")
             ),
+            metadata=metadata,
         )
 
         if not results:
@@ -4861,6 +4896,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 float(reward),
                 metadata,
             )
+            if accounting_applied_now is None:
+                return False
             if not accounting_applied_now and not metadata.get("accounting_applied"):
                 logger.error(
                     "Could not atomically apply accounting for payment %s.",
@@ -5083,4 +5120,4 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         return False
     finally:
         if pending_flag_set:
-            set_pending_payment(user_id, False)
+            set_pending_payment(user_id, False, owner=attempt_owner)

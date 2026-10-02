@@ -266,6 +266,117 @@ def main() -> int:
                         assert post("early-crash").status_code == 200
                         assert money() == (400, 4, 40)
                         assert len(panel_calls) == before_crash + 2
+
+                    # An old route's exception must not release a newer owner.
+                    for method in ("YooKassa", "CryptoBot"):
+                        pid = f"stale-exception-{method}"
+                        order(pid)
+                        replacement = {}
+                        before_panels, before_money = len(panel_calls), money()
+
+                        async def fail_after_takeover(_bot, old):
+                            assert db.finalize_reserved_transaction(
+                                pid, success=False, metadata=old
+                            )
+                            newer = db.reserve_pending_transaction(
+                                pid, {**metadata(), "provider_payment_id": pid,
+                                      "payment_method": method},
+                                payment_method=method, preserve_fulfillment_state=True,
+                            )
+                            assert newer is not None
+                            assert newer["processing_attempt_id"] != old["processing_attempt_id"]
+                            newer.update(fulfillment_target_expiry_ms=2_000_000_000_000,
+                                         accounting_applied=True)
+                            assert db.update_reserved_transaction_metadata(pid, newer)
+                            replacement.update(newer)
+                            raise RuntimeError("old attempt failed after takeover")
+
+                        with patch.object(handlers, "process_successful_payment", side_effect=fail_after_takeover):
+                            if method == "YooKassa":
+                                response = post(pid)
+                            else:
+                                db.update_setting("cryptobot_token", "synthetic-token")
+                                with patch.object(web, "_is_valid_cryptobot_signature", return_value=True):
+                                    response = client.post("/cryptobot-webhook", json={
+                                        "update_type": "invoice_paid", "payload": {
+                                            "invoice_id": "synthetic-invoice", "amount": "100.00",
+                                            "currency": "RUB", "currency_type": "fiat",
+                                            "payload": json.dumps({"tx_id": pid}),
+                                        },
+                                    })
+                        assert response.status_code == 500
+                        assert state(pid) == ("processing", replacement)
+                        assert len(panel_calls) == before_panels and money() == before_money
+
+                    # An in-flight old panel reply cannot persist keys/accounting
+                    # or clear the per-user flag acquired by the newer attempt.
+                    order("blocked-old-panel")
+
+                    async def blocked_panel_takeover():
+                        pid = "blocked-old-panel"
+                        old = db.reserve_pending_transaction(
+                            pid, {**metadata(), "provider_payment_id": pid,
+                                  "payment_method": "YooKassa"},
+                            payment_method="YooKassa", preserve_fulfillment_state=True,
+                        )
+                        assert old is not None
+                        entered, proceed = asyncio.Event(), asyncio.Event()
+
+                        async def blocked_key(**kwargs):
+                            entered.set()
+                            await proceed.wait()
+                            return {
+                                "host_name": kwargs["host_name"], "email": kwargs["email"],
+                                "client_uuid": "obsolete-client",
+                                "expiry_timestamp_ms": kwargs["target_expiry_ms"],
+                                "connection_string": "vless://obsolete@example.invalid:443",
+                            }
+
+                        keys_before, money_before = db.get_user_keys(1), money()
+                        with patch.object(handlers.xui_api, "create_or_update_key_on_host_absolute_expiry", side_effect=blocked_key):
+                            task = asyncio.create_task(handlers.process_successful_payment(bot, old))
+                            try:
+                                await asyncio.wait_for(entered.wait(), timeout=5)
+                                assert db.finalize_reserved_transaction(pid, success=False, metadata=old)
+                                assert db.set_pending_payment(1, False, owner=old["processing_attempt_id"])
+                                newer = db.reserve_pending_transaction(
+                                    pid, payment_method="YooKassa", preserve_fulfillment_state=True
+                                )
+                                assert newer is not None
+                                assert db.set_pending_payment(1, True, owner=newer["processing_attempt_id"])
+                            finally:
+                                proceed.set()
+                            assert await asyncio.wait_for(task, timeout=5) is False
+                        assert db.get_user_keys(1) == keys_before and money() == money_before
+                        assert db.get_pending_payment_status(1)
+                        assert db.is_reserved_transaction_owner(pid, newer)
+                        assert db.set_pending_payment(1, False, owner=newer["processing_attempt_id"])
+                        assert db.finalize_reserved_transaction(pid, success=False, metadata=newer)
+
+                    asyncio.run_coroutine_threadsafe(blocked_panel_takeover(), loop).result(timeout=10)
+
+                    # Real Stars confirmation and P2P routing retain the token
+                    # required by metadata updates and ordinary finalizers.
+                    assert db.create_pending_transaction(
+                        "stars-owner", 1, 100, {**metadata(), "expected_stars_amount": 10}
+                    )
+                    stars = handlers._stars_complete_transaction("stars-owner", 10, "test-charge", 1)
+                    assert stars is not None
+                    assert db.is_reserved_transaction_owner("stars-owner", stars)
+                    assert state("stars-owner")[1]["processing_attempt_id"] == stars["processing_attempt_id"]
+                    assert db.finalize_reserved_transaction("stars-owner", success=False, metadata=stars)
+
+                    async def fail_owned_p2p(_bot, reserved):
+                        assert reserved["processing_attempt_id"]
+                        assert db.is_reserved_transaction_owner("p2p-owner-routing", reserved)
+                        return False
+
+                    with patch.object(handlers, "process_successful_payment", side_effect=fail_owned_p2p):
+                        assert asyncio.run_coroutine_threadsafe(
+                            handlers._process_approved_p2p_request(bot, "owner-routing", metadata()), loop
+                        ).result(timeout=5) is False
+                    assert state("p2p-owner-routing")[0] == "pending"
+                    assert money() == (400, 4, 40)
             finally:
                 loop.call_soon_threadsafe(loop.stop)
                 thread.join(timeout=5)

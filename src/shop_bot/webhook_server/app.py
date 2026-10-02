@@ -5267,6 +5267,7 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/yookassa-webhook", methods=["POST"])
     def yookassa_webhook_handler():
         reserved_payment_id: str | None = None
+        reserved_attempt_id: str | None = None
         try:
             shop_id = get_setting("yookassa_shop_id")
             secret_key = get_setting("yookassa_secret_key")
@@ -5379,8 +5380,9 @@ def create_webhook_app(bot_controller_instance):
                         payment_id,
                     )
                     return "Service Unavailable", 503
-                metadata = reserved_metadata
                 reserved_payment_id = payment_id
+                reserved_attempt_id = reserved_metadata.get("processing_attempt_id")
+                metadata = reserved_metadata
 
                 bot = _bot_controller.get_bot_instance()
                 payment_processor = handlers.process_successful_payment
@@ -5464,13 +5466,17 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             if reserved_payment_id:
                 finalize_reserved_transaction(
-                    reserved_payment_id, success=False, payment_method="YooKassa"
+                    reserved_payment_id,
+                    success=False,
+                    payment_method="YooKassa",
+                    expected_attempt_id=reserved_attempt_id,
                 )
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
             return "Error", 500
 
     def _cryptobot_webhook_handler_impl():
         reserved_payment_id: str | None = None
+        reserved_attempt_id: str | None = None
         try:
             if not _is_valid_cryptobot_signature():
                 logger.warning(
@@ -5580,13 +5586,14 @@ def create_webhook_app(bot_controller_instance):
                             local_status,
                         )
                         return "Service Unavailable", 503
+                    reserved_payment_id = payment_id
+                    reserved_attempt_id = metadata.get("processing_attempt_id")
                     payload_price = metadata.get("price")
                     metadata["payment_method"] = "CryptoBot"
                     metadata["provider_payment_id"] = payment_id
                     metadata["cryptobot_invoice_id"] = str(
                         external_invoice_id or external_id_fallback or ""
                     )
-                    reserved_payment_id = payment_id
                 else:
                     logger.error(
                         "CryptoBot webhook: paid invoice payload has no known pending transaction id."
@@ -5676,7 +5683,10 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             if reserved_payment_id:
                 finalize_reserved_transaction(
-                    reserved_payment_id, success=False, payment_method="CryptoBot"
+                    reserved_payment_id,
+                    success=False,
+                    payment_method="CryptoBot",
+                    expected_attempt_id=reserved_attempt_id,
                 )
             logger.error(f"Error in cryptobot webhook handler: {e}", exc_info=True)
             return "Error", 500

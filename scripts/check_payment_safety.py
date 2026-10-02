@@ -40,7 +40,7 @@ def _has_final_pending_clear(source: str, fn: ast.AsyncFunctionDef) -> bool:
     return (
         "finally:" in text
         and "if pending_flag_set:" in text
-        and "set_pending_payment(user_id, False)" in text
+        and "set_pending_payment(user_id, False, owner=attempt_owner)" in text
     )
 
 
@@ -59,7 +59,7 @@ def _early_payment_validation_releases_pending_flag(
         if next_return < 0:
             return False
         branch = text[marker_index:next_return]
-        if "set_pending_payment(user_id, False)" not in branch:
+        if "set_pending_payment(user_id, False, owner=attempt_owner)" not in branch:
             return False
     return True
 

@@ -182,7 +182,8 @@ def main() -> int:
         assert database.create_pending_transaction(
             "accounting-once", 101, 200.0, accounting_metadata
         )
-        assert database.reserve_pending_transaction("accounting-once")
+        accounting_metadata = database.reserve_pending_transaction("accounting-once")
+        assert accounting_metadata
         assert database.apply_payment_accounting_once(
             "accounting-once", 101, 200.0, 1, 102, 20.0, accounting_metadata
         )

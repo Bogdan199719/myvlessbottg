@@ -164,8 +164,9 @@ def main() -> int:
         assert database.create_pending_transaction(
             "single-recovery", 1, 100.0, common
         )
-        assert database.reserve_pending_transaction("single-recovery")
-        stale = dict(common)
+        reserved = database.reserve_pending_transaction("single-recovery")
+        assert reserved
+        stale = dict(reserved)
         stale["processing_started_at"] = (
             time_utils.get_msk_now() - timedelta(minutes=20)
         ).isoformat()
@@ -180,7 +181,8 @@ def main() -> int:
         assert database.create_pending_transaction(
             "unsafe-recovery", 1, 100.0, unsafe
         )
-        assert database.reserve_pending_transaction("unsafe-recovery")
+        unsafe = database.reserve_pending_transaction("unsafe-recovery")
+        assert unsafe
         unsafe["processing_started_at"] = stale["processing_started_at"]
         assert database.update_reserved_transaction_metadata(
             "unsafe-recovery", unsafe

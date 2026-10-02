@@ -7,6 +7,7 @@ import json
 import math
 import os
 import uuid
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB_PATH = Path(os.getcwd()) / "users.db"
 DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
 _PAYMENT_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_pending_payment_owners: dict[int, str | None] = {}
+_pending_payment_owners_lock = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -3331,10 +3334,9 @@ def reserve_pending_transaction(
             )
             if not statuses:
                 return None
-            if preserve_fulfillment_state:
-                # Keep the read, checkpoint merge and reservation together.
-                # No external work is performed while holding this write lock.
-                cursor.execute("BEGIN IMMEDIATE")
+            # Keep the read, attempt ownership and reservation together.
+            # No external work is performed while holding this write lock.
+            cursor.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in statuses)
             cursor.execute(
                 f"""
@@ -3377,7 +3379,10 @@ def reserve_pending_transaction(
                 except json.JSONDecodeError:
                     metadata_to_store = {}
             else:
-                metadata_to_store = metadata
+                metadata_to_store = dict(metadata)
+            if not isinstance(metadata_to_store, dict):
+                return None
+            metadata_to_store["processing_attempt_id"] = uuid.uuid4().hex
             metadata_to_store["processing_started_at"] = (
                 time_utils.get_msk_now().isoformat()
             )
@@ -3417,10 +3422,61 @@ def reserve_pending_transaction(
         return None
 
 
+def _owned_processing_metadata(
+    conn: sqlite3.Connection, payment_id: str, expected_attempt_id: str | None
+) -> dict | None:
+    """Read the reservation for a caller, never grant it the current owner's id."""
+    row = conn.execute(
+        "SELECT status, metadata FROM transactions WHERE payment_id = ?",
+        (payment_id,),
+    ).fetchone()
+    if not row or row[0] != "processing":
+        return None
+    try:
+        stored = json.loads(row[1] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(stored, dict):
+        return None
+    if "processing_attempt_id" not in stored:
+        # Compatibility only for historical rows, never for a new reservation.
+        return stored if expected_attempt_id is None else None
+    owner = stored["processing_attempt_id"]
+    if (
+        not isinstance(owner, str)
+        or len(owner) != 32
+        or any(ch not in "0123456789abcdef" for ch in owner)
+        or owner != expected_attempt_id
+    ):
+        return None
+    return stored
+
+
+def is_reserved_transaction_owner(payment_id: str, metadata: dict) -> bool:
+    """Check ownership without changing transaction or caller state."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            ) is not None
+    except sqlite3.Error:
+        logger.exception("Failed to check payment attempt ownership")
+        return False
+
+
 def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> bool:
     """Persist resumable fulfillment state while a transaction is processing."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stored = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            )
+            if stored is None:
+                return False
+            metadata_to_store = dict(metadata)
+            if stored.get("accounting_applied"):
+                metadata_to_store["accounting_applied"] = True
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -3428,7 +3484,7 @@ def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> boo
                 SET metadata = ?
                 WHERE payment_id = ? AND status = 'processing'
                 """,
-                (json.dumps(metadata), payment_id),
+                (json.dumps(metadata_to_store), payment_id),
             )
             conn.commit()
             return cursor.rowcount == 1
@@ -3591,29 +3647,18 @@ def apply_payment_accounting_once(
     referrer_id: int | None,
     referral_reward: float,
     metadata: dict,
-) -> bool:
-    """Atomically apply purchase stats/referral credit once per provider payment."""
+) -> bool | None:
+    """True: applied now; False: already applied; None: caller cannot proceed."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute(
-                """
-                SELECT status, metadata
-                FROM transactions
-                WHERE payment_id = ?
-                """,
-                (payment_id,),
+            stored_metadata = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
             )
-            row = cursor.fetchone()
-            if not row or row["status"] != "processing":
+            if stored_metadata is None:
                 conn.rollback()
-                return False
-            try:
-                stored_metadata = json.loads(row["metadata"] or "{}")
-            except json.JSONDecodeError:
-                stored_metadata = {}
+                return None
             if stored_metadata.get("accounting_applied"):
                 metadata["accounting_applied"] = True
                 conn.rollback()
@@ -3655,14 +3700,14 @@ def apply_payment_accounting_once(
             )
             if cursor.rowcount != 1:
                 conn.rollback()
-                return False
+                return None
             conn.commit()
             return True
     except sqlite3.Error as e:
         logging.error(
             "Failed to apply accounting for payment %s: %s", payment_id, e
         )
-        return False
+        return None
 
 
 def finalize_reserved_transaction(
@@ -3673,6 +3718,7 @@ def finalize_reserved_transaction(
     payment_method: str | None = None,
     amount_currency: float | int | None = None,
     currency_name: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> bool:
     """
     Complete a reserved transaction.
@@ -3682,6 +3728,24 @@ def finalize_reserved_transaction(
     target_status = "paid" if success else "pending"
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if metadata is not None:
+                metadata_attempt_id = metadata.get("processing_attempt_id")
+                if (
+                    expected_attempt_id is not None
+                    and expected_attempt_id != metadata_attempt_id
+                ):
+                    return False
+                expected_attempt_id = metadata_attempt_id
+            stored = _owned_processing_metadata(conn, payment_id, expected_attempt_id)
+            if stored is None:
+                return False
+            metadata_to_store = None
+            if metadata is not None:
+                metadata_to_store = dict(metadata)
+                for key, value in stored.items():
+                    if key.startswith("fulfillment_") or key == "accounting_applied":
+                        metadata_to_store[key] = value
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -3699,7 +3763,7 @@ def finalize_reserved_transaction(
                 """,
                 (
                     target_status,
-                    json.dumps(metadata) if metadata is not None else None,
+                    json.dumps(metadata_to_store) if metadata_to_store is not None else None,
                     payment_method,
                     amount_currency,
                     currency_name,
@@ -5337,7 +5401,23 @@ def cleanup_notifications(days_to_keep: int = 30):
 # ============================================================================
 
 
-def set_pending_payment(user_id: int, is_pending: bool) -> bool:
+def set_pending_payment(
+    user_id: int, is_pending: bool, *, owner: str | None = None
+) -> bool:
+    """Acquire or release the user's flag without releasing another owner.
+
+    Ownership is process-local under the supported single-process deployment.
+    Startup clears abandoned database flags before workers are started.
+    """
+    with _pending_payment_owners_lock:
+        if not is_pending and _pending_payment_owners.get(user_id) != owner:
+            return False
+        return _set_pending_payment_locked(user_id, is_pending, owner)
+
+
+def _set_pending_payment_locked(
+    user_id: int, is_pending: bool, owner: str | None
+) -> bool:
     """
     Set or clear pending payment flag to prevent race conditions when multiple
     payment webhooks arrive simultaneously for the same user.
@@ -5363,6 +5443,10 @@ def set_pending_payment(user_id: int, is_pending: bool) -> bool:
                 )
             conn.commit()
             if cursor.rowcount > 0:
+                if is_pending:
+                    _pending_payment_owners[user_id] = owner
+                else:
+                    _pending_payment_owners.pop(user_id, None)
                 logging.info(
                     f"Pending payment flag for user {user_id} set to {is_pending}"
                 )
@@ -5408,6 +5492,12 @@ def get_pending_payment_status(user_id: int) -> bool:
 
 
 def clear_all_pending_payments() -> int:
+    """Reset abandoned flags and local owners before starting any workers."""
+    with _pending_payment_owners_lock:
+        return _clear_all_pending_payments_locked()
+
+
+def _clear_all_pending_payments_locked() -> int:
     """
     Clear pending payment flags for all users.
     Used on startup to ensure no stale flags remain.
@@ -5420,6 +5510,7 @@ def clear_all_pending_payments() -> int:
                 "UPDATE users SET pending_payment = 0 WHERE pending_payment = 1"
             )
             conn.commit()
+            _pending_payment_owners.clear()
             affected = cursor.rowcount
             if affected > 0:
                 logging.info(
