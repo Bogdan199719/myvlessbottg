@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # In Docker, os.getcwd() will be /app/project
 DEFAULT_DB_PATH = Path(os.getcwd()) / "users.db"
 DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
+_PAYMENT_PROCESS_INSTANCE_ID = uuid.uuid4().hex
 
 
 def _now_iso() -> str:
@@ -3292,7 +3293,7 @@ def create_pending_transaction(
                     user_id,
                     "pending",
                     amount_rub,
-                    json.dumps(metadata),
+                    json.dumps({**metadata, "fulfillment_protocol_version": 1}),
                     time_utils.get_msk_now(),
                 ),
             )
@@ -3364,6 +3365,12 @@ def reserve_pending_transaction(
                         "recovered_from_interrupted_processing_at",
                     }:
                         metadata_to_store[key] = value
+                if "fulfillment_protocol_version" not in stored_metadata:
+                    # Provider metadata must not upgrade an ambiguous old order.
+                    metadata_to_store.pop("fulfillment_protocol_version", None)
+                metadata_to_store["processing_instance_id"] = (
+                    _PAYMENT_PROCESS_INSTANCE_ID
+                )
             elif metadata is None:
                 try:
                     metadata_to_store = json.loads(metadata_raw) if metadata_raw else {}
@@ -3462,7 +3469,9 @@ def recover_stale_processing_transactions(
             for row in cursor.fetchall():
                 try:
                     metadata = json.loads(row["metadata"] or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
                     continue
                 if not metadata.get("provider_payment_id"):
                     continue
@@ -3485,14 +3494,85 @@ def recover_stale_processing_transactions(
                     UPDATE transactions
                     SET status = 'pending', metadata = ?
                     WHERE payment_id = ? AND status = 'processing'
+                      AND metadata = ?
                     """,
-                    (json.dumps(metadata), row["payment_id"]),
+                    (json.dumps(metadata), row["payment_id"], row["metadata"]),
                 )
                 recovered += cursor.rowcount
             conn.commit()
         return recovered
     except sqlite3.Error as e:
         logging.error("Failed to recover stale processing transactions: %s", e)
+        return 0
+
+
+def recover_pre_fulfillment_yookassa_on_startup() -> int:
+    """Recover new YooKassa orders before starting any payment workers.
+
+    Only call at single-process application startup after the previous process
+    has stopped. A different instance id alone is not proof that it has stopped.
+    Legacy orders without an original protocol marker remain untouched.
+    """
+    recovered = 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT payment_id, metadata
+                FROM transactions
+                WHERE status = 'processing' AND payment_method = 'YooKassa'
+                """
+            )
+            for row in cursor.fetchall():
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
+                    continue
+                version = metadata.get("fulfillment_protocol_version")
+                owner = metadata.get("processing_instance_id")
+                if (
+                    type(version) is not int
+                    or version != 1
+                    or not isinstance(owner, str)
+                    or len(owner) != 32
+                    or any(ch not in "0123456789abcdef" for ch in owner)
+                    or owner == _PAYMENT_PROCESS_INSTANCE_ID
+                    or metadata.get("payment_method") != "YooKassa"
+                    or metadata.get("provider_payment_id") != row["payment_id"]
+                    or metadata.get("service_type") not in ("xui", "mtg")
+                    or "fulfillment_target_expiry_ms" in metadata
+                    or metadata.get("accounting_applied")
+                ):
+                    continue
+                # Only the protocol marker and a Telegram status notification
+                # are possible before the target is durably saved.
+                if any(
+                    key.startswith("fulfillment_")
+                    and key not in {
+                        "fulfillment_protocol_version",
+                        "fulfillment_status_message_sent_at",
+                    }
+                    for key in metadata
+                ):
+                    continue
+                metadata["recovered_from_interrupted_processing_at"] = _now_iso()
+                cursor.execute(
+                    """
+                    UPDATE transactions SET status = 'pending', metadata = ?
+                    WHERE payment_id = ? AND status = 'processing'
+                      AND metadata = ?
+                    """,
+                    (json.dumps(metadata), row["payment_id"], row["metadata"]),
+                )
+                recovered += cursor.rowcount
+            conn.commit()
+        return recovered
+    except sqlite3.Error as e:
+        logger.error("Failed to recover early YooKassa orders at startup: %s", e)
         return 0
 
 

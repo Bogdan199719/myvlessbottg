@@ -178,6 +178,13 @@ def main():
     database.initialize_db()
     logger.info("Database initialization check complete.")
 
+    recovered = database.recover_pre_fulfillment_yookassa_on_startup()
+    if recovered:
+        logger.warning(
+            "Startup: returned %s interrupted early YooKassa order(s) to the retry queue.",
+            recovered,
+        )
+
     bot_controller = BotController()
     flask_app = create_webhook_app(bot_controller)
 

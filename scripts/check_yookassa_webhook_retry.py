@@ -218,6 +218,54 @@ def main() -> int:
                     assert post("accounting-retry").status_code == 200
                     assert state("accounting-retry")[1]["fulfillment_target_expiry_ms"] == accounted["fulfillment_target_expiry_ms"]
                     assert money() == (300, 3, 30)
+
+                    # Cancel the real fulfillment before it saves a target,
+                    # then simulate a restart without contacting any provider.
+                    order("early-crash")
+                    reserved = db.reserve_pending_transaction(
+                        "early-crash",
+                        {**metadata(), "provider_payment_id": "early-crash",
+                         "payment_method": "YooKassa"},
+                        payment_method="YooKassa", preserve_fulfillment_state=True,
+                    )
+                    assert reserved is not None
+                    before_crash = len(panel_calls)
+
+                    async def cancel_before_target():
+                        try:
+                            await handlers.process_successful_payment(bot, reserved)
+                        except asyncio.CancelledError:
+                            return
+                        raise AssertionError("Synthetic interruption was not reached")
+
+                    with patch.object(bot, "send_message", side_effect=asyncio.CancelledError):
+                        asyncio.run_coroutine_threadsafe(
+                            cancel_before_target(), loop
+                        ).result(timeout=5)
+                    status, interrupted = state("early-crash")
+                    assert status == "processing"
+                    assert "fulfillment_target_expiry_ms" not in interrupted
+                    assert interrupted["fulfillment_status_message_sent_at"]
+                    assert len(panel_calls) == before_crash
+                    assert money() == (300, 3, 30)
+                    assert db.get_pending_payment_status(1)
+                    assert db.recover_pre_fulfillment_yookassa_on_startup() == 0
+
+                    with patch.object(db, "_PAYMENT_PROCESS_INSTANCE_ID", "f" * 32):
+                        # initialize_db already clears abandoned user flags at
+                        # actual startup, before this new recovery is called.
+                        db.clear_all_pending_payments()
+                        assert db.recover_pre_fulfillment_yookassa_on_startup() >= 1
+                        assert state("early-crash")[0] == "pending"
+                        assert post("early-crash").status_code == 200
+                        completed = state("early-crash")[1]
+                        assert completed["processing_instance_id"] == "f" * 32
+                        assert completed["accounting_applied"] is True
+                        assert money() == (400, 4, 40)
+                        assert len(panel_calls) == before_crash + 2
+                        assert post("early-crash").status_code == 200
+                        assert money() == (400, 4, 40)
+                        assert len(panel_calls) == before_crash + 2
             finally:
                 loop.call_soon_threadsafe(loop.stop)
                 thread.join(timeout=5)
