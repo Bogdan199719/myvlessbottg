@@ -151,6 +151,10 @@ git diff --check
 
 `check_subscription_business_rules.py` и `check_profit_accounting.py` используют временную SQLite и не изменяют production-данные.
 
+`check_payment_analytics.py` читает рабочую БД в режиме read-only и получает
+согласованный снимок через SQLite Backup API, включая уже закоммиченные данные
+из WAL. Миграции и проверки аналитики выполняются только на временном снимке.
+
 `python3 scripts/check_subscription_issuance_speed.py` проверяет выдачу после оплаты
 и через админку на имитации панелей: ограничение параллелизма, порядок внутри
 панели, отмену, сохранение блокировки работающего HTTP worker, единый срок,
