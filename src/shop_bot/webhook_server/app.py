@@ -5359,6 +5359,7 @@ def create_webhook_app(bot_controller_instance):
                 reserved_metadata = reserve_pending_transaction(
                     payment_id,
                     metadata=metadata,
+                    preserve_fulfillment_state=True,
                     payment_method="YooKassa",
                     amount_currency=(
                         float(api_amount) if api_amount is not None else None
@@ -5383,6 +5384,30 @@ def create_webhook_app(bot_controller_instance):
 
                 bot = _bot_controller.get_bot_instance()
                 payment_processor = handlers.process_successful_payment
+
+                if bot is None or payment_processor is None:
+                    finalized = finalize_reserved_transaction(
+                        payment_id,
+                        success=False,
+                        metadata=metadata,
+                        payment_method="YooKassa",
+                        amount_currency=(
+                            float(api_amount) if api_amount is not None else None
+                        ),
+                        currency_name=api_currency,
+                    )
+                    reserved_payment_id = None
+                    if not finalized:
+                        logger.error(
+                            "YooKassa webhook: failed to release reserved transaction %s while the bot or payment processor is unavailable.",
+                            payment_id,
+                        )
+                    else:
+                        logger.warning(
+                            "YooKassa webhook: bot or payment processor is unavailable; payment %s returned to the retry queue.",
+                            payment_id,
+                        )
+                    return "Service Unavailable", 503
 
                 if metadata and bot is not None and payment_processor is not None:
                     loop = current_app.config.get("EVENT_LOOP")

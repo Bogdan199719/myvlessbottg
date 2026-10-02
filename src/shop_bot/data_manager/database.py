@@ -3311,10 +3311,13 @@ def reserve_pending_transaction(
     amount_currency: float | int | None = None,
     currency_name: str | None = None,
     allowed_statuses: tuple[str, ...] = ("pending",),
+    preserve_fulfillment_state: bool = False,
 ) -> dict | None:
     """
     Atomically reserve a pending transaction for processing.
     Returns metadata if the transaction was reserved, otherwise None.
+    YooKassa refreshes can preserve local checkpoints from the current row,
+    rather than a snapshot read before another fulfillment attempt completed.
     """
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -3327,6 +3330,10 @@ def reserve_pending_transaction(
             )
             if not statuses:
                 return None
+            if preserve_fulfillment_state:
+                # Keep the read, checkpoint merge and reservation together.
+                # No external work is performed while holding this write lock.
+                cursor.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in statuses)
             cursor.execute(
                 f"""
@@ -3340,7 +3347,24 @@ def reserve_pending_transaction(
                 return None
 
             metadata_raw = row["metadata"]
-            if metadata is None:
+            if preserve_fulfillment_state:
+                try:
+                    stored_metadata = json.loads(metadata_raw) if metadata_raw else {}
+                except (TypeError, json.JSONDecodeError):
+                    logging.error("Cannot reserve payment with invalid local metadata")
+                    return None
+                if not isinstance(stored_metadata, dict):
+                    logging.error("Cannot reserve payment with non-object local metadata")
+                    return None
+                metadata_to_store = dict(stored_metadata)
+                metadata_to_store.update(metadata or {})
+                for key, value in stored_metadata.items():
+                    if key.startswith("fulfillment_") or key in {
+                        "accounting_applied",
+                        "recovered_from_interrupted_processing_at",
+                    }:
+                        metadata_to_store[key] = value
+            elif metadata is None:
                 try:
                     metadata_to_store = json.loads(metadata_raw) if metadata_raw else {}
                 except json.JSONDecodeError:

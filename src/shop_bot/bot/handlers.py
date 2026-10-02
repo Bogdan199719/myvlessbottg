@@ -1842,13 +1842,14 @@ def get_user_router() -> Router:
 
         chosen_host = hosts[0]
 
+        # An expired Telegram callback must not consume the trial claim.
+        await callback.answer()
         if not claim_trial_if_unused(user_id):
             await callback.answer(
                 "Вы уже использовали бесплатный пробный период.", show_alert=True
             )
             return
 
-        await callback.answer()
         await process_trial_key_creation(callback.message, chosen_host["host_name"])
 
     async def process_trial_key_creation(message: types.Message, host_name: str):
@@ -1862,13 +1863,12 @@ def get_user_router() -> Router:
         if trial_days <= 0:
             trial_days = 1
 
-        await message.edit_text(
-            f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей подписки..."
-        )
-
         results: list[dict] = []
         panel_mutated = False
         try:
+            await message.edit_text(
+                f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей подписки..."
+            )
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
             hosts_to_process = get_all_hosts(only_enabled=True)

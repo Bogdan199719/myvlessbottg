@@ -1913,6 +1913,7 @@ async def process_pending_yookassa_payments(bot: Bot) -> None:
             payment_method="YooKassa",
             amount_currency=float(api_amount) if api_amount is not None else None,
             currency_name=api_currency,
+            preserve_fulfillment_state=True,
         )
         if reserved_metadata is None:
             logger.info(
