@@ -8,6 +8,7 @@ import math
 import os
 import uuid
 import threading
+from decimal import Decimal, DecimalException
 
 logger = logging.getLogger(__name__)
 
@@ -3296,7 +3297,18 @@ def create_pending_transaction(
                     user_id,
                     "pending",
                     amount_rub,
-                    json.dumps({**metadata, "fulfillment_protocol_version": 1}),
+                    json.dumps(
+                        {
+                            **metadata,
+                            "fulfillment_protocol_version": 1,
+                            **(
+                                {"payment_confirmation_verified": False}
+                                if str(metadata.get("payment_method") or "").lower()
+                                == "cryptobot"
+                                else {}
+                            ),
+                        }
+                    ),
                     time_utils.get_msk_now(),
                 ),
             )
@@ -3316,6 +3328,7 @@ def reserve_pending_transaction(
     currency_name: str | None = None,
     allowed_statuses: tuple[str, ...] = ("pending",),
     preserve_fulfillment_state: bool = False,
+    require_paid_confirmation: bool = False,
 ) -> dict | None:
     """
     Atomically reserve a pending transaction for processing.
@@ -3340,7 +3353,7 @@ def reserve_pending_transaction(
             placeholders = ",".join("?" for _ in statuses)
             cursor.execute(
                 f"""
-                SELECT metadata FROM transactions
+                SELECT * FROM transactions
                 WHERE payment_id = ? AND status IN ({placeholders})
                 """,
                 (payment_id, *statuses),
@@ -3350,6 +3363,15 @@ def reserve_pending_transaction(
                 return None
 
             metadata_raw = row["metadata"]
+            if require_paid_confirmation:
+                try:
+                    confirmation_metadata = json.loads(metadata_raw or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                if not isinstance(confirmation_metadata, dict):
+                    return None
+                if not _paid_retry_is_confirmed(dict(row), confirmation_metadata):
+                    return None
             if preserve_fulfillment_state:
                 try:
                     stored_metadata = json.loads(metadata_raw) if metadata_raw else {}
@@ -3365,6 +3387,7 @@ def reserve_pending_transaction(
                     if key.startswith("fulfillment_") or key in {
                         "accounting_applied",
                         "recovered_from_interrupted_processing_at",
+                        "payment_confirmation_verified",
                     }:
                         metadata_to_store[key] = value
                 if "fulfillment_protocol_version" not in stored_metadata:
@@ -3382,6 +3405,21 @@ def reserve_pending_transaction(
                 metadata_to_store = dict(metadata)
             if not isinstance(metadata_to_store, dict):
                 return None
+            # A reservation may carry fresh fulfillment data, but may not
+            # manufacture or erase a payment confirmation from caller input.
+            try:
+                confirmation_state = json.loads(metadata_raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                confirmation_state = {}
+            if (
+                isinstance(confirmation_state, dict)
+                and "payment_confirmation_verified" in confirmation_state
+            ):
+                metadata_to_store["payment_confirmation_verified"] = confirmation_state[
+                    "payment_confirmation_verified"
+                ]
+            else:
+                metadata_to_store.pop("payment_confirmation_verified", None)
             metadata_to_store["processing_attempt_id"] = uuid.uuid4().hex
             metadata_to_store["processing_started_at"] = (
                 time_utils.get_msk_now().isoformat()
@@ -3464,6 +3502,76 @@ def is_reserved_transaction_owner(payment_id: str, metadata: dict) -> bool:
         return False
 
 
+def _cryptobot_payment_is_confirmed(row: dict, metadata: dict) -> bool:
+    """Use a durable verified receipt, or conservative evidence for old orders."""
+    if "payment_confirmation_verified" in metadata:
+        return metadata["payment_confirmation_verified"] is True
+    if (
+        str(row.get("payment_method") or "").lower() != "cryptobot"
+        or metadata.get("provider_payment_id") != row.get("payment_id")
+        or not metadata.get("cryptobot_invoice_id")
+        or str(row.get("currency_name") or "").upper() != "RUB"
+    ):
+        return False
+    try:
+        paid = Decimal(str(row.get("amount_currency")))
+        price = Decimal(str(metadata.get("price")))
+        return (
+            paid.is_finite()
+            and price.is_finite()
+            and paid > 0
+            and price > 0
+            and abs(paid - price) <= Decimal("1")
+        )
+    except (DecimalException, ValueError, TypeError, OverflowError):
+        return False
+
+
+def _paid_retry_is_confirmed(row: dict, metadata: dict) -> bool:
+    method = str(metadata.get("payment_method") or "").lower()
+    if not metadata.get("provider_payment_id"):
+        return False
+    if method == "telegram stars":
+        return True
+    return method == "cryptobot" and _cryptobot_payment_is_confirmed(row, metadata)
+
+
+def _processing_fulfillment_is_allowed(
+    conn: sqlite3.Connection, payment_id: str, stored: dict
+) -> bool:
+    row = conn.execute(
+        "SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)
+    )
+    values = row.fetchone()
+    if values is None:
+        return False
+    item = dict(zip((column[0] for column in row.description), values))
+    # Check both representations so a caller cannot hide CryptoBot by changing
+    # its metadata method while the reserved transaction still names it.
+    if "cryptobot" in {
+        str(stored.get("payment_method") or "").lower(),
+        str(item.get("payment_method") or "").lower(),
+    }:
+        return _cryptobot_payment_is_confirmed(item, stored)
+    return True
+
+
+def is_reserved_transaction_fulfillment_allowed(payment_id: str, metadata: dict) -> bool:
+    """Verify ownership and payment confirmation before external fulfillment."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN")
+            stored = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            )
+            return stored is not None and _processing_fulfillment_is_allowed(
+                conn, payment_id, stored
+            )
+    except sqlite3.Error:
+        logger.exception("Failed to check payment fulfillment permission")
+        return False
+
+
 def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> bool:
     """Persist resumable fulfillment state while a transaction is processing."""
     try:
@@ -3475,8 +3583,17 @@ def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> boo
             if stored is None:
                 return False
             metadata_to_store = dict(metadata)
+            if (
+                "payment_confirmation_verified" in stored
+                and "payment_confirmation_verified" not in metadata_to_store
+            ):
+                metadata_to_store["payment_confirmation_verified"] = stored[
+                    "payment_confirmation_verified"
+                ]
             if stored.get("accounting_applied"):
                 metadata_to_store["accounting_applied"] = True
+            if stored.get("payment_confirmation_verified") is True:
+                metadata_to_store["payment_confirmation_verified"] = True
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -3659,6 +3776,8 @@ def apply_payment_accounting_once(
             if stored_metadata is None:
                 conn.rollback()
                 return None
+            if not _processing_fulfillment_is_allowed(conn, payment_id, stored_metadata):
+                return None
             if stored_metadata.get("accounting_applied"):
                 metadata["accounting_applied"] = True
                 conn.rollback()
@@ -3689,6 +3808,12 @@ def apply_payment_accounting_once(
                 )
 
             metadata["accounting_applied"] = True
+            if "payment_confirmation_verified" in stored_metadata:
+                metadata["payment_confirmation_verified"] = stored_metadata[
+                    "payment_confirmation_verified"
+                ]
+            else:
+                metadata.pop("payment_confirmation_verified", None)
             stored_metadata.update(metadata)
             cursor.execute(
                 """
@@ -3740,11 +3865,18 @@ def finalize_reserved_transaction(
             stored = _owned_processing_metadata(conn, payment_id, expected_attempt_id)
             if stored is None:
                 return False
+            if success and not _processing_fulfillment_is_allowed(conn, payment_id, stored):
+                return False
             metadata_to_store = None
             if metadata is not None:
                 metadata_to_store = dict(metadata)
+                if "payment_confirmation_verified" not in stored:
+                    metadata_to_store.pop("payment_confirmation_verified", None)
                 for key, value in stored.items():
-                    if key.startswith("fulfillment_") or key == "accounting_applied":
+                    if key.startswith("fulfillment_") or key in {
+                        "accounting_applied",
+                        "payment_confirmation_verified",
+                    }:
                         metadata_to_store[key] = value
             cursor = conn.cursor()
             cursor.execute(
@@ -3965,12 +4097,16 @@ def get_pending_paid_retry_transactions(limit: int = 100) -> list[dict]:
                 item = dict(row)
                 try:
                     metadata = json.loads(item.get("metadata") or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
                     continue
                 method = str(metadata.get("payment_method") or "").lower()
                 if method not in {"telegram stars", "cryptobot"}:
                     continue
                 if not metadata.get("provider_payment_id"):
+                    continue
+                if not _paid_retry_is_confirmed(item, metadata):
                     continue
                 item["metadata_dict"] = metadata
                 transactions.append(item)

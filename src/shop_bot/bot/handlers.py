@@ -52,7 +52,7 @@ from shop_bot.data_manager.database import (
     create_pending_transaction,
     reserve_pending_transaction,
     update_reserved_transaction_metadata,
-    is_reserved_transaction_owner,
+    is_reserved_transaction_fulfillment_allowed,
     apply_payment_accounting_once,
     finalize_reserved_transaction,
     mark_pending_transaction_status,
@@ -134,7 +134,15 @@ def _is_payment_fulfillment_retry(metadata: dict | None) -> bool:
 
 def _payment_attempt_is_current(metadata: dict | None) -> bool:
     provider_payment_id = (metadata or {}).get("provider_payment_id")
-    return not provider_payment_id or is_reserved_transaction_owner(
+    if (
+        not provider_payment_id
+        and (
+            "processing_attempt_id" in (metadata or {})
+            or str((metadata or {}).get("payment_method") or "").lower() == "cryptobot"
+        )
+    ):
+        return False
+    return not provider_payment_id or is_reserved_transaction_fulfillment_allowed(
         str(provider_payment_id), metadata
     )
 

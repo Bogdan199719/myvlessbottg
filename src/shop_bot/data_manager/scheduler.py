@@ -1988,6 +1988,7 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
             database.reserve_pending_transaction,
             payment_id,
             preserve_fulfillment_state=True,
+            require_paid_confirmation=True,
         )
         if reserved_metadata is None:
             logger.info(

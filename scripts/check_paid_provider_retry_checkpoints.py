@@ -79,6 +79,16 @@ def main() -> None:
             }
             assert database.create_pending_transaction(payment_id, user_id, 250, invoice)
             with sqlite3.connect(database.DB_FILE) as conn:
+                if method == "CryptoBot":
+                    # This fixture represents an already validated paid receipt.
+                    # Creation deliberately marks new Crypto invoices unverified;
+                    # establish trusted local confirmation before queue selection.
+                    confirmed = json.loads(conn.execute(
+                        "SELECT metadata FROM transactions WHERE payment_id=?", (payment_id,)
+                    ).fetchone()[0])
+                    confirmed["payment_confirmation_verified"] = True
+                    conn.execute("UPDATE transactions SET metadata=? WHERE payment_id=?",
+                                 (json.dumps(confirmed), payment_id))
                 conn.execute(
                     "UPDATE transactions SET payment_method=?,amount_currency=3,currency_name='OLD' "
                     "WHERE payment_id=?", (method, payment_id)

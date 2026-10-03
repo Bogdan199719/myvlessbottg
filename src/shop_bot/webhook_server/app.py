@@ -1,5 +1,6 @@
 import os
 import logging
+import math
 import asyncio
 import concurrent.futures
 import json
@@ -90,6 +91,7 @@ from shop_bot.data_manager.database import (
     update_key_info,
     get_plan_by_id,
     reserve_pending_transaction,
+    update_reserved_transaction_metadata,
     finalize_reserved_transaction,
     get_all_keys_with_usernames,
     update_key_connection_string,
@@ -679,15 +681,10 @@ def _sanitize_csv_cell(value) -> str:
 
 def _reserve_pending_transaction_for_cryptobot(
     payment_id: str,
-    *,
-    amount_currency=None,
-    currency_name: str | None = None,
 ) -> dict | None:
     return reserve_pending_transaction(
         payment_id,
         payment_method="CryptoBot",
-        amount_currency=amount_currency,
-        currency_name=currency_name,
     )
 
 
@@ -5552,11 +5549,25 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return "Bad Request", 400
 
+                # Validate before passing provider values to SQLite. A signed
+                # notification still needs a usable, finite positive amount.
+                try:
+                    if isinstance(cb_amount, bool):
+                        raise ValueError("Boolean payment amount")
+                    paid_amount = Decimal(str(cb_amount))
+                    if not paid_amount.is_finite() or paid_amount <= 0:
+                        raise ValueError("Non-positive or non-finite payment amount")
+                    cb_amount = float(paid_amount)
+                    if not math.isfinite(cb_amount) or cb_amount <= 0:
+                        raise ValueError("Payment amount cannot be stored safely")
+                except (InvalidOperation, ValueError, TypeError, OverflowError):
+                    logger.error("CryptoBot webhook: Invalid paid amount.")
+                    return "Bad Request", 400
+                currency_name = "RUB"
+
                 if payment_id:
                     metadata = _reserve_pending_transaction_for_cryptobot(
                         payment_id,
-                        amount_currency=cb_amount,
-                        currency_name=currency_name,
                     )
                     if metadata is None:
                         local_status = _get_transaction_status(payment_id)
@@ -5600,29 +5611,47 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return "Bad Request", 400
 
-                # Cross-check actual paid amount against payload price
-                if cb_amount:
-                    try:
-                        if abs(float(cb_amount) - float(payload_price)) > 1.0:
-                            if reserved_payment_id:
-                                finalize_reserved_transaction(
-                                    reserved_payment_id,
-                                    success=False,
-                                    metadata=metadata,
-                                    payment_method="CryptoBot",
-                                    amount_currency=cb_amount,
-                                    currency_name=currency_name,
-                                )
-                                reserved_payment_id = None
-                            logger.error(
-                                f"CryptoBot webhook: Amount mismatch! "
-                                f"paid={cb_amount}, payload_price={payload_price}"
-                            )
-                            return "Bad Request", 400
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            f"CryptoBot webhook: Could not compare amounts: {cb_amount} vs {payload_price}"
-                        )
+                # Keep the established one-ruble tolerance, but never treat a
+                # missing or malformed invoice price as successful validation.
+                try:
+                    if isinstance(payload_price, bool):
+                        raise ValueError("Boolean invoice price")
+                    expected_price = Decimal(str(payload_price))
+                    price_matches = (
+                        expected_price.is_finite()
+                        and expected_price > 0
+                        and math.isfinite(float(expected_price))
+                        and abs(paid_amount - expected_price) <= Decimal("1")
+                    )
+                except (InvalidOperation, ValueError, TypeError, OverflowError):
+                    price_matches = False
+                if not price_matches:
+                    finalize_reserved_transaction(
+                        reserved_payment_id,
+                        success=False,
+                        metadata=metadata,
+                    )
+                    reserved_payment_id = None
+                    logger.error(
+                        "CryptoBot webhook: Paid amount does not match a valid invoice price."
+                    )
+                    return "Bad Request", 400
+
+                metadata["payment_confirmation_verified"] = True
+                if not update_reserved_transaction_metadata(payment_id, metadata):
+                    # The unpersisted in-memory proof must not be written by a
+                    # cleanup path or used to start fulfillment.
+                    finalize_reserved_transaction(
+                        reserved_payment_id,
+                        success=False,
+                        payment_method="CryptoBot",
+                        expected_attempt_id=reserved_attempt_id,
+                    )
+                    reserved_payment_id = None
+                    logger.error(
+                        "CryptoBot webhook: Could not persist payment confirmation."
+                    )
+                    return "Service Unavailable", 503
 
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get("EVENT_LOOP")
