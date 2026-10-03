@@ -1982,18 +1982,12 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
         if not payment_id:
             continue
 
-        metadata = dict(tx.get("metadata_dict") or {})
-        method = metadata.get("payment_method") or tx.get("payment_method") or "Unknown"
-        currency_name = tx.get("currency_name")
-        amount_currency = tx.get("amount_currency")
-
+        # The queue is only a list of candidate ids. Another attempt may have
+        # returned a newer checkpoint to pending since this snapshot was read.
         reserved_metadata = await asyncio.to_thread(
             database.reserve_pending_transaction,
             payment_id,
-            metadata,
-            payment_method=method,
-            amount_currency=amount_currency,
-            currency_name=currency_name,
+            preserve_fulfillment_state=True,
         )
         if reserved_metadata is None:
             logger.info(
@@ -2020,9 +2014,6 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
             payment_id,
             success=bool(processed_ok),
             metadata=reserved_metadata,
-            payment_method=method,
-            amount_currency=amount_currency,
-            currency_name=currency_name,
         )
         if not finalized:
             logger.error(

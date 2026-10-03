@@ -3320,7 +3320,7 @@ def reserve_pending_transaction(
     """
     Atomically reserve a pending transaction for processing.
     Returns metadata if the transaction was reserved, otherwise None.
-    YooKassa refreshes can preserve local checkpoints from the current row,
+    Provider retries can preserve local checkpoints from the current row,
     rather than a snapshot read before another fulfillment attempt completed.
     """
     try:
