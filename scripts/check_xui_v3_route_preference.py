@@ -237,8 +237,36 @@ def main() -> int:
         "enable": True,
     }
 
+    canonical = dict(
+        id=42,
+        uuid=client.id,
+        email=client.email,
+        subId=client.sub_id,
+        enable=True,
+        expiryTime=0,
+        totalGB=0,
+        reset=0,
+        limitIp=0,
+        tgId=0,
+    )
+
+    def current_success(_api, _method, endpoint, payload=None):
+        if endpoint.startswith("panel/api/clients/get/"):
+            return {"success": True, "obj": {"client": dict(canonical)}}
+        if endpoint.startswith("panel/api/clients/update/"):
+            for field in (
+                "expiryTime",
+                "enable",
+                "totalGB",
+                "reset",
+                "limitIp",
+                "tgId",
+            ):
+                canonical[field] = payload[field]
+        return {"success": True, "obj": {}}
+
     with patch.object(
-        xui_api, "_raw_api_request", return_value={"success": True, "obj": {}}
+        xui_api, "_raw_api_request", side_effect=current_success
     ) as request:
         xui_api._add_client_compat(api, 6, client, client.id)
         expect(
@@ -247,8 +275,9 @@ def main() -> int:
         )
         xui_api._update_client_compat(api, client.id, client)
         expect(
-            _endpoint(request.call_args_list[-1]).startswith(
-                "panel/api/clients/update/"
+            any(
+                _endpoint(call).startswith("panel/api/clients/update/")
+                for call in request.call_args_list
             ),
             "update did not prefer v3",
         )
@@ -276,10 +305,14 @@ def main() -> int:
             _endpoint(request.call_args_list[-1]) == "panel/api/clients/add",
             "raw add did not prefer v3",
         )
+        canonical["expiryTime"] = 0
+        canonical["auth"] = "raw-auth"
+        request.reset_mock()
         xui_api._update_raw_client(api, 7, "raw-auth", raw_client)
         expect(
-            _endpoint(request.call_args_list[-1]).startswith(
-                "panel/api/clients/update/"
+            any(
+                _endpoint(call).startswith("panel/api/clients/update/")
+                for call in request.call_args_list
             ),
             "raw update did not prefer v3",
         )
