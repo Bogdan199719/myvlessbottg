@@ -994,10 +994,28 @@ def create_webhook_app(bot_controller_instance):
     def inject_current_year():
         return {"current_year": time_utils.get_msk_now().year}
 
+    def _admin_session_fingerprint() -> str:
+        credentials = json.dumps(
+            [get_setting("panel_login"), get_setting("panel_password")],
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hmac.new(
+            str(current_app.secret_key).encode("utf-8"), credentials, hashlib.sha256
+        ).hexdigest()
+
     def login_required(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if not session.get("logged_in", False):
+            fingerprint = session.get("admin_credential_fingerprint")
+            authenticated = (
+                session.get("logged_in", False)
+                and isinstance(fingerprint, str)
+                and compare_digest(fingerprint, _admin_session_fingerprint())
+            )
+            if not authenticated:
+                session.pop("logged_in", None)
+                session.pop("admin_credential_fingerprint", None)
+                session.pop("_csrf_token", None)
                 next_path = request.full_path if request.query_string else request.path
                 return redirect(url_for("login_page", next=next_path))
             return f(*args, **kwargs)
@@ -1115,6 +1133,7 @@ def create_webhook_app(bot_controller_instance):
                 with _login_attempts_lock:
                     _login_attempts.pop(client_ip, None)
                 session["logged_in"] = True
+                session["admin_credential_fingerprint"] = _admin_session_fingerprint()
                 session.permanent = True
                 session.pop("_csrf_token", None)  # Rotate CSRF token on login
                 next_url = (request.args.get("next") or "").strip()
@@ -1132,6 +1151,8 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def logout_page():
         session.pop("logged_in", None)
+        session.pop("admin_credential_fingerprint", None)
+        session.pop("_csrf_token", None)
         flash("Вы успешно вышли.", "success")
         return redirect(url_for("login_page"))
 
@@ -1632,7 +1653,9 @@ def create_webhook_app(bot_controller_instance):
             "history": history,
         }
 
-    def _build_dashboard_analytics(days: int | None = 30) -> dict:
+    def _build_dashboard_analytics(
+        days: int | None = 30, purchase_kind: str = "all"
+    ) -> dict:
         period_key = "all" if days is None else str(days)
         start_day = None
         if days is None:
@@ -1667,6 +1690,7 @@ def create_webhook_app(bot_controller_instance):
             "dates": dates,
             "labels": [_format_chart_day(day) for day in dates],
             "period": period_key,
+            "purchase_kind": purchase_kind,
             "period_days": days,
             "period_label": _format_period_label(period_key),
             "series": {
@@ -1701,6 +1725,10 @@ def create_webhook_app(bot_controller_instance):
                 "paying_users": 0,
                 "paid_transaction_users": 0,
                 "completed_transactions": 0,
+                "matching_completed_transactions": 0,
+                "existing_paid_transaction_users": 0,
+                "archived_paid_transaction_users": 0,
+                "current_user_conversion_percent": 0.0,
                 "period_paid_transaction_users": 0,
                 "paid_subscription_users": 0,
                 "active_subscriptions": 0,
@@ -1727,6 +1755,7 @@ def create_webhook_app(bot_controller_instance):
 
         today_key = time_utils.get_msk_now().date().isoformat()
         now = time_utils.get_msk_now()
+        analytics["checked_at"] = time_utils.format_msk(now)
 
         try:
             with sqlite3.connect(DB_FILE) as conn:
@@ -1943,6 +1972,13 @@ def create_webhook_app(bot_controller_instance):
 
                     is_free_promo = method == "Promo" and amount <= 0
                     is_monetary_payment = amount > 0 and not is_free_promo
+                    matches_purchase_kind = (
+                        purchase_kind == "all"
+                        or (purchase_kind == "money" and is_monetary_payment)
+                        or (purchase_kind == "promo" and is_free_promo)
+                    )
+                    if matches_purchase_kind:
+                        analytics["summary"]["matching_completed_transactions"] += 1
 
                     if is_free_promo:
                         analytics["summary"]["all_time_free_promos"] += 1
@@ -1990,7 +2026,7 @@ def create_webhook_app(bot_controller_instance):
                         plan_bucket["revenue"] += amount
                         plan_bucket["orders"] += 1
 
-                    if len(paid_transactions) < 200:
+                    if matches_purchase_kind and len(paid_transactions) < 200:
                         paid_transactions.append(
                             {
                                 "payment_id": row["payment_id"],
@@ -2009,6 +2045,10 @@ def create_webhook_app(bot_controller_instance):
                 period_orders = sum(analytics["series"]["orders"].values())
                 period_users = sum(analytics["series"]["users"].values())
                 paying_users.update(paid_transaction_users)
+                existing_user_ids = {
+                    int(user["telegram_id"]) for user in users_for_status
+                }
+                existing_payers = paid_transaction_users & existing_user_ids
                 analytics["summary"].update(
                     {
                         "today_users": analytics["series"]["users"].get(today_key, 0),
@@ -2021,6 +2061,15 @@ def create_webhook_app(bot_controller_instance):
                         "period_orders": period_orders,
                         "paying_users": len(paid_transaction_users),
                         "paid_transaction_users": len(paid_transaction_users),
+                        "existing_paid_transaction_users": len(existing_payers),
+                        "archived_paid_transaction_users": len(
+                            paid_transaction_users - existing_user_ids
+                        ),
+                        "current_user_conversion_percent": (
+                            round(len(existing_payers) / total_users * 100, 1)
+                            if total_users
+                            else 0.0
+                        ),
                         "period_paid_transaction_users": len(
                             period_paid_transaction_users
                         ),
@@ -2045,9 +2094,7 @@ def create_webhook_app(bot_controller_instance):
                         "active_paid_users_without_payment": len(
                             active_paid_users - paid_transaction_users
                         ),
-                        "expired_paid_users": user_status_counts[
-                            "paid_expired_users"
-                        ],
+                        "expired_paid_users": user_status_counts["paid_expired_users"],
                         "trial_users": user_status_counts["trial_users"],
                         "trial_used_users": len(trial_used_users),
                         "expired_trial_users": user_status_counts[
@@ -2453,7 +2500,12 @@ def create_webhook_app(bot_controller_instance):
         )
         total_pages = ceil(total_transactions / per_page)
 
-        analytics = _build_dashboard_analytics(days=period_days)
+        purchase_kind = (request.args.get("purchases") or "all").strip().lower()
+        if purchase_kind not in {"all", "money", "promo"}:
+            purchase_kind = "all"
+        analytics = _build_dashboard_analytics(
+            days=period_days, purchase_kind=purchase_kind
+        )
         profit = _build_profit_context(
             analytics["summary"]["period_revenue"], selected_period, period_days
         )
@@ -4136,8 +4188,10 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/ban/<int:user_id>", methods=["POST"])
     @login_required
     def ban_user_route(user_id):
-        ban_user(user_id)
-        flash(f"Пользователь {user_id} был заблокирован.", "success")
+        if ban_user(user_id):
+            flash(f"Пользователь {user_id} был заблокирован.", "success")
+        else:
+            flash("Блокировка не сохранена. Проверьте пользователя и логи.", "danger")
         return redirect(url_for("users_page"))
 
     def _requested_bulk_ids(field_name: str, *, limit: int = 100) -> list[int]:
@@ -4195,8 +4249,10 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/unban/<int:user_id>", methods=["POST"])
     @login_required
     def unban_user_route(user_id):
-        unban_user(user_id)
-        flash(f"Пользователь {user_id} был разблокирован.", "success")
+        if unban_user(user_id):
+            flash(f"Пользователь {user_id} был разблокирован.", "success")
+        else:
+            flash("Разблокировка не сохранена. Проверьте пользователя и логи.", "danger")
         return redirect(url_for("users_page"))
 
     @flask_app.route("/users/revoke/<int:user_id>", methods=["POST"])
@@ -4242,9 +4298,13 @@ def create_webhook_app(bot_controller_instance):
                 continue
             try:
                 if action == "ban":
-                    ban_user(user_id)
+                    if not ban_user(user_id):
+                        failed += 1
+                        continue
                 elif action == "unban":
-                    unban_user(user_id)
+                    if not unban_user(user_id):
+                        failed += 1
+                        continue
                 elif action == "revoke":
                     result = _revoke_user_keys(user_id)
                     if result["failed"]:

@@ -3,18 +3,19 @@
 {% block content %}
 
 {% set summary = analytics.summary %}
+{% set purchase_kind = analytics.purchase_kind|default('all') %}
 
 <div class="dashboard-page-head analytics-head">
 	<div>
 		<h1>Аналитика</h1>
-		<p>Пользователи, выручка, подписки и платежи {{ analytics.period_label }}.</p>
+		<p>Выручка и заказы {{ analytics.period_label }}. Доступ — на текущий момент, история — за всё время.</p>
 	</div>
 	<div class="analytics-head-actions">
 		{% for option in period_options %}
 		<a class="button button-small {{ 'button-primary' if option.is_active else 'button-secondary' }}" href="{{ url_for('dashboard_page', period=option.period) }}">{{ option.label }}</a>
 		{% endfor %}
-		<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Пользователи CSV</a>
-		<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Платежи CSV</a>
+		<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Все пользователи CSV</a>
+		<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Все платежи CSV</a>
 	</div>
 </div>
 
@@ -32,7 +33,7 @@
 	<a href="{{ url_for('users_page', status='paid') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Активные оплаченные подписки</span>
 		<strong>{{ summary.active_paid_subscriptions }}</strong>
-		<small>активных клиентов; уникальных оплативших за всю историю: {{ summary.paid_transaction_users }}</small>
+		<small>клиентов с действующим платным доступом сейчас</small>
 	</a>
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Пользователи</span>
@@ -42,12 +43,12 @@
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Средний чек</span>
 		<strong>{{ "%.0f"|format(summary.avg_order) }} ₽</strong>
-		<small>конверсия в оплату: {{ summary.conversion_percent }}%</small>
+		<small>оплачивали среди текущих профилей: {{ summary.current_user_conversion_percent }}%</small>
 	</div>
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">За всё время</span>
 		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
-		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных промокодов: {{ summary.all_time_free_promos }}</small>
+		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных активаций: {{ summary.all_time_free_promos }}</small>
 	</div>
 </section>
 
@@ -248,7 +249,7 @@
 			<span class="panel-note">пользователи, оплаты, выручка</span>
 		</div>
 		<div class="analytics-chart analytics-chart-large">
-			<canvas id="analyticsTrendChart"></canvas>
+			<canvas id="analyticsTrendChart" role="img" aria-label="Динамика новых пользователей, оплат и выручки за выбранный период">График динамики. Суммарные показатели доступны в карточках выше.</canvas>
 		</div>
 	</section>
 
@@ -258,7 +259,7 @@
 			<span class="panel-note">оплаченные платежи {{ analytics.period_label }}</span>
 		</div>
 		<div class="analytics-chart analytics-chart-donut">
-			<canvas id="paymentMethodsChart"></canvas>
+			<canvas id="paymentMethodsChart" role="img" aria-label="Выручка по методам оплаты за выбранный период">Данные по методам оплаты приведены в списке ниже.</canvas>
 		</div>
 		{% if analytics.payment_methods %}
 		<div class="analytics-list">
@@ -305,6 +306,7 @@
 			<h2>Подписки и доступ</h2>
 			<a class="button button-small button-secondary" href="{{ url_for('users_page') }}">Пользователи</a>
 		</div>
+		<p class="panel-note">Клиенты, а не ключи. Рассчитано {{ analytics.checked_at }} МСК. Текущий доступ и история указаны отдельно.</p>
 		<div class="subscription-state-grid">
 			<a class="subscription-state-item is-active" href="{{ url_for('users_page', status='paid') }}">
 				<span>Активные оплаченные подписки</span>
@@ -323,23 +325,24 @@
 				<strong>{{ summary.active_trial_subscriptions }}</strong>
 			</a>
 			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_used') }}">
-				<span>Пробник взяли всего</span>
+				<span>Брали пробник · текущие профили</span>
 				<strong>{{ summary.trial_used_users }}</strong>
 			</a>
 			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_expired') }}">
-				<span>Пробники истекли</span>
+				<span>После пробника без доступа сейчас</span>
 				<strong>{{ summary.expired_trial_users }}</strong>
 			</a>
 			<a class="subscription-state-item" href="{{ url_for('users_page', status='paid_ever') }}">
-				<span>Уникальные оплатившие клиенты</span>
+				<span>Оплачивали за всю историю</span>
 				<strong>{{ summary.paid_transaction_users }}</strong>
+				<small>Профили в списке: {{ summary.existing_paid_transaction_users }}; без профиля: {{ summary.archived_paid_transaction_users }}. Открыть список.</small>
 			</a>
-			<a class="subscription-state-item" href="#completed-purchases">
+			<a class="subscription-state-item" href="{{ url_for('dashboard_page', period=analytics.period, purchases='money', _anchor='completed-purchases') }}">
 				<span>Денежные оплаты</span>
 				<strong>{{ summary.all_time_orders }}</strong>
 			</a>
-			<a class="subscription-state-item is-trial" href="{{ url_for('settings_page') }}#promo-codes">
-				<span>Бесплатные промокоды</span>
+			<a class="subscription-state-item is-trial" href="{{ url_for('dashboard_page', period=analytics.period, purchases='promo', _anchor='completed-purchases') }}">
+				<span>Бесплатные активации по промокоду</span>
 				<strong>{{ summary.all_time_free_promos }}</strong>
 			</a>
 		</div>
@@ -387,10 +390,15 @@
 	<section id="completed-purchases" class="analytics-panel analytics-panel-wide paid-transactions-panel">
 		<div class="section-head">
 			<div>
-				<h2>Все завершённые покупки</h2>
-				<span class="panel-note">денежные оплаты и бесплатные промокоды, последние сверху; показано {{ analytics.paid_transactions|length }} из {{ summary.completed_transactions }}</span>
+				<h2>{{ {'all': 'Все завершённые покупки', 'money': 'Денежные оплаты', 'promo': 'Бесплатные активации по промокоду'}[purchase_kind] }}</h2>
+				<span class="panel-note">За всю историю, последние сверху; показано {{ analytics.paid_transactions|length }} из {{ summary.matching_completed_transactions|default(summary.completed_transactions) }}</span>
 			</div>
-			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
+			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Все платежи CSV</a>
+		</div>
+		<div class="analytics-head-actions" aria-label="Фильтр завершённых покупок">
+			{% for kind, label in [('all', 'Все'), ('money', 'Денежные оплаты'), ('promo', 'Бесплатные активации')] %}
+			<a class="button button-small {{ 'button-primary' if purchase_kind == kind else 'button-secondary' }}" href="{{ url_for('dashboard_page', period=analytics.period, purchases=kind, _anchor='completed-purchases') }}">{{ label }}</a>
+			{% endfor %}
 		</div>
 		{% if analytics.paid_transactions %}
 		<div class="table-scroll paid-transactions-scroll">

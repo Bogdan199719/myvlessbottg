@@ -5311,28 +5311,34 @@ def get_idle_onboarding_users(
         return []
 
 
-def ban_user(telegram_id: int):
+def ban_user(telegram_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET is_banned = 1 WHERE telegram_id = ?", (telegram_id,)
             )
+            updated = cursor.rowcount > 0
             conn.commit()
+            return updated
     except sqlite3.Error as e:
         logging.error(f"Failed to ban user {telegram_id}: {e}")
+        return False
 
 
-def unban_user(telegram_id: int):
+def unban_user(telegram_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET is_banned = 0 WHERE telegram_id = ?", (telegram_id,)
             )
+            updated = cursor.rowcount > 0
             conn.commit()
+            return updated
     except sqlite3.Error as e:
         logging.error(f"Failed to unban user {telegram_id}: {e}")
+        return False
 
 
 def delete_user_keys(user_id: int) -> bool:

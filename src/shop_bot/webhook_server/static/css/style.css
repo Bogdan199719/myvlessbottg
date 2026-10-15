@@ -3530,3 +3530,11 @@ button:focus-visible {
 		max-width: 100%;
 	}
 }
+
+.subscription-state-item small {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
