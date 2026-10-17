@@ -1,3 +1,4 @@
+from shop_bot.modules import subscription_operations
 import asyncio
 import logging
 import math
@@ -1181,7 +1182,22 @@ async def auto_provision_new_hosts_for_global_users():
     provision_timeout = _provision_timeout_seconds()
 
     for user_id, user_keys in keys_by_user.items():
+        # Most users have complete access; avoid reserving them unnecessarily.
+        snapshot_now = time_utils.get_msk_now()
+        active_snapshot_hosts = {
+            k.get("host_name")
+            for k in user_keys
+            if k.get("service_type", "xui") == "xui"
+            and (expiry := time_utils.parse_iso_to_msk(k.get("expiry_date")))
+            and expiry > snapshot_now
+        }
+        if not active_snapshot_hosts or enabled_host_names <= active_snapshot_hosts:
+            continue
+        if not subscription_operations.try_acquire(user_id):
+            continue  # A foreground grant will finish; retry on the next pass.
         try:
+            # The initial global snapshot may predate a foreground grant.
+            user_keys = await asyncio.to_thread(database.get_user_keys, user_id)
             # Filter active global access keys. Paid global keys and trial keys
             # both represent access to all enabled XUI hosts.
             now = time_utils.get_msk_now()
@@ -1298,8 +1314,8 @@ async def auto_provision_new_hosts_for_global_users():
                             database.get_key_by_email, res["email"]
                         )
                         if existing_key:
-                            await asyncio.to_thread(
-                                database.update_key_by_email,
+                            persisted = await asyncio.to_thread(
+                                database.merge_provisioned_key_by_email,
                                 key_email=res["email"],
                                 host_name=host_name,
                                 xui_client_uuid=res["client_uuid"],
@@ -1308,7 +1324,7 @@ async def auto_provision_new_hosts_for_global_users():
                                 plan_id=first_global_plan_id,
                             )
                         else:
-                            await asyncio.to_thread(
+                            persisted = await asyncio.to_thread(
                                 database.add_new_key,
                                 user_id=user_id,
                                 host_name=host_name,
@@ -1318,6 +1334,8 @@ async def auto_provision_new_hosts_for_global_users():
                                 connection_string=res.get("connection_string"),
                                 plan_id=first_global_plan_id,
                             )
+                        if not persisted:
+                            raise RuntimeError("Auto-provision result could not be safely persisted")
                         total_keys_created += 1
                         _mark_host_success(host_name)
                         logger.info(
@@ -1351,6 +1369,8 @@ async def auto_provision_new_hosts_for_global_users():
                 f"Scheduler: Error processing user {user_id} for auto-provision: {e}"
             )
             total_errors += 1
+        finally:
+            subscription_operations.release(user_id)
 
     logger.info(
         f"Scheduler: Auto-provision finished. Users processed: {total_users_processed}, Keys created: {total_keys_created}, Errors: {total_errors}"

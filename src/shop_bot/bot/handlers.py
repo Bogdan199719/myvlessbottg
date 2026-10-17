@@ -1,3 +1,4 @@
+from shop_bot.modules.subscription_operations import serialize_user_operation
 import logging
 import uuid
 import qrcode
@@ -1824,6 +1825,7 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data == "get_trial")
     @registration_required
+    @serialize_user_operation(lambda callback, state: callback.from_user.id)
     async def trial_period_handler(callback: types.CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         user_db_data = get_user(user_id)
@@ -4622,6 +4624,7 @@ async def _execute_payment_for_hosts(
     return results, primary_key_id
 
 
+@serialize_user_operation(lambda bot, metadata: (metadata or {}).get("user_id"))
 async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     pending_flag_set = False
     attempt_owner = metadata.get("processing_attempt_id")

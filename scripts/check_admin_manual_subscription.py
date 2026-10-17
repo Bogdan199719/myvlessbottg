@@ -43,7 +43,9 @@ def main() -> None:
     assert "Срок отсчитывается от выдачи и устанавливается для всех серверов." in USERS
     assert 'name="plan_id" id="planSelect" required' not in USERS
     assert "@single_manual_issue_per_user" in APP
-    assert "_manual_issue_users_lock" in APP
+    assert "subscription_operations.try_acquire(normalized_user_id)" in APP
+    assert "subscription_operations.release(normalized_user_id)" in APP
+    assert "@single_key_duration_operation" in APP
     assert 'issueKeyForm.dataset.submitting === "1"' in USERS
     assert 'submitButton.disabled = true' in USERS
     assert 'request.form.get("days") or "0"' in adjust_route

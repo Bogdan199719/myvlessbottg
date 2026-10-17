@@ -24,6 +24,7 @@ from shop_bot.data_manager.database import (
     update_key_by_email,
 )
 from shop_bot.modules.host_selector import panel_group_key
+from shop_bot.modules import subscription_operations
 
 logger = logging.getLogger(__name__)
 
@@ -2169,7 +2170,7 @@ async def create_or_update_key_on_host(
 async def create_or_update_key_on_host_seconds(
     host_name: str, email: str, seconds_to_add: int, telegram_id: str = None
 ) -> Dict | None:
-    return await asyncio.to_thread(
+    return await subscription_operations.run_worker(
         _create_or_update_key_on_host_sync,
         host_name,
         email,
@@ -2187,7 +2188,7 @@ async def create_or_update_key_on_host_absolute_expiry(
     telegram_id: str = None,
     preserve_longer_expiry: bool = True,
 ) -> Dict | None:
-    return await asyncio.to_thread(
+    return await subscription_operations.run_worker(
         _create_or_update_key_on_host_sync,
         host_name,
         email,
@@ -2620,8 +2621,68 @@ async def sync_clients_state_on_host(
     host_name: str, desired_by_email: dict[str, dict]
 ) -> dict:
     return await asyncio.to_thread(
-        _sync_clients_state_on_host_sync, host_name, desired_by_email
+        _sync_clients_state_with_user_guards, host_name, desired_by_email
     )
+
+
+def _sync_clients_state_with_user_guards(host_name, desired_by_email):
+    """A delayed DB snapshot must not roll back a foreground grant.
+
+    Reservations live in this worker until HTTP writes really finish, including
+    when an asyncio caller times out. Unavailable users retry next cycle.
+    """
+    reserved = set()
+    deferred_users = set()
+    safe = {}
+    try:
+        for state in desired_by_email.values():
+            if state.get("expiry_timestamp_ms") is None or not state.get("telegram_id"):
+                continue  # Compatibility for IP-limit-only administrative calls.
+            user_id = int(state["telegram_id"])
+            if user_id not in reserved and user_id not in deferred_users:
+                if subscription_operations.try_acquire(user_id):
+                    reserved.add(user_id)
+                else:
+                    deferred_users.add(user_id)
+        current = (
+            {key["key_email"]: key for key in get_keys_for_host(host_name)}
+            if reserved
+            else {}
+        )
+        for email, state in desired_by_email.items():
+            if state.get("expiry_timestamp_ms") is None or not state.get("telegram_id"):
+                safe[email] = state
+                continue
+            if int(state["telegram_id"]) in deferred_users:
+                continue
+            key = current.get(email)
+            expiry = (
+                time_utils.parse_iso_to_msk(key.get("expiry_date")) if key else None
+            )
+            if (
+                not expiry
+                or abs(
+                    time_utils.get_timestamp_ms(expiry)
+                    - int(state["expiry_timestamp_ms"])
+                )
+                > 1000
+            ):
+                continue
+            if str(key.get("xui_client_uuid")) != str(state.get("client_identifier")):
+                continue
+            safe[email] = state
+        result = _sync_clients_state_on_host_sync(host_name, safe)
+        result["deferred"] = len(desired_by_email) - len(safe)
+        if result["deferred"]:
+            logger.info(
+                "Deferred %s subscription states on host %s during concurrent changes.",
+                result["deferred"],
+                host_name,
+            )
+        return result
+    finally:
+        for user_id in reserved:
+            subscription_operations.release(user_id)
 
 
 @_serialize_host_write

@@ -4327,7 +4327,7 @@ def add_new_key(
             existing_key = get_key_by_email(key_email)
             if existing_key:
                 # Key already exists: update it instead of failing
-                updated = update_key_by_email(
+                updated = merge_provisioned_key_by_email(
                     key_email=key_email,
                     host_name=host_name,
                     xui_client_uuid=xui_client_uuid,
@@ -4356,7 +4356,7 @@ def add_new_key(
                     )
                     existing = cursor.fetchone()
                 if existing:
-                    updated = update_key_by_email(
+                    updated = merge_provisioned_key_by_email(
                         key_email=existing["key_email"],
                         host_name=host_name,
                         xui_client_uuid=xui_client_uuid,
@@ -4383,6 +4383,64 @@ def add_new_key(
     except sqlite3.Error as e:
         logging.error(f"Failed to add new key for user {user_id}: {e}")
         return None
+
+
+def merge_provisioned_key_by_email(
+    key_email: str,
+    host_name: str,
+    xui_client_uuid: str,
+    expiry_timestamp_ms: int,
+    connection_string: str | None = None,
+    plan_id: int = 0,
+):
+    """Persist an insert race without undoing a newer grant or client identity.
+
+    Explicit admin shortening uses update_key_info, not this insert/repair path.
+    Read and merge under one SQLite write transaction, including trial markers.
+    """
+    try:
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute(
+                "SELECT * FROM vpn_keys WHERE key_email = ?", (key_email,)
+            ).fetchone()
+            if not old:
+                return False
+            if (
+                old["host_name"] != host_name
+                or old["xui_client_uuid"] != xui_client_uuid
+            ):
+                logging.error(
+                    "Provisioning conflict has a different identity; existing key retained."
+                )
+                return False
+            old_expiry = time_utils.parse_iso_to_msk(old["expiry_date"])
+            if not old_expiry:
+                return False
+            old_ms = time_utils.get_timestamp_ms(old_expiry)
+            target_ms = max(old_ms, int(expiry_timestamp_ms))
+            old_plan = int(old["plan_id"] or 0)
+            incoming_plan = int(plan_id or 0)
+            # A late trial must never demote an already assigned tariff.
+            target_plan = old_plan if old_plan > 0 else incoming_plan
+            if target_ms != old_ms or target_plan != old_plan:
+                conn.execute(
+                    "UPDATE vpn_keys SET expiry_date = ?, plan_id = ? WHERE key_id = ?",
+                    (
+                        time_utils.from_timestamp_ms(target_ms),
+                        target_plan,
+                        old["key_id"],
+                    ),
+                )
+            conn.execute(
+                "DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,)
+            )
+            conn.commit()
+            return True
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logging.error("Failed to merge provisioned key: %s", e)
+        return False
 
 
 def update_key_by_email(

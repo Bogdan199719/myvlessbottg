@@ -54,6 +54,7 @@ from yookassa import Payment
 
 from shop_bot.modules import host_selector, mtg_api, xui_api
 from shop_bot.modules.panel_jobs import run_panel_jobs
+from shop_bot.modules import subscription_operations
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
 from shop_bot.webhook_server.restore_manager import (
@@ -1022,8 +1023,6 @@ def create_webhook_app(bot_controller_instance):
 
         return decorated_function
 
-    _manual_issue_users: set[int] = set()
-    _manual_issue_users_lock = threading.Lock()
     _bulk_xui_action_lock = threading.Lock()
 
     def single_bulk_xui_action(redirect_endpoint: str):
@@ -1054,21 +1053,17 @@ def create_webhook_app(bot_controller_instance):
         @wraps(f)
         def decorated_function(user_id, *args, **kwargs):
             normalized_user_id = int(user_id)
-            with _manual_issue_users_lock:
-                if normalized_user_id in _manual_issue_users:
-                    flash(
-                        "Для этого пользователя уже выполняется ручная выдача. "
-                        "Дождитесь её завершения.",
-                        "warning",
-                    )
-                    return redirect(url_for("users_page"))
-                _manual_issue_users.add(normalized_user_id)
-
+            if not subscription_operations.try_acquire(normalized_user_id):
+                flash(
+                    "Для этого пользователя уже выполняется выдача или синхронизация. "
+                    "Дождитесь её завершения и повторите действие.",
+                    "warning",
+                )
+                return redirect(url_for("users_page"))
             try:
                 return f(user_id, *args, **kwargs)
             finally:
-                with _manual_issue_users_lock:
-                    _manual_issue_users.discard(normalized_user_id)
+                subscription_operations.release(normalized_user_id)
 
         return decorated_function
 
@@ -3417,8 +3412,30 @@ def create_webhook_app(bot_controller_instance):
     def tasks_status_route():
         return {"status": "success", "tasks": _task_status_snapshot()}
 
+    def single_key_duration_operation(f):
+        @wraps(f)
+        def wrapped(key_id):
+            key = get_key_by_id(key_id)
+            if not key:
+                return f(key_id)
+            user_id = key["user_id"]
+            if not subscription_operations.try_acquire(user_id):
+                flash(
+                    "Для этого пользователя уже выполняется выдача или синхронизация. Повторите позже.",
+                    "warning",
+                )
+                return redirect(url_for("keys_page"))
+            try:
+                return f(key_id)
+            finally:
+                subscription_operations.release(user_id)
+
+        return wrapped
+
+
     @flask_app.route("/keys/adjust/<int:key_id>", methods=["POST"])
     @login_required
+    @single_key_duration_operation
     def adjust_key_duration(key_id):
         """Adjust key duration by days and/or hours. Supports negative values to reduce duration."""
         try:
