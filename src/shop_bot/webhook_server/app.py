@@ -21,6 +21,7 @@ from hmac import compare_digest
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from shop_bot.utils import time_utils, update_manager
+from shop_bot.utils.subscription_rules import configured_trial_days, is_trial_xui_key
 from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
 from shop_bot.version import APP_VERSION
@@ -205,15 +206,8 @@ def _is_xui_key(key: dict) -> bool:
     return key.get("service_type", "xui") != "mtg"
 
 
-def _is_trial_key(key: dict) -> bool:
-    return _is_xui_key(key) and _key_plan_id(key) <= 0
-
-
 def _configured_trial_duration_days() -> float:
-    try:
-        return max(1.0, float(get_setting("trial_duration_days") or 1))
-    except (TypeError, ValueError):
-        return 1.0
+    return configured_trial_days(get_setting("trial_duration_days"))
 
 
 def _user_has_paid_subscription(user: dict) -> bool:
@@ -236,23 +230,14 @@ def _key_is_trial_for_user(
     user: dict | None = None,
     trial_duration_days: float | None = None,
 ) -> bool:
-    if not _is_trial_key(key):
+    if not _is_xui_key(key) or _key_plan_id(key) > 0:
         return False
-
-    created = time_utils.parse_iso_to_msk(key.get("created_date"))
-    expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-    if not created or not expiry:
-        return True
-
     configured_days = (
         trial_duration_days
         if trial_duration_days is not None
         else _configured_trial_duration_days()
     )
-    grace_seconds = 6 * 3600
-    return (expiry - created).total_seconds() <= (
-        configured_days * 86400 + grace_seconds
-    )
+    return is_trial_xui_key(key, configured_days)
 
 
 def _key_is_trial_for_owner(

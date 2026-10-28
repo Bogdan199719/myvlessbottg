@@ -159,6 +159,8 @@ git diff --check
 
 `check_subscription_consistency.py` читает live-БД и проверяет, что каждый active trial и active paid global пользователь имеет ключ на каждом включённом XUI-хосте. По умолчанию скрипт маскирует идентификаторы; `--show-identities` предназначен только для доверенной локальной диагностики.
 
+`check_subscription_notifications.py` проверяет на отдельной синтетической БД и имитации Telegram цепочки paid/trial/free/MTG, группировку по серверам, защиту от дублей, новый цикл после изменения срока, повтор после ошибки отправки и тексты onboarding при включённом и выключенном trial.
+
 `check_subscription_business_rules.py` и `check_profit_accounting.py` используют временную SQLite и не изменяют production-данные.
 
 Для изменений оплаты и trial дополнительно проверяются:

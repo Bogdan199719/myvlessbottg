@@ -6,6 +6,7 @@ import time
 
 from datetime import datetime
 from shop_bot.utils import time_utils
+from shop_bot.utils.subscription_rules import configured_trial_days, is_trial_xui_key
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import Bot
@@ -442,6 +443,26 @@ async def send_idle_onboarding_notification(
             )
             primary_text = "🎁 Попробовать бесплатно"
 
+        if not trial_enabled:
+            if hours_mark == 3:
+                message = (
+                    "☀️ <b>Ты заходил посмотреть VPN, но ещё не включил доступ.</b>\n\n"
+                    "Выбери подходящую подписку и подключи VPN на своих устройствах."
+                )
+            elif hours_mark == 24:
+                message = (
+                    "✨ <b>Маленькое напоминание</b>\n\n"
+                    "VPN пригодится, когда сайты не открываются, видео тормозит или "
+                    "нужен стабильный доступ в дороге.\n\n"
+                    "Можно выбрать подходящую подписку и подключиться."
+                )
+            else:
+                message = (
+                    "👋 <b>Последнее напоминание</b>\n\n"
+                    "Ты заходил в бот, но так и не подключил VPN. "
+                    "Если доступ ещё актуален, выбери подходящую подписку."
+                )
+
         builder = InlineKeyboardBuilder()
         if trial_enabled:
             builder.button(text=primary_text, callback_data="get_trial")
@@ -611,6 +632,9 @@ async def check_expiring_subscriptions(bot: Bot):
     logger.info("Scheduler: Checking for expiring subscriptions...")
     all_keys = await asyncio.to_thread(database.get_all_keys)
     current_time = time_utils.get_msk_now()
+    trial_days = configured_trial_days(
+        await asyncio.to_thread(database.get_setting, "trial_duration_days")
+    )
 
     # Determine global plan ids (host_name == 'ALL')
     try:
@@ -629,10 +653,13 @@ async def check_expiring_subscriptions(bot: Bot):
         try:
             service_type = key.get("service_type", "xui")
             plan_id = int(key.get("plan_id", 0) or 0)
-            if service_type == "xui" and plan_id == 0:
-                trial_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
-                    key
+            if service_type == "xui" and plan_id <= 0:
+                bucket = (
+                    trial_global_keys_by_user
+                    if is_trial_xui_key(key, trial_days)
+                    else paid_global_keys_by_user
                 )
+                bucket.setdefault(int(key["user_id"]), []).append(key)
             elif database.is_global_xui_key(key, global_plan_ids):
                 paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(key)
             else:
@@ -751,8 +778,7 @@ async def check_expiring_subscriptions(bot: Bot):
             user_id = key["user_id"]
 
             key_id = key["key_id"]
-            plan_id = int(key.get("plan_id", 0) or 0)
-            is_trial = plan_id == 0
+            is_trial = is_trial_xui_key(key, trial_days)
             service_type = key.get("service_type", "xui")
 
             if (
