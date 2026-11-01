@@ -21,6 +21,7 @@ from hmac import compare_digest
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from shop_bot.utils import time_utils, update_manager
+from shop_bot.utils.login_attempts import login_is_limited, record_login_failure
 from shop_bot.utils.subscription_rules import configured_trial_days, is_trial_xui_key
 from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
@@ -843,16 +844,29 @@ def create_webhook_app(bot_controller_instance):
     def healthz():
         db_ok = False
         try:
-            with sqlite3.connect(DB_FILE, timeout=2) as conn:
-                conn.execute("SELECT 1")
+            database_uri = Path(DB_FILE).resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(database_uri, uri=True, timeout=0.25) as conn:
+                for table, column in (
+                    ("users", "telegram_id"), ("vpn_keys", "key_id"),
+                    ("transactions", "payment_id"), ("bot_settings", "key"),
+                ):
+                    conn.execute(f"SELECT {column} FROM {table} LIMIT 0")
             db_ok = True
         except sqlite3.Error:
-            logger.exception("Health check failed: database is unavailable")
+            logger.error("Health check failed: application database is unavailable")
 
         loop = current_app.config.get("EVENT_LOOP")
         loop_ok = bool(loop and loop.is_running())
-        status_code = 200 if db_ok and loop_ok else 503
-        payload = {"status": "ok" if status_code == 200 else "degraded"}
+        monitor = getattr(_bot_controller, "runtime_health", None)
+        diagnostics = monitor.snapshot() if monitor else {
+            "failed": [], "warnings": ["monitoring_unavailable"],
+        }
+        status_code = 200 if db_ok and loop_ok and not diagnostics["failed"] else 503
+        payload = {
+            "status": "ok" if status_code == 200 else "degraded",
+            "database": "ok" if db_ok else "unavailable",
+            "runtime": diagnostics,
+        }
         return Response(
             json.dumps(payload, ensure_ascii=False),
             status=status_code,
@@ -1086,18 +1100,14 @@ def create_webhook_app(bot_controller_instance):
             client_is_allowlisted = is_ip_allowlisted(
                 client_ip, settings.get("admin_ip_allowlist")
             )
-            now = _time.time()
+            now = _time.monotonic()
             if not client_is_allowlisted:
                 with _login_attempts_lock:
-                    _login_attempts[client_ip] = [
-                        t
-                        for t in _login_attempts[client_ip]
-                        if now - t < _LOGIN_WINDOW_SECONDS
-                    ]
-                    login_is_limited = (
-                        len(_login_attempts[client_ip]) >= _LOGIN_MAX_ATTEMPTS
+                    login_limited = login_is_limited(
+                        _login_attempts, client_ip, now,
+                        _LOGIN_WINDOW_SECONDS, _LOGIN_MAX_ATTEMPTS,
                     )
-                if login_is_limited:
+                if login_limited:
                     flash(
                         "Слишком много попыток входа. Попробуйте через 5 минут.",
                         "danger",
@@ -1123,7 +1133,10 @@ def create_webhook_app(bot_controller_instance):
             else:
                 if not client_is_allowlisted:
                     with _login_attempts_lock:
-                        _login_attempts[client_ip].append(now)
+                        record_login_failure(
+                            _login_attempts, client_ip, now,
+                            _LOGIN_WINDOW_SECONDS, _LOGIN_MAX_ATTEMPTS,
+                        )
                 flash("Неверный логин или пароль", "danger")
         return render_template("login.html")
 

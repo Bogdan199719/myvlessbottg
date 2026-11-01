@@ -3518,44 +3518,7 @@ def get_user_router() -> Router:
 
         payment_id = None
         try:
-            exchange_rate = await get_usdt_rub_rate()
-
-            if not exchange_rate:
-                logger.warning(
-                    "Failed to get live exchange rate. Falling back to the manual setting or default."
-                )
-
-                # Fallback to setting if available, otherwise default to a safe high rate (e.g. 110)
-                # Ideally, you should have a setting for this. For now, we'll try to get it or hardcode.
-                manual_rate = get_setting("usdt_rub_rate")
-                if manual_rate:
-                    try:
-                        exchange_rate = Decimal(manual_rate)
-                    except (InvalidOperation, ValueError, TypeError) as rate_error:
-                        logger.warning(
-                            f"Invalid manual usdt_rub_rate setting '{manual_rate}': {rate_error}"
-                        )
-
-                if not exchange_rate:
-                    # Final fallback
-                    exchange_rate = Decimal("100.00")
-                    logger.warning("Using hardcoded fallback rate: 100.00 RUB/USDT")
-
-            if not exchange_rate:
-                await callback.message.edit_text(
-                    "❌ Не удалось получить курс валют. Попробуйте позже."
-                )
-                await state.clear()
-                return
-
-            margin = Decimal("1.03")
-            price_usdt = (price_rub / exchange_rate * margin).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            )
-
-            logger.info(
-                f"Creating Crypto Pay invoice for user {user_id}. Plan price: {price_rub} RUB. Converted to: {price_usdt} USDT."
-            )
+            logger.info("Creating Crypto Pay invoice in RUB.")
 
             crypto = CryptoPay(cryptobot_token)
             payment_id = str(uuid.uuid4())

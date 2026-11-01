@@ -15,6 +15,7 @@ from shop_bot.bot.middlewares import BanMiddleware, SafeCallbackMiddleware
 from shop_bot.bot import handlers, support_handlers
 from shop_bot.bot.support_handlers import get_support_router
 from shop_bot.utils.admin_ids import parse_admin_telegram_ids
+from shop_bot.utils.runtime_health import RuntimeHealth
 
 logger = logging.getLogger(__name__)
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
@@ -55,6 +56,7 @@ def _parse_float(value, default: float = 0.0) -> float:
 
 class BotController:
     def __init__(self):
+        self.runtime_health = RuntimeHealth()
         self._loop = None
         self._lifecycle_lock = threading.RLock()
 
@@ -199,6 +201,7 @@ class BotController:
                 "message": "Невозможно запустить: не все обязательные настройки Telegram заполнены (токен и ID админа).",
             }
 
+        self.runtime_health.expect_bot("ShopBot", True)
         try:
             self.shop_bot = Bot(
                 token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -216,6 +219,9 @@ class BotController:
                         "Не удалось получить username бота: запрос к Bot API превысил лимит ожидания."
                     ) from exc
 
+            self.shop_bot.session.middleware(
+                self.runtime_health.api_middleware("ShopBot")
+            )
             self.shop_dp = Dispatcher()
             self.shop_dp.update.middleware(SafeCallbackMiddleware())
             self.shop_dp.update.middleware(BanMiddleware())
@@ -245,6 +251,7 @@ class BotController:
             self.shop_task = asyncio.run_coroutine_threadsafe(
                 self._start_polling(self.shop_bot, self.shop_dp, "ShopBot"), self._loop
             )
+            self.runtime_health.track_bot("ShopBot", self.shop_task)
             logger.info("BotController: Start command sent to event loop.")
             return {
                 "status": "success",
@@ -252,6 +259,7 @@ class BotController:
             }
 
         except Exception as e:
+            self.runtime_health.bot_start_failed("ShopBot")
             logger.error("Failed to start bot: %s", e, exc_info=True)
             self._reset_bot_state("ShopBot")
             return {"status": "error", "message": f"Ошибка при запуске: {e}"}
@@ -278,9 +286,13 @@ class BotController:
                 "message": "Токен для Бота-Саппорта и Айди группы не указаны.",
             }
 
+        self.runtime_health.expect_bot("SupportBot", True)
         try:
             self.support_bot = Bot(
                 token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+            )
+            self.support_bot.session.middleware(
+                self.runtime_health.api_middleware("SupportBot")
             )
             self.support_dp = Dispatcher()
             self.support_dp.update.middleware(SafeCallbackMiddleware())
@@ -296,11 +308,13 @@ class BotController:
                 self._start_polling(self.support_bot, self.support_dp, "SupportBot"),
                 self._loop,
             )
+            self.runtime_health.track_bot("SupportBot", self.support_task)
             return {
                 "status": "success",
                 "message": "Команда на запуск бота отправлена.",
             }
         except Exception as e:
+            self.runtime_health.bot_start_failed("SupportBot")
             self._reset_bot_state("SupportBot")
             logger.error("Failed to start Support Bot: %s", e, exc_info=True)
             return {"status": "error", "message": f"Error starting Support Bot: {e}"}
@@ -316,6 +330,7 @@ class BotController:
                 "message": "Критическая ошибка: компоненты бота недоступны.",
             }
 
+        self.runtime_health.expect_bot("ShopBot", False)
         self.shop_is_running = False
 
         logger.info("BotController: Sending graceful stop signal...")
@@ -334,6 +349,7 @@ class BotController:
                 "message": "Критическая ошибка: компоненты бота недоступны.",
             }
 
+        self.runtime_health.expect_bot("SupportBot", False)
         self.support_is_running = False
 
         logger.info("BotController: Sending graceful stop signal...")

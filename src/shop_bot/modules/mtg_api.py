@@ -67,28 +67,23 @@ async def _get_token(host_name: str) -> str | None:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status != 200:
-                        text = await resp.text()
                         logger.error(
-                            "MTG login failed for host '%s': %s %s",
-                            host_name,
+                            "MTG login failed: HTTP %s",
                             resp.status,
-                            text,
                         )
                         return None
                     data = await resp.json()
                     token = data.get("token")
                     if not token:
                         logger.error(
-                            "MTG login response missing token for host '%s': %s",
-                            host_name,
-                            data,
+                            "MTG login response missing token",
                         )
                         return None
                     _token_cache[host_name] = (token, time.time() + _TOKEN_TTL)
                     return token
         except Exception as e:
             logger.error(
-                f"MTG login exception for host '{host_name}': {e}", exc_info=True
+                "MTG login exception: %s", type(e).__name__
             )
             return None
 
@@ -113,7 +108,7 @@ async def _get_best_node_id(url: str, token: str) -> int | None:
                 node_id = data.get("id")
                 return int(node_id) if node_id is not None else None
     except Exception as e:
-        logger.error(f"MTG get best node exception: {e}", exc_info=True)
+        logger.error("MTG get best node exception: %s", type(e).__name__)
         return None
 
 
@@ -159,9 +154,8 @@ async def create_proxy_for_user(
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status not in (200, 201):
-                    text = await resp.text()
                     logger.error(
-                        f"MTG create user failed for host '{host_name}': {resp.status} {text}"
+                        "MTG create user failed: HTTP %s", resp.status
                     )
                     # Token may be stale
                     if resp.status == 401:
@@ -170,14 +164,14 @@ async def create_proxy_for_user(
                 data = await resp.json()
     except Exception as e:
         logger.error(
-            f"MTG create user exception for host '{host_name}': {e}", exc_info=True
+            "MTG create user exception: %s", type(e).__name__
         )
         return None
 
     link = data.get("link") or _build_proxy_link(url, data)
     if not link:
         logger.error(
-            f"MTG create user: no link in response for host '{host_name}': {data}"
+            "MTG create user response missing connection link"
         )
         return None
 
@@ -210,7 +204,7 @@ async def delete_proxy_for_user(host_name: str, proxy_name: str, node_id: int) -
                     _invalidate_token(host_name)
                 return resp.status in (200, 204)
     except Exception as e:
-        logger.error(f"MTG delete user exception: {e}", exc_info=True)
+        logger.error("MTG delete user exception: %s", type(e).__name__)
         return False
 
 
@@ -243,7 +237,7 @@ async def _toggle_proxy(
                     _invalidate_token(host_name)
                 return resp.status in (200, 204)
     except Exception as e:
-        logger.error(f"MTG {action} proxy exception: {e}", exc_info=True)
+        logger.error("MTG %s proxy exception: %s", action, type(e).__name__)
         return False
 
 
@@ -278,13 +272,12 @@ async def renew_proxy_for_user(
                 if resp.status == 401:
                     _invalidate_token(host_name)
                 if resp.status not in (200, 201):
-                    text = await resp.text()
-                    logger.error(f"MTG renew failed: {resp.status} {text}")
+                    logger.error("MTG renew failed: HTTP %s", resp.status)
                     return None
                 data = await resp.json()
                 return _iso_to_ms(data.get("expires_at"))
     except Exception as e:
-        logger.error(f"MTG renew exception: {e}", exc_info=True)
+        logger.error("MTG renew exception: %s", type(e).__name__)
         return None
 
 
@@ -328,7 +321,7 @@ async def get_proxy_details(host_name: str, proxy_name: str) -> dict | None:
                     "expiry_timestamp_ms": _iso_to_ms(data.get("expires_at")),
                 }
     except Exception as e:
-        logger.error(f"MTG get_proxy_details exception: {e}", exc_info=True)
+        logger.error("MTG get_proxy_details exception: %s", type(e).__name__)
         return None
 
 

@@ -189,6 +189,7 @@ def main():
     flask_app = create_webhook_app(bot_controller)
 
     async def shutdown(sig: signal.Signals, loop: asyncio.AbstractEventLoop):
+        bot_controller.runtime_health.close()
         logger.info("Received signal: %s. Shutting down...", sig.name)
         if bot_controller.get_status()["is_running"]:
             bot_controller.stop()
@@ -200,6 +201,9 @@ def main():
         loop = asyncio.get_running_loop()
         bot_controller.set_loop(loop)
         flask_app.config["EVENT_LOOP"] = loop
+        bot_controller.runtime_health.create_task(
+            "heartbeat", bot_controller.runtime_health.heartbeat()
+        )
 
         _register_signal_handlers(loop, shutdown, logger)
 
@@ -268,8 +272,12 @@ def main():
 
         logger.info("Application is running. Bots are auto-started if configured.")
 
-        asyncio.create_task(periodic_subscription_check(bot_controller))
-        asyncio.create_task(periodic_payment_check(bot_controller))
+        bot_controller.runtime_health.create_task(
+            "subscriptions", periodic_subscription_check(bot_controller)
+        )
+        bot_controller.runtime_health.create_task(
+            "payments", periodic_payment_check(bot_controller)
+        )
 
         await asyncio.Future()
 

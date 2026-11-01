@@ -2107,27 +2107,43 @@ async def expire_stale_unpaid_stars_payments() -> None:
 async def periodic_payment_check(bot_controller: BotController) -> None:
     """Keep payment recovery moving even when a maintenance panel is slow."""
     logger.info("Payment recovery scheduler has been started.")
+    monitor = getattr(bot_controller, "runtime_health", None)
     await asyncio.sleep(_STARTUP_DELAY_SECONDS)
     while True:
+        cycle_error = False
+        if monitor:
+            monitor.cycle_started("payments")
         try:
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
+                    if monitor:
+                        monitor.progress("payments", "recover_interrupted_payment_processing")
                     await recover_interrupted_payment_processing()
+                    if monitor:
+                        monitor.progress("payments", "process_pending_yookassa_payments")
                     await process_pending_yookassa_payments(bot)
+                    if monitor:
+                        monitor.progress("payments", "process_pending_paid_provider_retries")
                     await process_pending_paid_provider_retries(bot)
+                    if monitor:
+                        monitor.progress("payments", "expire_stale_unpaid_stars_payments")
                     await expire_stale_unpaid_stars_payments()
                 else:
                     logger.warning(
                         "Payment scheduler: Bot is marked as running, but instance is not available."
                     )
         except Exception:
+            cycle_error = True
             logger.exception("Payment scheduler: cycle failed")
+        if monitor:
+            monitor.cycle_finished("payments", error=cycle_error)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
+    monitor = getattr(bot_controller, "runtime_health", None)
     await asyncio.sleep(_STARTUP_DELAY_SECONDS)
 
     # Track when XTLS sync was last performed (run every 5 min instead of every CHECK_INTERVAL)
@@ -2138,6 +2154,9 @@ async def periodic_subscription_check(bot_controller: BotController):
     last_client_state_enforce_time = 0
 
     while True:
+        cycle_error = False
+        if monitor:
+            monitor.cycle_started("subscriptions")
         try:
             current_time = time.time()
             # Expiry is already stored in Xray. This pass is a reconciliation
@@ -2147,13 +2166,19 @@ async def periodic_subscription_check(bot_controller: BotController):
                 current_time - last_client_state_enforce_time
                 >= _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS
             ):
+                if monitor:
+                    monitor.progress("subscriptions", "enforce_clients_state_from_db")
                 await enforce_clients_state_from_db()
                 last_client_state_enforce_time = time.time()
 
             # Enforce MTG proxy states (start active, stop expired)
+            if monitor:
+                monitor.progress("subscriptions", "enforce_mtg_proxies_state")
             await enforce_mtg_proxies_state()
 
             if _bool_setting("panel_sync_enabled", default=False):
+                if monitor:
+                    monitor.progress("subscriptions", "sync_keys_with_panels")
                 await sync_keys_with_panels()
             else:
                 logger.debug(
@@ -2161,14 +2186,20 @@ async def periodic_subscription_check(bot_controller: BotController):
                 )
 
             # Run cleanup once per cycle (or could be less frequent, but this is cheap)
+            if monitor:
+                monitor.progress("subscriptions", "cleanup_old_notifications")
             await cleanup_old_notifications()
 
             # Auto-provision new hosts for global subscription users
+            if monitor:
+                monitor.progress("subscriptions", "auto_provision_new_hosts_for_global_users")
             await auto_provision_new_hosts_for_global_users()
 
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
             if current_time - last_host_health_time >= _HOST_HEALTH_INTERVAL_SECONDS:
+                if monitor:
+                    monitor.progress("subscriptions", "refresh_xui_host_health")
                 await refresh_xui_host_health()
                 last_host_health_time = time.time()
 
@@ -2176,6 +2207,8 @@ async def periodic_subscription_check(bot_controller: BotController):
                 warning_bot = None
                 if bot_controller.get_status().get("is_running"):
                     warning_bot = bot_controller.get_bot_instance()
+                if monitor:
+                    monitor.progress("subscriptions", "monitor_xui_ip_limits")
                 await monitor_xui_ip_limits(warning_bot)
                 last_ip_limit_time = time.time()
 
@@ -2183,6 +2216,8 @@ async def periodic_subscription_check(bot_controller: BotController):
                 _bool_setting("xtls_sync_enabled", default=False)
                 and current_time - last_xtls_sync_time >= xtls_sync_interval
             ):
+                if monitor:
+                    monitor.progress("subscriptions", "periodic_xtls_sync")
                 await periodic_xtls_sync()
                 last_xtls_sync_time = current_time
             elif current_time - last_xtls_sync_time >= xtls_sync_interval:
@@ -2191,7 +2226,11 @@ async def periodic_subscription_check(bot_controller: BotController):
             if bot_controller.get_status().get("is_running"):
                 bot = bot_controller.get_bot_instance()
                 if bot:
+                    if monitor:
+                        monitor.progress("subscriptions", "check_expiring_subscriptions")
                     await check_expiring_subscriptions(bot)
+                    if monitor:
+                        monitor.progress("subscriptions", "check_idle_onboarding_users")
                     await check_idle_onboarding_users(bot)
                 else:
                     logger.warning(
@@ -2201,6 +2240,7 @@ async def periodic_subscription_check(bot_controller: BotController):
                 logger.info("Scheduler: Bot is stopped, skipping user notifications.")
 
         except Exception as e:
+            cycle_error = True
             logger.error(
                 f"Scheduler: An unhandled error occurred in the main loop: {e}",
                 exc_info=True,
@@ -2209,4 +2249,6 @@ async def periodic_subscription_check(bot_controller: BotController):
         logger.info(
             f"Scheduler: Cycle finished. Next check in {CHECK_INTERVAL_SECONDS} seconds."
         )
+        if monitor:
+            monitor.cycle_finished("subscriptions", error=cycle_error)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
