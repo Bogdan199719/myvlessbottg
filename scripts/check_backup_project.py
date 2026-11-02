@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the local backup script with synthetic data only."""
 
+import hashlib
 import io
 import os
 import sqlite3
@@ -41,11 +42,13 @@ def main() -> None:
                 member = tarfile.TarInfo("marker")
                 member.size = len(data)
                 archive.addfile(member, io.BytesIO(data))
+            Path(str(old)+".sha256").write_text(hashlib.sha256(old.read_bytes()).hexdigest()+"  "+old.name+"\n")
             os.utime(old, (1_700_000_000 + index, 1_700_000_000 + index))
 
         env = dict(os.environ)
         env.update(
             BACKUP_PROJECT_DIR=str(project),
+            BACKUP_DB_PATH=str(project / "users.db"),
             BACKUP_OUTPUT_DIR=str(output),
             BACKUP_LOG_FILE=str(root / "backup.log"),
             BACKUP_RETENTION_COUNT="3",
@@ -85,6 +88,8 @@ def main() -> None:
             for item in output.glob("project_backup_*.tar.gz")
         } == original_archives
 
+        assert (project / ".backup_status.json").is_file()
+        assert (project / ".backup_status.json").stat().st_mode & 0o777 == 0o600
         print("Backup project check: OK")
 
 

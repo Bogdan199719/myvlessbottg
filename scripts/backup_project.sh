@@ -10,7 +10,32 @@ LOG_FILE="${BACKUP_LOG_FILE:-/var/log/backup_my_project.log}"
 RETENTION_COUNT="${BACKUP_RETENTION_COUNT:-3}"
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
 PROJECT_PARENT="$(dirname "$PROJECT_DIR")"
-DB_FILE="${PROJECT_DIR}/users.db"
+# Resolve only the DB_PATH value; never execute .env as a shell script.
+DB_FILE="$(python3 - "$PROJECT_DIR" <<'PYDB'
+import os, shlex, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+value = os.environ.get('BACKUP_DB_PATH') or os.environ.get('DB_PATH')
+if not value and (root/'.env').is_file():
+    for line in (root/'.env').read_text().splitlines():
+        line = line.strip().removeprefix('export ')
+        if '=' not in line or line.split('=',1)[0].strip() != 'DB_PATH':
+            continue
+        parts = shlex.split(line.split('=',1)[1], comments=True)
+        if len(parts) > 1:
+            raise SystemExit('Invalid DB_PATH; set BACKUP_DB_PATH explicitly')
+        value = parts[0] if parts else ''
+if value and '$' in value:
+    raise SystemExit('Interpolated DB_PATH requires an explicit BACKUP_DB_PATH')
+path = Path(value or 'users.db')
+# The standard container bind maps this prefix to the host project directory.
+if str(path).startswith('/app/project/'):
+    path = root / str(path).removeprefix('/app/project/')
+elif not path.is_absolute():
+    path = root/path
+print(path.resolve())
+PYDB
+)"
 
 if [[ ! -d "$PROJECT_DIR" || ! -f "$DB_FILE" || ! -f "$PROJECT_DIR/.env" ]]; then
     printf 'Backup requires the project directory, users.db and .env\n' >&2
@@ -42,6 +67,7 @@ log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"
 }
 
+DB_ARCHIVE_PATH="$(realpath --relative-to="$PROJECT_PARENT" "$DB_FILE")"
 WORK_DIR=""
 TMP_ARCHIVE=""
 cleanup() {
@@ -55,15 +81,31 @@ cleanup() {
 trap cleanup EXIT
 
 rotate_backups() {
-    local old_backup
-    mapfile -t old_backups < <(
-        find "$BACKUP_DIR" -maxdepth 1 -type f -name 'project_backup_*.tar.gz' \
-            -printf '%T@ %p\n' | sort -nr | awk -v keep="$RETENTION_COUNT" 'NR > keep {print $2}'
-    )
-    for old_backup in "${old_backups[@]}"; do
-        rm -f -- "$old_backup" "${old_backup}.sha256"
-        log "Rotation: deleted old completed backup $old_backup"
-    done
+    # Whitespace/line splitting is unsafe for custom directories containing spaces.
+    # Only archives whose saved checksum still matches count as completed copies.
+    python3 - "$BACKUP_DIR" "$RETENTION_COUNT" <<'PYROTATE'
+import hashlib, sys
+from pathlib import Path
+root, keep = Path(sys.argv[1]), int(sys.argv[2])
+verified = []
+for archive in root.glob('project_backup_*.tar.gz'):
+    checksum = Path(str(archive) + '.sha256')
+    try:
+        expected = checksum.read_text().split()[0]
+        digest = hashlib.sha256()
+        with archive.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+        if digest.hexdigest() == expected:
+            verified.append(archive)
+    except (OSError, IndexError):
+        continue
+verified.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+for archive in verified[keep:]:
+    archive.unlink()
+    Path(str(archive) + '.sha256').unlink(missing_ok=True)
+    print('Rotation: deleted an older verified backup')
+PYROTATE
 }
 
 create_sqlite_backup() {
@@ -108,7 +150,9 @@ make_project_manifest() {
                 -name .venv -o -name venv -o -name tmp -o -name temp \) -prune \) -o \
             \( \( -type f -o -type l \) \
                 ! -path "$PROJECT_NAME/users.db" \
-                ! -path "$PROJECT_NAME/users.db-*" -print0 \)
+                ! -path "$PROJECT_NAME/users.db-*" \
+                ! -path "$DB_ARCHIVE_PATH" ! -path "$DB_ARCHIVE_PATH-*" \
+                ! -name '*.instance.lock' ! -name '.backup_status.json' -print0 \)
     ) >"$WORK_DIR/project-files.list"
 }
 
@@ -117,7 +161,7 @@ main() {
     WORK_DIR="$(mktemp -d /tmp/backup_my_project.XXXXXX)"
     mkdir -p "$WORK_DIR/backup_extra/sqlite" "$WORK_DIR/backup_extra/docker"
 
-    timestamp="$(date '+%Y-%m-%d_%H-%M')"
+    timestamp="$(date '+%Y-%m-%d_%H-%M-%S_%N')"
     archive="$BACKUP_DIR/project_backup_${timestamp}.tar.gz"
     TMP_ARCHIVE="${archive}.tmp"
     log "Backup started: $archive"
@@ -154,9 +198,48 @@ main() {
     grep -Fqx 'backup_extra/sqlite/users.db' "$WORK_DIR/archive.list"
     mv -f -- "$TMP_ARCHIVE" "$archive"
     TMP_ARCHIVE=""
-    sha256sum "$archive" >"${archive}.sha256"
+    sha256sum "$archive" >"${archive}.sha256.tmp"
+    mv -f -- "${archive}.sha256.tmp" "${archive}.sha256"
+    # Publish the checksum last, then durably flush the completed pair before rotation.
+    python3 - "$archive" "${archive}.sha256" <<'PYFLUSH'
+import os, sys
+from pathlib import Path
+for name in sys.argv[1:]:
+    with open(name, 'rb') as source:
+        os.fsync(source.fileno())
+descriptor = os.open(Path(sys.argv[1]).parent, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PYFLUSH
     log "Backup archive verified: $archive"
     rotate_backups
+    python3 - "$DB_FILE" "$PROJECT_DIR/.backup_status.json" "${archive}.sha256" <<'PYRECEIPT'
+import datetime, json, os, sys, tempfile
+from pathlib import Path
+source, destination, checksum = map(Path, sys.argv[1:])
+receipt = dict(completed_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               sha256=checksum.read_text().split()[0])
+fd, temporary = tempfile.mkstemp(prefix='.backup-receipt-', dir=destination.parent)
+try:
+    with os.fdopen(fd, 'w') as out:
+        json.dump(receipt, out); out.flush(); os.fsync(out.fileno())
+    info = source.stat()
+    os.chmod(temporary, 0o600)
+    if os.geteuid() == 0:
+        os.chown(temporary, info.st_uid, info.st_gid)
+    with open(temporary, 'rb') as source:
+        os.fsync(source.fileno())
+    os.replace(temporary, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PYRECEIPT
     log "Backup finished successfully"
 }
 
