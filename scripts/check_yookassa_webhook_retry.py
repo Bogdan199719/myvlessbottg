@@ -101,8 +101,10 @@ def main() -> int:
                 return dict(user_id=1, months=1, price=100, action="new", key_id=0,
                             host_name="ALL", plan_id=plan_id, plan_name="Test", service_type="xui")
 
-            def order(payment_id, *, currency="RUB", amount="100.00"):
+            def order(payment_id, *, currency="RUB", amount="100.00", method=None):
                 snapshot = metadata()
+                if method:
+                    snapshot["payment_method"] = method
                 assert db.create_pending_transaction(payment_id, 1, 100, snapshot)
                 providers[payment_id] = SimpleNamespace(status="succeeded", metadata=snapshot,
                     amount=SimpleNamespace(value=amount, currency=currency))
@@ -270,7 +272,7 @@ def main() -> int:
                     # An old route's exception must not release a newer owner.
                     for method in ("YooKassa", "CryptoBot"):
                         pid = f"stale-exception-{method}"
-                        order(pid)
+                        order(pid, method=method)
                         replacement = {}
                         before_panels, before_money = len(panel_calls), money()
 

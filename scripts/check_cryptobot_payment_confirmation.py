@@ -120,10 +120,10 @@ def main() -> int:
                     reward = conn.execute('SELECT referral_balance FROM users WHERE telegram_id=2').fetchone()[0]
                 return (*buyer, reward)
 
-            def legacy(pid, *, amount='100.00', price=100, currency='RUB', marker='absent', invoice_id='legacy-invoice', method='CryptoBot'):
+            def legacy(pid, *, amount='100.00', price=100, currency='RUB', marker='absent', invoice_id=None, method='CryptoBot'):
                 invoice(pid)
                 metadata = state(pid)[1]
-                metadata.update(provider_payment_id=pid, cryptobot_invoice_id=invoice_id, price=price)
+                metadata.update(provider_payment_id=pid, cryptobot_invoice_id=('legacy-' + pid if invoice_id is None else invoice_id), price=price)
                 if marker == 'absent':
                     metadata.pop('payment_confirmation_verified')
                 else:

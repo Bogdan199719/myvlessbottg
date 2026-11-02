@@ -3319,6 +3319,131 @@ def create_pending_transaction(
         return 0
 
 
+def _cryptobot_identity(value) -> str | None:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text if text and len(text) <= 128 else None
+
+
+def _cryptobot_binding_protocol(metadata: dict) -> str:
+    if "cryptobot_binding_version" not in metadata and "cryptobot_binding_state" not in metadata:
+        return "legacy"
+    version = metadata.get("cryptobot_binding_version")
+    state = metadata.get("cryptobot_binding_state")
+    if type(version) is not int or version != 1 or not isinstance(state, str) or state not in {"creating", "bound"}:
+        return "invalid"
+    identity = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+    if (state == "bound" and identity is None) or (state == "creating" and identity is not None):
+        return "invalid"
+    return "v1"
+
+
+def _cryptobot_binding_state(row, metadata, invoice_id) -> str:
+    if not isinstance(metadata, dict):
+        return "mismatch"
+    if (str(metadata.get("payment_method") or "").lower() != "cryptobot"
+            or str(row["payment_method"] or "cryptobot").lower() != "cryptobot"):
+        return "mismatch"
+    identity = _cryptobot_identity(invoice_id)
+    if not identity:
+        return "mismatch"
+    saved = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+    protocol = _cryptobot_binding_protocol(metadata)
+    if protocol == "invalid":
+        return "mismatch"
+    if protocol == "v1" and metadata["cryptobot_binding_state"] == "creating":
+        return "awaiting_binding"
+    return "match" if saved is None or saved == identity else "mismatch"
+
+
+def _preserve_cryptobot_binding(stored: dict, incoming: dict) -> None:
+    """Binding is durable local evidence, never replaced by a caller snapshot."""
+    if not isinstance(stored, dict):
+        stored = {}
+    for key in ("cryptobot_binding_version", "cryptobot_binding_state", "cryptobot_invoice_id"):
+        if key in stored:
+            incoming[key] = stored[key]
+        else:
+            incoming.pop(key, None)
+
+
+def _cryptobot_amount_matches(metadata, paid_amount) -> bool:
+    try:
+        if isinstance(metadata.get("price"), bool) or isinstance(paid_amount, bool):
+            return False
+        expected = Decimal(str(metadata.get("price")))
+        paid = Decimal(str(paid_amount))
+        return (expected.is_finite() and paid.is_finite() and expected > 0 and paid > 0
+                and math.isfinite(float(expected)) and math.isfinite(float(paid))
+                and abs(expected - paid) <= Decimal("1"))
+    except (DecimalException, ValueError, TypeError, OverflowError):
+        return False
+
+
+def _cryptobot_invoice_used_elsewhere(conn, payment_id, invoice_id) -> bool:
+    identity = _cryptobot_identity(invoice_id)
+    if identity is None:
+        return True
+    # Use exactly the same normalizer for legacy stored values and incoming IDs.
+    # SQL trim() differs from Python strip() on tabs/newlines/Unicode whitespace.
+    rows = conn.execute(
+        """SELECT CASE WHEN json_valid(metadata)
+            THEN json_extract(metadata, '$.cryptobot_invoice_id') ELSE NULL END
+        FROM transactions WHERE payment_id != ?""",
+        (payment_id,),
+    )
+    return any(_cryptobot_identity(row[0]) == identity for row in rows)
+
+
+def get_cryptobot_binding_state(payment_id: str, invoice_id, paid_amount=None) -> str:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+            if not row:
+                return "missing"
+            metadata = json.loads(row["metadata"] or "{}")
+            state = _cryptobot_binding_state(row, metadata, invoice_id)
+            if state == "match" and paid_amount is not None and not _cryptobot_amount_matches(metadata, paid_amount):
+                return "amount_mismatch"
+            if state == "match" and _cryptobot_invoice_used_elsewhere(conn, payment_id, invoice_id):
+                return "mismatch"
+            return state
+    except (sqlite3.Error, ValueError, TypeError):
+        return "unavailable"
+
+
+def bind_cryptobot_invoice(payment_id: str, invoice_id) -> bool:
+    """Save the provider identity before publishing a new invoice's payment link."""
+    identity = _cryptobot_identity(invoice_id)
+    if not identity:
+        return False
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+            if not row or row["status"] != "pending":
+                return False
+            metadata = json.loads(row["metadata"] or "{}")
+            if (not isinstance(metadata, dict) or _cryptobot_binding_protocol(metadata) != "v1"
+                    or str(metadata.get("payment_method") or "").lower() != "cryptobot"
+                    or str(row["payment_method"] or "cryptobot").lower() != "cryptobot"):
+                return False
+            existing = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+            if (existing is not None and existing != identity) or _cryptobot_invoice_used_elsewhere(conn, payment_id, identity):
+                return False
+            metadata.update(cryptobot_invoice_id=identity, cryptobot_binding_state="bound")
+            conn.execute("UPDATE transactions SET metadata=? WHERE payment_id=? AND status='pending'",
+                         (json.dumps(metadata), payment_id))
+            conn.commit()
+            return True
+    except (sqlite3.Error, ValueError, TypeError):
+        logger.error("Could not persist CryptoBot invoice binding")
+        return False
+
+
 def reserve_pending_transaction(
     payment_id: str,
     metadata: dict | None = None,
@@ -3329,6 +3454,8 @@ def reserve_pending_transaction(
     allowed_statuses: tuple[str, ...] = ("pending",),
     preserve_fulfillment_state: bool = False,
     require_paid_confirmation: bool = False,
+    expected_cryptobot_invoice_id: str | None = None,
+    expected_cryptobot_amount=None,
 ) -> dict | None:
     """
     Atomically reserve a pending transaction for processing.
@@ -3363,6 +3490,15 @@ def reserve_pending_transaction(
                 return None
 
             metadata_raw = row["metadata"]
+            if expected_cryptobot_invoice_id is not None:
+                try:
+                    binding_metadata = json.loads(metadata_raw or "{}")
+                except (ValueError, TypeError):
+                    return None
+                if (_cryptobot_binding_state(row, binding_metadata, expected_cryptobot_invoice_id) != "match"
+                        or not _cryptobot_amount_matches(binding_metadata, expected_cryptobot_amount)
+                        or _cryptobot_invoice_used_elsewhere(conn, payment_id, expected_cryptobot_invoice_id)):
+                    return None
             if require_paid_confirmation:
                 try:
                     confirmation_metadata = json.loads(metadata_raw or "{}")
@@ -3371,6 +3507,10 @@ def reserve_pending_transaction(
                 if not isinstance(confirmation_metadata, dict):
                     return None
                 if not _paid_retry_is_confirmed(dict(row), confirmation_metadata):
+                    return None
+                if (str(confirmation_metadata.get("payment_method") or "").lower() == "cryptobot"
+                        and confirmation_metadata.get("cryptobot_invoice_id")
+                        and _cryptobot_invoice_used_elsewhere(conn, payment_id, confirmation_metadata["cryptobot_invoice_id"])):
                     return None
             if preserve_fulfillment_state:
                 try:
@@ -3420,6 +3560,10 @@ def reserve_pending_transaction(
                 ]
             else:
                 metadata_to_store.pop("payment_confirmation_verified", None)
+            _preserve_cryptobot_binding(confirmation_state, metadata_to_store)
+            if expected_cryptobot_invoice_id is not None:
+                # Claim a legacy invoice under the same DB write lock as reservation.
+                metadata_to_store["cryptobot_invoice_id"] = _cryptobot_identity(expected_cryptobot_invoice_id)
             metadata_to_store["processing_attempt_id"] = uuid.uuid4().hex
             metadata_to_store["processing_started_at"] = (
                 time_utils.get_msk_now().isoformat()
@@ -3504,6 +3648,9 @@ def is_reserved_transaction_owner(payment_id: str, metadata: dict) -> bool:
 
 def _cryptobot_payment_is_confirmed(row: dict, metadata: dict) -> bool:
     """Use a durable verified receipt, or conservative evidence for old orders."""
+    protocol = _cryptobot_binding_protocol(metadata)
+    if protocol == "invalid" or (protocol == "v1" and metadata["cryptobot_binding_state"] != "bound"):
+        return False
     if "payment_confirmation_verified" in metadata:
         return metadata["payment_confirmation_verified"] is True
     if (
@@ -3552,6 +3699,9 @@ def _processing_fulfillment_is_allowed(
         str(stored.get("payment_method") or "").lower(),
         str(item.get("payment_method") or "").lower(),
     }:
+        if (stored.get("cryptobot_invoice_id") and _cryptobot_invoice_used_elsewhere(
+                conn, payment_id, stored["cryptobot_invoice_id"])):
+            return False
         return _cryptobot_payment_is_confirmed(item, stored)
     return True
 
@@ -3583,6 +3733,7 @@ def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> boo
             if stored is None:
                 return False
             metadata_to_store = dict(metadata)
+            _preserve_cryptobot_binding(stored, metadata_to_store)
             if (
                 "payment_confirmation_verified" in stored
                 and "payment_confirmation_verified" not in metadata_to_store
@@ -3814,6 +3965,7 @@ def apply_payment_accounting_once(
                 ]
             else:
                 metadata.pop("payment_confirmation_verified", None)
+            _preserve_cryptobot_binding(stored_metadata, metadata)
             stored_metadata.update(metadata)
             cursor.execute(
                 """
@@ -3870,6 +4022,7 @@ def finalize_reserved_transaction(
             metadata_to_store = None
             if metadata is not None:
                 metadata_to_store = dict(metadata)
+                _preserve_cryptobot_binding(stored, metadata_to_store)
                 if "payment_confirmation_verified" not in stored:
                     metadata_to_store.pop("payment_confirmation_verified", None)
                 for key, value in stored.items():
@@ -4107,6 +4260,9 @@ def get_pending_paid_retry_transactions(limit: int = 100) -> list[dict]:
                 if not metadata.get("provider_payment_id"):
                     continue
                 if not _paid_retry_is_confirmed(item, metadata):
+                    continue
+                if (method == "cryptobot" and metadata.get("cryptobot_invoice_id")
+                        and _cryptobot_invoice_used_elsewhere(conn, item["payment_id"], metadata["cryptobot_invoice_id"])):
                     continue
                 item["metadata_dict"] = metadata
                 transactions.append(item)

@@ -94,6 +94,7 @@ from shop_bot.data_manager.database import (
     update_key_info,
     get_plan_by_id,
     reserve_pending_transaction,
+    get_cryptobot_binding_state,
     update_reserved_transaction_metadata,
     finalize_reserved_transaction,
     get_all_keys_with_usernames,
@@ -668,10 +669,14 @@ def _sanitize_csv_cell(value) -> str:
 
 def _reserve_pending_transaction_for_cryptobot(
     payment_id: str,
+    invoice_id: str,
+    paid_amount,
 ) -> dict | None:
     return reserve_pending_transaction(
         payment_id,
         payment_method="CryptoBot",
+        expected_cryptobot_invoice_id=invoice_id,
+        expected_cryptobot_amount=paid_amount,
     )
 
 
@@ -5641,8 +5646,15 @@ def create_webhook_app(bot_controller_instance):
                 currency_name = "RUB"
 
                 if payment_id:
+                    invoice_identity = external_invoice_id or external_id_fallback
+                    binding = get_cryptobot_binding_state(payment_id, invoice_identity, paid_amount)
+                    if binding in {"awaiting_binding", "unavailable", "missing"}:
+                        return "Service Unavailable", 503
+                    if binding != "match":
+                        logger.warning("CryptoBot invoice ownership mismatch; transaction unchanged")
+                        return "Bad Request", 400
                     metadata = _reserve_pending_transaction_for_cryptobot(
-                        payment_id,
+                        payment_id, str(invoice_identity), paid_amount,
                     )
                     if metadata is None:
                         local_status = _get_transaction_status(payment_id)
@@ -5677,9 +5689,9 @@ def create_webhook_app(bot_controller_instance):
                     payload_price = metadata.get("price")
                     metadata["payment_method"] = "CryptoBot"
                     metadata["provider_payment_id"] = payment_id
-                    metadata["cryptobot_invoice_id"] = str(
-                        external_invoice_id or external_id_fallback or ""
-                    )
+                    # The reservation already claimed the canonical provider ID.
+                    # Do not replace it with raw webhook formatting.
+                    assert metadata.get("cryptobot_invoice_id")
                 else:
                     logger.error(
                         "CryptoBot webhook: paid invoice payload has no known pending transaction id."

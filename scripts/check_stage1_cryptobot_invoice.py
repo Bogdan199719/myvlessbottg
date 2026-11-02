@@ -18,12 +18,14 @@ node.decorator_list = []
 module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node], type_ignores=[])
 assert not any(isinstance(n, ast.Name) and n.id == "get_usdt_rub_rate" for n in ast.walk(node))
 
-async def run(discount, failure=False):
+async def run(discount, failure=False, bind_failure=False, delivery_failure=False):
     invoice_calls = []
     stored = []
     failed = []
     state = NS(get_data=AsyncMock(return_value={"plan_id":7,"user_id":101,"host_name":"ALL","action":"new","key_id":0,"customer_email":"fixture@example.invalid"}), clear=AsyncMock())
     callback = NS(answer=AsyncMock(), from_user=NS(id=101), message=NS(edit_text=AsyncMock()))
+    if delivery_failure:
+        callback.message.edit_text.side_effect = [RuntimeError("synthetic delivery failure"), None]
     price = Decimal("90") if discount else Decimal("100")
     class Crypto:
         def __init__(self, token):
@@ -32,11 +34,11 @@ async def run(discount, failure=False):
             invoice_calls.append(kwargs)
             if failure:
                 raise RuntimeError("synthetic creation failure")
-            return NS(pay_url="https://fixture.invalid/pay")
+            return NS(pay_url="https://fixture.invalid/pay", invoice_id=123)
     def store(pid, uid, amount, metadata):
         stored.append((pid, uid, amount, metadata.copy()))
         return 1
-    ns = dict(logger=logging.getLogger("fixture"), get_user=lambda uid:{"telegram_id":uid}, get_setting=lambda key: "synthetic-token" if key=="cryptobot_token" else (_ for _ in ()).throw(AssertionError("Unused setting requested")), get_plan_by_id=lambda pid:{"months":1}, _validate_payment_state_plan=lambda *a:(True,""), _calculate_plan_quote=lambda *a:(price,discount), _plan_snapshot=lambda p:{"months":1,"service_type":"xui","plan_name":"fixture"}, CryptoPay=Crypto, uuid=uuid, create_pending_transaction=store, _cryptobot_build_payload=lambda pid:json.dumps({"tx_id":pid}), keyboards=NS(create_payment_keyboard=lambda url:url), mark_pending_transaction_status=lambda *a,**kw:failed.append((a,kw)))
+    ns = dict(asyncio=asyncio, logger=logging.getLogger("fixture"), get_user=lambda uid:{"telegram_id":uid}, get_setting=lambda key: "synthetic-token" if key=="cryptobot_token" else (_ for _ in ()).throw(AssertionError("Unused setting requested")), get_plan_by_id=lambda pid:{"months":1}, _validate_payment_state_plan=lambda *a:(True,""), _calculate_plan_quote=lambda *a:(price,discount), _plan_snapshot=lambda p:{"months":1,"service_type":"xui","plan_name":"fixture"}, CryptoPay=Crypto, uuid=uuid, create_pending_transaction=store, bind_cryptobot_invoice=lambda pid, iid: iid == 123 and not bind_failure, _cryptobot_build_payload=lambda pid:json.dumps({"tx_id":pid}), keyboards=NS(create_payment_keyboard=lambda url:url), mark_pending_transaction_status=lambda *a,**kw:failed.append((a,kw)))
     exec(compile(ast.fix_missing_locations(module), "invoice-handler", "exec"), ns)
     await ns[node.name](callback, state)
     assert len(invoice_calls) == len(stored) == 1
@@ -48,11 +50,15 @@ async def run(discount, failure=False):
     assert meta["payment_method"] == "CryptoBot" and meta["host_name"] == "ALL"
     assert meta["action"] == "new" and meta["plan_id"] == 7 and meta["months"] == 1
     assert state.clear.await_count == 1
-    assert bool(failed) is failure
-    if not failure:
+    assert bool(failed) is (failure or bind_failure)
+    if bind_failure:
+        assert not any(call.kwargs.get("reply_markup") for call in callback.message.edit_text.call_args_list)
+    if not failure and not bind_failure and not delivery_failure:
         assert callback.message.edit_text.call_args.kwargs["reply_markup"] == "https://fixture.invalid/pay"
 
 asyncio.run(run(False))
 asyncio.run(run(True))
 asyncio.run(run(False, True))
+asyncio.run(run(False, bind_failure=True))
+asyncio.run(run(False, delivery_failure=True))
 print("Stage 1 CryptoBot RUB invoice: OK")

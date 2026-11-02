@@ -51,6 +51,7 @@ from shop_bot.data_manager.database import (
     get_referral_count,
     add_to_referral_balance,
     create_pending_transaction,
+    bind_cryptobot_invoice,
     reserve_pending_transaction,
     update_reserved_transaction_metadata,
     is_reserved_transaction_fulfillment_allowed,
@@ -3517,6 +3518,7 @@ def get_user_router() -> Router:
         plan_snapshot = _plan_snapshot(plan)
 
         payment_id = None
+        invoice_bound = False
         try:
             logger.info("Creating Crypto Pay invoice in RUB.")
 
@@ -3532,6 +3534,8 @@ def get_user_router() -> Router:
                 "plan_id": plan_id,
                 "customer_email": customer_email,
                 "payment_method": "CryptoBot",
+                "cryptobot_binding_version": 1,
+                "cryptobot_binding_state": "creating",
                 "referral_discount_applied": referral_discount_applied,
             }
             pending_id = create_pending_transaction(
@@ -3554,6 +3558,12 @@ def get_user_router() -> Router:
             if not invoice or not invoice.pay_url:
                 raise Exception("Failed to create invoice or pay_url is missing.")
 
+            if not await asyncio.to_thread(
+                bind_cryptobot_invoice, payment_id, getattr(invoice, "invoice_id", None)
+            ):
+                raise RuntimeError("Could not save CryptoBot invoice ownership")
+            invoice_bound = True
+
             await callback.message.edit_text(
                 "Нажмите на кнопку ниже для оплаты:",
                 reply_markup=keyboards.create_payment_keyboard(invoice.pay_url),
@@ -3561,7 +3571,7 @@ def get_user_router() -> Router:
             await state.clear()
 
         except Exception as e:
-            if payment_id:
+            if payment_id and not invoice_bound:
                 mark_pending_transaction_status(
                     payment_id,
                     "failed",
