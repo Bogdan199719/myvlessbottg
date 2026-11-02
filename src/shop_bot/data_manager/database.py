@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from shop_bot.utils import time_utils
 import logging
 from pathlib import Path
@@ -3773,6 +3773,56 @@ def recover_stale_processing_transactions(
     Payment fulfillment persists an absolute target before touching a panel, so
     global and single-host XUI/MTG purchases can all be resumed safely.
     """
+    # Flag acquisition/release uses this same owner-lock -> SQLite order.
+    # Keep the active-owner decision and CAS transition in one critical section.
+    # This protects workers already registered here; existing durable attempt
+    # fencing remains responsible for a late worker which has not registered yet.
+    with _pending_payment_owners_lock:
+        return _recover_stale_processing_transactions_locked(older_than_minutes)
+
+
+def _processing_user_active_locked(row) -> bool:
+    try:
+        user_id = int(row["user_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    # Another live order for this user is also a reason to postpone recovery.
+    # Membership matters: None is a real legacy owner, not an absent record.
+    return user_id in _pending_payment_owners
+
+
+def _processing_started_at(metadata, row):
+    # Diagnostic metadata is untrusted: do not send a malformed date or payload
+    # into the general date parser, which logs its input on parsing failures.
+    for value in (metadata.get("processing_started_at"), row["created_date"]):
+        if not isinstance(value, str):
+            continue
+        try:
+            started = datetime.fromisoformat(value)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            return time_utils.to_msk(started)
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return None
+
+
+def _valid_recovery_target(metadata) -> bool:
+    target = metadata.get("fulfillment_target_expiry_ms")
+    if isinstance(target, bool):
+        return False
+    # The writer saves integer milliseconds. Digit-only historical strings are
+    # safe without coercing floats, booleans, exponents or malformed targets.
+    if not (isinstance(target, int) or (
+            isinstance(target, str) and target.isascii() and target.isdigit())):
+        return False
+    try:
+        return 0 < int(target) <= 253402300799999
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _recover_stale_processing_transactions_locked(older_than_minutes: int) -> int:
     cutoff = time_utils.get_msk_now() - timedelta(
         minutes=max(5, int(older_than_minutes))
     )
@@ -3783,7 +3833,7 @@ def recover_stale_processing_transactions(
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT payment_id, metadata, created_date
+                SELECT payment_id, user_id, metadata, created_date
                 FROM transactions
                 WHERE status = 'processing'
                   AND metadata IS NOT NULL
@@ -3799,14 +3849,12 @@ def recover_stale_processing_transactions(
                     continue
                 if not metadata.get("provider_payment_id"):
                     continue
-                if not metadata.get("fulfillment_target_expiry_ms"):
+                if not _valid_recovery_target(metadata):
+                    continue
+                if _processing_user_active_locked(row):
                     continue
 
-                started_at = time_utils.parse_iso_to_msk(
-                    metadata.get("processing_started_at")
-                )
-                if not started_at:
-                    started_at = time_utils.parse_iso_to_msk(row["created_date"])
+                started_at = _processing_started_at(metadata, row)
                 if not started_at or started_at > cutoff:
                     continue
 
@@ -3828,6 +3876,48 @@ def recover_stale_processing_transactions(
     except sqlite3.Error as e:
         logging.error("Failed to recover stale processing transactions: %s", e)
         return 0
+
+
+def get_payment_recovery_diagnostics(older_than_minutes: int = 15) -> dict:
+    """Read-only operational counts, never identities or authorization to retry.
+
+    A recoverable count means the existing stale-recovery shape is present, not
+    that payment confirmation/fulfillment gates can be skipped. Malformed and
+    pre-target orders remain untouched for manual/provider reconciliation.
+    """
+    counts = {"stale_active": 0, "stale_recoverable": 0,
+              "stale_manual_review": 0, "invalid_processing_state": 0}
+    cutoff = time_utils.get_msk_now() - timedelta(minutes=max(5, int(older_than_minutes)))
+    try:
+        # Keep the same lock order as recovery and user-flag acquisition.
+        with _pending_payment_owners_lock:
+            with sqlite3.connect(Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("SELECT user_id, metadata, created_date FROM transactions WHERE status='processing'").fetchall()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = None
+                if not isinstance(metadata, dict):
+                    counts["invalid_processing_state"] += 1
+                    continue
+                started = _processing_started_at(metadata, row)
+                if not started:
+                    counts["invalid_processing_state"] += 1
+                    continue
+                if started > cutoff:
+                    continue
+                if _processing_user_active_locked(row):
+                    counts["stale_active"] += 1
+                elif metadata.get("provider_payment_id") and _valid_recovery_target(metadata):
+                    counts["stale_recoverable"] += 1
+                else:
+                    counts["stale_manual_review"] += 1
+        return counts
+    except sqlite3.Error:
+        logger.error("Payment recovery diagnostics unavailable")
+        return {**counts, "unavailable": True}
 
 
 def recover_pre_fulfillment_yookassa_on_startup() -> int:

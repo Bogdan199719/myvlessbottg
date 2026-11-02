@@ -22,6 +22,7 @@ class RuntimeHealth:
         self._tasks = {}
         self._cycles = {}
         self._bots = {}
+        self._payment_recovery = {}
 
     def close(self):
         with self._lock:
@@ -113,6 +114,10 @@ class RuntimeHealth:
                     state["requests"].pop(marker, None)
         return observe
 
+    def payment_recovery_status(self, counts):
+        with self._lock:
+            self._payment_recovery = dict(counts)
+
     def snapshot(self):
         with self._lock:
             now = self._clock()
@@ -174,4 +179,5 @@ class RuntimeHealth:
                 "failed": failed, "warnings": warnings, "tasks": tasks,
                 "cycles": cycles, "bots": bots, "heartbeat_age_seconds": heartbeat_age,
                 "closing": self._closing,
+                "payment_recovery": dict(self._payment_recovery),
             }

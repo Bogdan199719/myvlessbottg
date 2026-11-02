@@ -2,6 +2,9 @@
 import asyncio
 import logging
 import time
+import json
+from pathlib import Path
+from datetime import datetime, timezone
 
 from shop_bot.utils.admin_ids import parse_admin_telegram_ids
 
@@ -9,20 +12,40 @@ logger = logging.getLogger(__name__)
 
 
 async def runtime_watchdog(controller):
-    from shop_bot.data_manager.database import get_setting
+    from shop_bot.data_manager.database import get_setting, get_payment_recovery_diagnostics
 
     monitor = controller.runtime_health
     first_seen = {}
     last_sent = {}
     while True:
         try:
+            receipt = Path(__file__).resolve().parents[3] / '.backup_status.json'
+            backup_warning = None
+            try:
+                data = await asyncio.to_thread(receipt.read_text)
+                stamp = datetime.fromisoformat(json.loads(data)['completed_at_utc'])
+                age = (datetime.now(timezone.utc) - stamp).total_seconds()
+                if age > 25 * 3600:
+                    backup_warning = 'backup_stale'
+            except FileNotFoundError:
+                backup_warning = 'backup_missing'
+            except (OSError, ValueError, TypeError, KeyError):
+                backup_warning = 'backup_receipt_invalid'
+            recovery = await asyncio.to_thread(get_payment_recovery_diagnostics)
+            if hasattr(monitor, 'payment_recovery_status'):
+                monitor.payment_recovery_status(recovery)
+            recovery_warnings = set()
+            if recovery.get('stale_manual_review') or recovery.get('invalid_processing_state'):
+                recovery_warnings.add('payment_manual_review_required')
+            if recovery.get('unavailable'):
+                recovery_warnings.add('payment_recovery_status_unavailable')
             snapshot = monitor.snapshot()
             if snapshot['closing']:
                 return
             now = time.monotonic()
             failures = set(snapshot['failed'])
             # Short external outages and the normal startup window are advisory.
-            candidates = failures | {
+            candidates = failures | recovery_warnings | ({backup_warning} if backup_warning else set()) | {
                 code for code in snapshot['warnings']
                 if code.endswith(('_cycle_error', '_progress_delayed', '_start_failed'))
             }
