@@ -52,12 +52,18 @@ class RuntimeHealth:
             previous = self._cycles.get(name, {})
             self._cycles[name] = {
                 **previous, "progress": self._clock(), "active": True,
-                "stage": "starting",
+                "stage": "starting", "step_errors": [],
             }
 
     def progress(self, name, stage):
         with self._lock:
             self._cycles[name].update(progress=self._clock(), stage=stage)
+
+    def step_failed(self, name, step):
+        with self._lock:
+            errors = self._cycles[name]["step_errors"]
+            if step not in errors:
+                errors.append(step)
 
     def cycle_finished(self, name, error=False):
         with self._lock:
@@ -113,7 +119,7 @@ class RuntimeHealth:
             age = lambda value: None if value is None else round(max(0, now - value), 1)
             failed = []
             warnings = []
-            missing = {"heartbeat", "payments", "subscriptions"} - self._tasks.keys()
+            missing = {"heartbeat", "payments", "subscriptions", "notifications", "runtime_watchdog"} - self._tasks.keys()
             if missing and not self._closing:
                 warnings.append(
                     "startup_delayed"
@@ -137,6 +143,7 @@ class RuntimeHealth:
                     "progress_age_seconds": progress_age,
                     "success_age_seconds": age(state.get("success")),
                     "last_cycle_error": state.get("error", False),
+                    "step_errors": list(state.get("step_errors", [])),
                 }
                 if state.get("error"):
                     warnings.append(name + "_cycle_error")

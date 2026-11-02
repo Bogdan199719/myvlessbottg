@@ -11,6 +11,8 @@ from shop_bot.webhook_server.restore_manager import (
     quarantine_pending_restore,
 )
 from shop_bot.utils.logging_utils import SensitiveUrlFilter
+from shop_bot.utils.runtime_alerts import runtime_watchdog
+from shop_bot.utils.process_lock import acquire_instance_lock, InstanceAlreadyRunning
 
 load_dotenv()
 
@@ -19,6 +21,11 @@ load_dotenv()
 _APP_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _APP_ROOT / ".env"
 _DB_FILE = Path(os.getenv("DB_PATH", Path.cwd() / "users.db"))
+try:
+    _INSTANCE_LOCK = acquire_instance_lock(_DB_FILE, _APP_ROOT)
+except InstanceAlreadyRunning:
+    logging.getLogger(__name__).critical("Application startup refused: another instance is running")
+    raise SystemExit(73)
 try:
     _pending_env = _APP_ROOT / ".restore_pending" / ".env"
     if _pending_env.exists():
@@ -42,6 +49,7 @@ except Exception:
 from shop_bot.webhook_server.app import create_webhook_app
 from shop_bot.data_manager.scheduler import (
     periodic_payment_check,
+    periodic_notification_check,
     periodic_subscription_check,
 )
 from shop_bot.data_manager import database
@@ -277,6 +285,13 @@ def main():
         )
         bot_controller.runtime_health.create_task(
             "payments", periodic_payment_check(bot_controller)
+        )
+
+        bot_controller.runtime_health.create_task(
+            "notifications", periodic_notification_check(bot_controller)
+        )
+        bot_controller.runtime_health.create_task(
+            "runtime_watchdog", runtime_watchdog(bot_controller)
         )
 
         await asyncio.Future()

@@ -43,3 +43,6 @@ QWEN.md
 
 # Misc
 *.bak*
+
+# Process ownership files must stay local and must never be removed while running.
+*.instance.lock
