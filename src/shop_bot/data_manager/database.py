@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from shop_bot.utils import time_utils
 import logging
 from pathlib import Path
@@ -7,6 +7,8 @@ import json
 import math
 import os
 import uuid
+import threading
+from decimal import Decimal, DecimalException
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,9 @@ logger = logging.getLogger(__name__)
 # In Docker, os.getcwd() will be /app/project
 DEFAULT_DB_PATH = Path(os.getcwd()) / "users.db"
 DB_FILE = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH))
+_PAYMENT_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_pending_payment_owners: dict[int, str | None] = {}
+_pending_payment_owners_lock = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -53,9 +58,7 @@ DEFAULT_BOT_SETTINGS = {
     "panel_login": os.getenv("PANEL_LOGIN", "admin"),
     "panel_password": os.getenv("PANEL_PASSWORD"),
     "flask_secret_key": os.getenv("FLASK_SECRET_KEY"),
-    "admin_ip_allowlist": os.getenv(
-        "ADMIN_IP_ALLOWLIST", "94.183.234.189 79.139.250.224"
-    ),
+    "admin_ip_allowlist": os.getenv("ADMIN_IP_ALLOWLIST", ""),
     "show_about_menu_item": "true",
     "about_text": None,
     "terms_url": None,
@@ -104,6 +107,7 @@ DEFAULT_BOT_SETTINGS = {
     "ip_limit_enabled": "true",
     "ip_limit_max_ips": "10",
     "ip_limit_warning_grace_hours": "24",
+    "ip_limit_activity_window_minutes": "10",
     "p2p_enabled": "false",
     "p2p_card_number": None,
     "enable_global_plans": "true",
@@ -287,6 +291,57 @@ def initialize_db():
                 "ON xui_ip_limit_events(state, last_exceeded_at DESC)"
             )
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS xui_ip_limit_user_events (
+                    user_id INTEGER PRIMARY KEY,
+                    observed_ip_count INTEGER NOT NULL DEFAULT 0,
+                    limit_count INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'candidate',
+                    consecutive_exceeded INTEGER NOT NULL DEFAULT 0,
+                    first_exceeded_at TEXT NOT NULL,
+                    last_exceeded_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    warned_at TEXT,
+                    enforced_at TEXT,
+                    resolved_at TEXT,
+                    notification_error TEXT
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xui_ip_limit_user_events_state "
+                "ON xui_ip_limit_user_events(state, last_exceeded_at DESC)"
+            )
+            # Preserve decisions already enforced by the legacy per-key monitor.
+            # Warnings are intentionally not migrated because the new detector
+            # requires a complete, fresh, subscription-wide snapshot.
+            cursor.execute("""
+                INSERT INTO xui_ip_limit_user_events (
+                    user_id, observed_ip_count, limit_count, state,
+                    consecutive_exceeded, first_exceeded_at,
+                    last_exceeded_at, last_checked_at, warned_at,
+                    enforced_at, resolved_at, notification_error
+                )
+                SELECT
+                    user_id,
+                    MAX(observed_ip_count),
+                    MAX(limit_count),
+                    'enforced',
+                    0,
+                    MIN(first_exceeded_at),
+                    MAX(last_exceeded_at),
+                    MAX(last_checked_at),
+                    MIN(warned_at),
+                    MAX(enforced_at),
+                    NULL,
+                    MAX(notification_error)
+                FROM xui_ip_limit_events
+                WHERE state='enforced'
+                GROUP BY user_id
+                ON CONFLICT(user_id) DO NOTHING
+            """)
+            # ``run_migration`` opens its own SQLite connection below.
+            # Release the write transaction created by the legacy-state import.
+            conn.commit()
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS mtg_hosts (
                     host_name TEXT NOT NULL PRIMARY KEY,
                     host_url TEXT NOT NULL,
@@ -385,6 +440,7 @@ def initialize_db():
         clear_all_pending_payments()
     except sqlite3.Error as e:
         logging.error(f"Database error on initialization: {e}")
+        raise
 
 
 def run_migration():
@@ -678,6 +734,14 @@ def run_migration():
 
             try:
                 cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_vpn_keys_host_name ON vpn_keys(host_name)"
+                )
+                logging.info(" -> Index on vpn_keys.host_name created.")
+            except sqlite3.OperationalError:
+                logging.info(" -> Index on vpn_keys.host_name already exists.")
+
+            try:
+                cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_vpn_keys_expiry ON vpn_keys(expiry_date)"
                 )
                 logging.info(" -> Index on vpn_keys.expiry_date created.")
@@ -700,15 +764,19 @@ def run_migration():
             except sqlite3.OperationalError:
                 logging.info(" -> Index on users.is_banned already exists.")
 
-            # Hard guard: one paid key per user per host.
+            # Hard guard: one paid key per user, service and host.
             # Prevents accidental duplicates that inflate "servers count" and break global expiry logic.
             try:
                 cursor.execute(
+                    "DROP INDEX IF EXISTS idx_vpn_keys_user_host_paid_unique"
+                )
+                cursor.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_vpn_keys_user_host_paid_unique "
-                    "ON vpn_keys(user_id, host_name) WHERE plan_id > 0"
+                    "ON vpn_keys(user_id, service_type, host_name) WHERE plan_id > 0"
                 )
                 logging.info(
-                    " -> Partial unique index on paid keys (user_id, host_name) created."
+                    " -> Partial unique index on paid keys "
+                    "(user_id, service_type, host_name) created."
                 )
             except sqlite3.OperationalError as e:
                 logging.warning(f" -> Could not create paid-keys unique index: {e}")
@@ -751,20 +819,9 @@ def run_migration():
                         "The 'Transactions' table already has a new structure. Migration is not required."
                     )
                 else:
-                    backup_name = (
-                        f"transactions_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    )
-                    logging.warning(
-                        f"The old structure of the TRANSACTIONS table was discovered. I rename in '{backup_name}' ..."
-                    )
-                    cursor.execute(f"ALTER TABLE transactions RENAME TO {backup_name}")
-
-                    logging.info(
-                        "I create a new table 'Transactions' with the correct structure ..."
-                    )
-                    create_new_transactions_table(cursor)
-                    logging.info(
-                        "The new table 'Transactions' has been successfully created. The old data is saved."
+                    raise sqlite3.OperationalError(
+                        "Unsupported legacy transactions schema; automatic migration "
+                        "was stopped to preserve payment history"
                     )
             else:
                 logging.info("TRANSACTIONS table was not found. I create a new one ...")
@@ -960,13 +1017,14 @@ def run_migration():
                     ),
                 )
 
-            # Ensure xui_hosts has a UNIQUE constraint on host_name.
-            # First remove any duplicate rows that would block index creation (keep lowest rowid).
-            cursor.execute("""
-                DELETE FROM xui_hosts WHERE rowid NOT IN (
-                    SELECT MIN(rowid) FROM xui_hosts GROUP BY host_name
+            # Never guess which duplicate host configuration is authoritative.
+            cursor.execute(
+                "SELECT host_name FROM xui_hosts GROUP BY host_name HAVING COUNT(*) > 1 LIMIT 1"
+            )
+            if cursor.fetchone():
+                raise sqlite3.IntegrityError(
+                    "Duplicate xui_hosts names require an explicit manual merge"
                 )
-            """)
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_xui_hosts_name ON xui_hosts(host_name)"
             )
@@ -978,6 +1036,7 @@ def run_migration():
 
     except sqlite3.Error as e:
         logging.error(f"An error occurred during migration: {e}")
+        raise
 
 
 def create_new_transactions_table(cursor: sqlite3.Cursor):
@@ -1383,7 +1442,10 @@ def process_xui_ip_limit_observations(
                 existing = dict(existing_row) if existing_row else None
 
                 if observed_count > limit_count:
-                    if not existing or existing.get("state") == "resolved":
+                    if not existing or existing.get("state") in {
+                        "resolved",
+                        "released",
+                    }:
                         cursor.execute(
                             """
                             INSERT INTO xui_ip_limit_events (
@@ -1484,7 +1546,10 @@ def process_xui_ip_limit_observations(
                         )
                     continue
 
-                if not existing or existing.get("state") == "resolved":
+                if not existing or existing.get("state") in {
+                    "resolved",
+                    "released",
+                }:
                     continue
 
                 cursor.execute(
@@ -1562,6 +1627,597 @@ def get_enforced_xui_ip_limit_key_ids() -> set[int]:
     except sqlite3.Error as e:
         logger.error("Failed to load enforced XUI IP-limit keys: %s", e)
         return set()
+
+
+def enforce_xui_ip_limit_now(key_id: int) -> dict | None:
+    """Move one warned key to enforcement immediately by administrator action."""
+    try:
+        safe_key_id = int(key_id)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            row = cursor.execute(
+                """
+                SELECT key_id, user_id, host_name, key_email
+                FROM xui_ip_limit_events
+                WHERE key_id=? AND state='warning'
+                """,
+                (safe_key_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_events
+                SET state='enforced', enforced_at=?, resolved_at=NULL
+                WHERE key_id=? AND state='warning'
+                """,
+                (_now_iso(), safe_key_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            conn.commit()
+            return dict(row)
+    except sqlite3.Error as e:
+        logger.error("Failed to enforce XUI IP limit for key %s: %s", key_id, e)
+        return None
+
+
+def release_xui_ip_limits(key_ids: list[int] | None = None) -> list[dict]:
+    """Release enforced native limits while keeping an auditable event record.
+
+    ``None`` releases every enforced key. An explicit list limits the operation
+    to those key IDs. Released events are terminal, so a later breach starts a
+    fresh warning and grace-period cycle.
+    """
+    normalized_ids: list[int] | None = None
+    if key_ids is not None:
+        normalized_ids = []
+        for key_id in key_ids:
+            try:
+                normalized_ids.append(int(key_id))
+            except (TypeError, ValueError):
+                continue
+        normalized_ids = sorted(set(normalized_ids))
+        if not normalized_ids:
+            return []
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where_sql = "state='enforced'"
+            params: list[int] = []
+            if normalized_ids is not None:
+                placeholders = ",".join("?" for _ in normalized_ids)
+                where_sql += f" AND key_id IN ({placeholders})"
+                params.extend(normalized_ids)
+
+            rows = cursor.execute(
+                f"""
+                SELECT key_id, user_id, host_name, key_email
+                FROM xui_ip_limit_events
+                WHERE {where_sql}
+                ORDER BY key_id
+                """,
+                params,
+            ).fetchall()
+            if not rows:
+                return []
+
+            released_at = _now_iso()
+            released_ids = [int(row["key_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in released_ids)
+            cursor.execute(
+                f"""
+                UPDATE xui_ip_limit_events
+                SET state='released', resolved_at=?
+                WHERE state='enforced' AND key_id IN ({placeholders})
+                """,
+                [released_at, *released_ids],
+            )
+            conn.commit()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to release XUI IP limits: %s", e)
+        return []
+
+
+def prune_xui_ip_limit_history(retention_days: int = 7) -> int:
+    """Delete completed IP-limit events after the audit retention period."""
+    try:
+        safe_retention_days = max(1, int(retention_days))
+    except (TypeError, ValueError):
+        safe_retention_days = 7
+    cutoff = (
+        time_utils.get_msk_now() - timedelta(days=safe_retention_days)
+    ).isoformat()
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM xui_ip_limit_events
+                WHERE state IN ('resolved', 'released')
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = max(0, int(cursor.rowcount))
+            conn.commit()
+            return deleted
+    except sqlite3.Error as e:
+        logger.error("Failed to prune XUI IP-limit history: %s", e)
+        return 0
+
+
+def process_xui_ip_limit_user_observations(
+    observations: list[dict],
+    limit_count: int,
+    warning_grace_hours: int,
+    confirmation_checks: int = 2,
+    clean_minutes: int = 60,
+    confirmation_gap_minutes: int = 15,
+) -> dict:
+    """Process one privacy-preserving, subscription-wide IP count per user."""
+    result = {"warnings": [], "enforced": [], "resolved": []}
+    if not observations:
+        return result
+
+    limit_count = max(1, int(limit_count))
+    warning_grace_hours = max(1, int(warning_grace_hours))
+    confirmation_checks = max(1, int(confirmation_checks))
+    clean_minutes = max(1, int(clean_minutes))
+    confirmation_gap_minutes = max(1, int(confirmation_gap_minutes))
+    now = time_utils.get_msk_now()
+    now_text = _now_iso()
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            for observation in observations:
+                try:
+                    user_id = int(observation["user_id"])
+                    observed_count = max(
+                        0,
+                        int(observation.get("ip_count", 0)),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                row = cursor.execute(
+                    """
+                    SELECT *
+                    FROM xui_ip_limit_user_events
+                    WHERE user_id=?
+                    """,
+                    (user_id,),
+                ).fetchone()
+                existing = dict(row) if row else None
+                state = str(existing.get("state") or "") if existing else ""
+
+                if observed_count > limit_count:
+                    if not existing or state in {"resolved", "released"}:
+                        initial_state = (
+                            "warning"
+                            if confirmation_checks == 1
+                            else "candidate"
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO xui_ip_limit_user_events (
+                                user_id, observed_ip_count, limit_count, state,
+                                consecutive_exceeded, first_exceeded_at,
+                                last_exceeded_at, last_checked_at, warned_at,
+                                enforced_at, resolved_at, notification_error
+                            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, NULL)
+                            ON CONFLICT(user_id) DO UPDATE SET
+                                observed_ip_count=excluded.observed_ip_count,
+                                limit_count=excluded.limit_count,
+                                state=excluded.state,
+                                consecutive_exceeded=1,
+                                first_exceeded_at=excluded.first_exceeded_at,
+                                last_exceeded_at=excluded.last_exceeded_at,
+                                last_checked_at=excluded.last_checked_at,
+                                warned_at=NULL,
+                                enforced_at=NULL,
+                                resolved_at=NULL,
+                                notification_error=NULL
+                            """,
+                            (
+                                user_id,
+                                observed_count,
+                                limit_count,
+                                initial_state,
+                                now_text,
+                                now_text,
+                                now_text,
+                            ),
+                        )
+                        if initial_state == "warning":
+                            result["warnings"].append(
+                                {
+                                    "user_id": user_id,
+                                    "ip_count": observed_count,
+                                    "limit_count": limit_count,
+                                }
+                            )
+                        continue
+
+                    if state == "candidate":
+                        previous_check = time_utils.parse_iso_to_msk(
+                            existing.get("last_checked_at")
+                        )
+                        is_consecutive = bool(
+                            previous_check
+                            and now - previous_check
+                            <= timedelta(minutes=confirmation_gap_minutes)
+                        )
+                        consecutive = (
+                            int(existing.get("consecutive_exceeded") or 0) + 1
+                            if is_consecutive
+                            else 1
+                        )
+                        next_state = (
+                            "warning"
+                            if consecutive >= confirmation_checks
+                            else "candidate"
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE xui_ip_limit_user_events
+                            SET observed_ip_count=?, limit_count=?, state=?,
+                                consecutive_exceeded=?, last_exceeded_at=?,
+                                last_checked_at=?,
+                                first_exceeded_at=CASE
+                                    WHEN ? THEN first_exceeded_at
+                                    ELSE ?
+                                END,
+                                resolved_at=NULL
+                            WHERE user_id=?
+                            """,
+                            (
+                                observed_count,
+                                limit_count,
+                                next_state,
+                                consecutive,
+                                now_text,
+                                now_text,
+                                1 if is_consecutive else 0,
+                                now_text,
+                                user_id,
+                            ),
+                        )
+                        if next_state == "warning":
+                            result["warnings"].append(
+                                {
+                                    "user_id": user_id,
+                                    "ip_count": observed_count,
+                                    "limit_count": limit_count,
+                                }
+                            )
+                        continue
+
+                    cursor.execute(
+                        """
+                        UPDATE xui_ip_limit_user_events
+                        SET observed_ip_count=?, limit_count=?,
+                            consecutive_exceeded=consecutive_exceeded + 1,
+                            last_exceeded_at=?, last_checked_at=?,
+                            resolved_at=NULL
+                        WHERE user_id=?
+                        """,
+                        (
+                            observed_count,
+                            limit_count,
+                            now_text,
+                            now_text,
+                            user_id,
+                        ),
+                    )
+                    warned_at = time_utils.parse_iso_to_msk(
+                        existing.get("warned_at")
+                    )
+                    if (
+                        state == "warning"
+                        and warned_at
+                        and now - warned_at
+                        >= timedelta(hours=warning_grace_hours)
+                    ):
+                        cursor.execute(
+                            """
+                            UPDATE xui_ip_limit_user_events
+                            SET state='enforced', enforced_at=?
+                            WHERE user_id=? AND state='warning'
+                            """,
+                            (now_text, user_id),
+                        )
+                        result["enforced"].append(
+                            {
+                                "user_id": user_id,
+                                "ip_count": observed_count,
+                                "limit_count": limit_count,
+                            }
+                        )
+                    elif state == "warning" and not warned_at:
+                        result["warnings"].append(
+                            {
+                                "user_id": user_id,
+                                "ip_count": observed_count,
+                                "limit_count": limit_count,
+                            }
+                        )
+                    continue
+
+                if not existing or state in {"resolved", "released"}:
+                    continue
+                if state == "candidate":
+                    cursor.execute(
+                        """
+                        DELETE FROM xui_ip_limit_user_events
+                        WHERE user_id=? AND state='candidate'
+                        """,
+                        (user_id,),
+                    )
+                    continue
+
+                cursor.execute(
+                    """
+                    UPDATE xui_ip_limit_user_events
+                    SET observed_ip_count=?, limit_count=?,
+                        consecutive_exceeded=0, last_checked_at=?
+                    WHERE user_id=?
+                    """,
+                    (observed_count, limit_count, now_text, user_id),
+                )
+                last_exceeded_at = time_utils.parse_iso_to_msk(
+                    existing.get("last_exceeded_at")
+                )
+                if (
+                    state == "warning"
+                    and last_exceeded_at
+                    and now - last_exceeded_at
+                    >= timedelta(minutes=clean_minutes)
+                ):
+                    cursor.execute(
+                        """
+                        UPDATE xui_ip_limit_user_events
+                        SET state='resolved', resolved_at=?
+                        WHERE user_id=? AND state='warning'
+                        """,
+                        (now_text, user_id),
+                    )
+                    result["resolved"].append({"user_id": user_id})
+
+            conn.commit()
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logger.error("Failed to process global XUI IP-limit observations: %s", e)
+
+    return result
+
+
+def mark_xui_ip_limit_user_warning_result(
+    user_id: int,
+    notification_error: str | None = None,
+) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_user_events
+                SET warned_at=?, notification_error=?
+                WHERE user_id=? AND state='warning' AND warned_at IS NULL
+                """,
+                (
+                    _now_iso(),
+                    (notification_error or "")[:500] or None,
+                    int(user_id),
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logger.error(
+            "Failed to mark global XUI IP-limit warning for user %s: %s",
+            user_id,
+            e,
+        )
+        return False
+
+
+def get_enforced_xui_ip_limit_user_ids() -> set[int]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE state='enforced'
+                """
+            ).fetchall()
+            return {int(row[0]) for row in rows}
+    except sqlite3.Error as e:
+        logger.error("Failed to load globally limited XUI users: %s", e)
+        return set()
+
+
+def get_pending_xui_ip_limit_user_ids() -> set[int]:
+    """Return candidates/warnings so missing or expired subscriptions can clear."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE state IN ('candidate', 'warning')
+                """
+            ).fetchall()
+            return {int(row[0]) for row in rows}
+    except sqlite3.Error as e:
+        logger.error("Failed to load pending global XUI IP-limit users: %s", e)
+        return set()
+
+
+def enforce_xui_ip_limit_user_now(user_id: int) -> dict | None:
+    try:
+        safe_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            row = cursor.execute(
+                """
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE user_id=? AND state='warning'
+                """,
+                (safe_user_id,),
+            ).fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                """
+                UPDATE xui_ip_limit_user_events
+                SET state='enforced', enforced_at=?, resolved_at=NULL
+                WHERE user_id=? AND state='warning'
+                """,
+                (_now_iso(), safe_user_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            conn.commit()
+            return dict(row)
+    except sqlite3.Error as e:
+        logger.error(
+            "Failed to enforce global XUI IP limit for user %s: %s",
+            user_id,
+            e,
+        )
+        return None
+
+
+def release_xui_ip_limit_users(
+    user_ids: list[int] | None = None,
+) -> list[dict]:
+    normalized_ids: list[int] | None = None
+    if user_ids is not None:
+        normalized_ids = []
+        for user_id in user_ids:
+            try:
+                normalized_ids.append(int(user_id))
+            except (TypeError, ValueError):
+                continue
+        normalized_ids = sorted(set(normalized_ids))
+        if not normalized_ids:
+            return []
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            where_sql = "state='enforced'"
+            params: list[int] = []
+            if normalized_ids is not None:
+                placeholders = ",".join("?" for _ in normalized_ids)
+                where_sql += f" AND user_id IN ({placeholders})"
+                params.extend(normalized_ids)
+            rows = cursor.execute(
+                f"""
+                SELECT user_id
+                FROM xui_ip_limit_user_events
+                WHERE {where_sql}
+                ORDER BY user_id
+                """,
+                params,
+            ).fetchall()
+            if not rows:
+                return []
+            released_ids = [int(row["user_id"]) for row in rows]
+            placeholders = ",".join("?" for _ in released_ids)
+            cursor.execute(
+                f"""
+                UPDATE xui_ip_limit_user_events
+                SET state='released', resolved_at=?
+                WHERE state='enforced'
+                  AND user_id IN ({placeholders})
+                """,
+                [_now_iso(), *released_ids],
+            )
+            conn.commit()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to release global XUI IP limits: %s", e)
+        return []
+
+
+def get_xui_ip_limit_user_events(limit: int = 100) -> list[dict]:
+    try:
+        safe_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        safe_limit = 100
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT e.*, u.username
+                FROM xui_ip_limit_user_events AS e
+                LEFT JOIN users AS u ON u.telegram_id=e.user_id
+                WHERE e.state <> 'candidate'
+                ORDER BY
+                    CASE e.state
+                        WHEN 'enforced' THEN 0
+                        WHEN 'warning' THEN 1
+                        ELSE 2
+                    END,
+                    e.last_exceeded_at DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as e:
+        logger.error("Failed to load global XUI IP-limit events: %s", e)
+        return []
+
+
+def prune_xui_ip_limit_user_history(retention_days: int = 7) -> int:
+    try:
+        safe_retention_days = max(1, int(retention_days))
+    except (TypeError, ValueError):
+        safe_retention_days = 7
+    cutoff = (
+        time_utils.get_msk_now() - timedelta(days=safe_retention_days)
+    ).isoformat()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM xui_ip_limit_user_events
+                WHERE state IN ('resolved', 'released')
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at < ?
+                """,
+                (cutoff,),
+            )
+            deleted = max(0, int(cursor.rowcount))
+            conn.commit()
+            return deleted
+    except sqlite3.Error as e:
+        logger.error("Failed to prune global XUI IP-limit history: %s", e)
+        return 0
 
 
 def get_xui_ip_limit_events(limit: int = 100) -> list[dict]:
@@ -2090,7 +2746,7 @@ def void_profit_distribution(distribution_id: int) -> bool:
                 """
                 UPDATE profit_distributions
                 SET status = 'void', updated_at = ?
-                WHERE distribution_id = ? AND status IN ('active', 'paid')
+                WHERE distribution_id = ? AND status = 'active'
                 """,
                 (_now_iso(), distribution_id),
             )
@@ -2232,7 +2888,7 @@ def is_global_xui_key(
         return True
 
     key_email = str(key.get("key_email") or "").lower()
-    if plan_id > 0 and "-global-" in key_email:
+    if "-global-" in key_email:
         return True
 
     if enabled_host_names is not None:
@@ -2271,6 +2927,22 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            # Referral deep links are untrusted input.  Only persist an existing
+            # user as the referrer; otherwise a fabricated numeric id would
+            # incorrectly make the new account eligible for the first-purchase
+            # referral discount.
+            validated_referrer_id = None
+            try:
+                candidate_referrer_id = int(referrer_id) if referrer_id else None
+            except (TypeError, ValueError):
+                candidate_referrer_id = None
+            if candidate_referrer_id and candidate_referrer_id != int(telegram_id):
+                cursor.execute(
+                    "SELECT 1 FROM users WHERE telegram_id = ?",
+                    (candidate_referrer_id,),
+                )
+                if cursor.fetchone():
+                    validated_referrer_id = candidate_referrer_id
             cursor.execute(
                 "SELECT telegram_id, subscription_token FROM users WHERE telegram_id = ?",
                 (telegram_id,),
@@ -2284,7 +2956,7 @@ def register_user_if_not_exists(telegram_id: int, username: str, referrer_id):
                         telegram_id,
                         username,
                         time_utils.get_msk_now(),
-                        referrer_id,
+                        validated_referrer_id,
                         token,
                     ),
                 )
@@ -2625,7 +3297,18 @@ def create_pending_transaction(
                     user_id,
                     "pending",
                     amount_rub,
-                    json.dumps(metadata),
+                    json.dumps(
+                        {
+                            **metadata,
+                            "fulfillment_protocol_version": 1,
+                            **(
+                                {"payment_confirmation_verified": False}
+                                if str(metadata.get("payment_method") or "").lower()
+                                == "cryptobot"
+                                else {}
+                            ),
+                        }
+                    ),
                     time_utils.get_msk_now(),
                 ),
             )
@@ -2636,6 +3319,131 @@ def create_pending_transaction(
         return 0
 
 
+def _cryptobot_identity(value) -> str | None:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text if text and len(text) <= 128 else None
+
+
+def _cryptobot_binding_protocol(metadata: dict) -> str:
+    if "cryptobot_binding_version" not in metadata and "cryptobot_binding_state" not in metadata:
+        return "legacy"
+    version = metadata.get("cryptobot_binding_version")
+    state = metadata.get("cryptobot_binding_state")
+    if type(version) is not int or version != 1 or not isinstance(state, str) or state not in {"creating", "bound"}:
+        return "invalid"
+    identity = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+    if (state == "bound" and identity is None) or (state == "creating" and identity is not None):
+        return "invalid"
+    return "v1"
+
+
+def _cryptobot_binding_state(row, metadata, invoice_id) -> str:
+    if not isinstance(metadata, dict):
+        return "mismatch"
+    if (str(metadata.get("payment_method") or "").lower() != "cryptobot"
+            or str(row["payment_method"] or "cryptobot").lower() != "cryptobot"):
+        return "mismatch"
+    identity = _cryptobot_identity(invoice_id)
+    if not identity:
+        return "mismatch"
+    saved = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+    protocol = _cryptobot_binding_protocol(metadata)
+    if protocol == "invalid":
+        return "mismatch"
+    if protocol == "v1" and metadata["cryptobot_binding_state"] == "creating":
+        return "awaiting_binding"
+    return "match" if saved is None or saved == identity else "mismatch"
+
+
+def _preserve_cryptobot_binding(stored: dict, incoming: dict) -> None:
+    """Binding is durable local evidence, never replaced by a caller snapshot."""
+    if not isinstance(stored, dict):
+        stored = {}
+    for key in ("cryptobot_binding_version", "cryptobot_binding_state", "cryptobot_invoice_id"):
+        if key in stored:
+            incoming[key] = stored[key]
+        else:
+            incoming.pop(key, None)
+
+
+def _cryptobot_amount_matches(metadata, paid_amount) -> bool:
+    try:
+        if isinstance(metadata.get("price"), bool) or isinstance(paid_amount, bool):
+            return False
+        expected = Decimal(str(metadata.get("price")))
+        paid = Decimal(str(paid_amount))
+        return (expected.is_finite() and paid.is_finite() and expected > 0 and paid > 0
+                and math.isfinite(float(expected)) and math.isfinite(float(paid))
+                and abs(expected - paid) <= Decimal("1"))
+    except (DecimalException, ValueError, TypeError, OverflowError):
+        return False
+
+
+def _cryptobot_invoice_used_elsewhere(conn, payment_id, invoice_id) -> bool:
+    identity = _cryptobot_identity(invoice_id)
+    if identity is None:
+        return True
+    # Use exactly the same normalizer for legacy stored values and incoming IDs.
+    # SQL trim() differs from Python strip() on tabs/newlines/Unicode whitespace.
+    rows = conn.execute(
+        """SELECT CASE WHEN json_valid(metadata)
+            THEN json_extract(metadata, '$.cryptobot_invoice_id') ELSE NULL END
+        FROM transactions WHERE payment_id != ?""",
+        (payment_id,),
+    )
+    return any(_cryptobot_identity(row[0]) == identity for row in rows)
+
+
+def get_cryptobot_binding_state(payment_id: str, invoice_id, paid_amount=None) -> str:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+            if not row:
+                return "missing"
+            metadata = json.loads(row["metadata"] or "{}")
+            state = _cryptobot_binding_state(row, metadata, invoice_id)
+            if state == "match" and paid_amount is not None and not _cryptobot_amount_matches(metadata, paid_amount):
+                return "amount_mismatch"
+            if state == "match" and _cryptobot_invoice_used_elsewhere(conn, payment_id, invoice_id):
+                return "mismatch"
+            return state
+    except (sqlite3.Error, ValueError, TypeError):
+        return "unavailable"
+
+
+def bind_cryptobot_invoice(payment_id: str, invoice_id) -> bool:
+    """Save the provider identity before publishing a new invoice's payment link."""
+    identity = _cryptobot_identity(invoice_id)
+    if not identity:
+        return False
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)).fetchone()
+            if not row or row["status"] != "pending":
+                return False
+            metadata = json.loads(row["metadata"] or "{}")
+            if (not isinstance(metadata, dict) or _cryptobot_binding_protocol(metadata) != "v1"
+                    or str(metadata.get("payment_method") or "").lower() != "cryptobot"
+                    or str(row["payment_method"] or "cryptobot").lower() != "cryptobot"):
+                return False
+            existing = _cryptobot_identity(metadata.get("cryptobot_invoice_id"))
+            if (existing is not None and existing != identity) or _cryptobot_invoice_used_elsewhere(conn, payment_id, identity):
+                return False
+            metadata.update(cryptobot_invoice_id=identity, cryptobot_binding_state="bound")
+            conn.execute("UPDATE transactions SET metadata=? WHERE payment_id=? AND status='pending'",
+                         (json.dumps(metadata), payment_id))
+            conn.commit()
+            return True
+    except (sqlite3.Error, ValueError, TypeError):
+        logger.error("Could not persist CryptoBot invoice binding")
+        return False
+
+
 def reserve_pending_transaction(
     payment_id: str,
     metadata: dict | None = None,
@@ -2644,10 +3452,16 @@ def reserve_pending_transaction(
     amount_currency: float | int | None = None,
     currency_name: str | None = None,
     allowed_statuses: tuple[str, ...] = ("pending",),
+    preserve_fulfillment_state: bool = False,
+    require_paid_confirmation: bool = False,
+    expected_cryptobot_invoice_id: str | None = None,
+    expected_cryptobot_amount=None,
 ) -> dict | None:
     """
     Atomically reserve a pending transaction for processing.
     Returns metadata if the transaction was reserved, otherwise None.
+    Provider retries can preserve local checkpoints from the current row,
+    rather than a snapshot read before another fulfillment attempt completed.
     """
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -2660,10 +3474,13 @@ def reserve_pending_transaction(
             )
             if not statuses:
                 return None
+            # Keep the read, attempt ownership and reservation together.
+            # No external work is performed while holding this write lock.
+            cursor.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" for _ in statuses)
             cursor.execute(
                 f"""
-                SELECT metadata FROM transactions
+                SELECT * FROM transactions
                 WHERE payment_id = ? AND status IN ({placeholders})
                 """,
                 (payment_id, *statuses),
@@ -2673,13 +3490,81 @@ def reserve_pending_transaction(
                 return None
 
             metadata_raw = row["metadata"]
-            if metadata is None:
+            if expected_cryptobot_invoice_id is not None:
+                try:
+                    binding_metadata = json.loads(metadata_raw or "{}")
+                except (ValueError, TypeError):
+                    return None
+                if (_cryptobot_binding_state(row, binding_metadata, expected_cryptobot_invoice_id) != "match"
+                        or not _cryptobot_amount_matches(binding_metadata, expected_cryptobot_amount)
+                        or _cryptobot_invoice_used_elsewhere(conn, payment_id, expected_cryptobot_invoice_id)):
+                    return None
+            if require_paid_confirmation:
+                try:
+                    confirmation_metadata = json.loads(metadata_raw or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                if not isinstance(confirmation_metadata, dict):
+                    return None
+                if not _paid_retry_is_confirmed(dict(row), confirmation_metadata):
+                    return None
+                if (str(confirmation_metadata.get("payment_method") or "").lower() == "cryptobot"
+                        and confirmation_metadata.get("cryptobot_invoice_id")
+                        and _cryptobot_invoice_used_elsewhere(conn, payment_id, confirmation_metadata["cryptobot_invoice_id"])):
+                    return None
+            if preserve_fulfillment_state:
+                try:
+                    stored_metadata = json.loads(metadata_raw) if metadata_raw else {}
+                except (TypeError, json.JSONDecodeError):
+                    logging.error("Cannot reserve payment with invalid local metadata")
+                    return None
+                if not isinstance(stored_metadata, dict):
+                    logging.error("Cannot reserve payment with non-object local metadata")
+                    return None
+                metadata_to_store = dict(stored_metadata)
+                metadata_to_store.update(metadata or {})
+                for key, value in stored_metadata.items():
+                    if key.startswith("fulfillment_") or key in {
+                        "accounting_applied",
+                        "recovered_from_interrupted_processing_at",
+                        "payment_confirmation_verified",
+                    }:
+                        metadata_to_store[key] = value
+                if "fulfillment_protocol_version" not in stored_metadata:
+                    # Provider metadata must not upgrade an ambiguous old order.
+                    metadata_to_store.pop("fulfillment_protocol_version", None)
+                metadata_to_store["processing_instance_id"] = (
+                    _PAYMENT_PROCESS_INSTANCE_ID
+                )
+            elif metadata is None:
                 try:
                     metadata_to_store = json.loads(metadata_raw) if metadata_raw else {}
                 except json.JSONDecodeError:
                     metadata_to_store = {}
             else:
-                metadata_to_store = metadata
+                metadata_to_store = dict(metadata)
+            if not isinstance(metadata_to_store, dict):
+                return None
+            # A reservation may carry fresh fulfillment data, but may not
+            # manufacture or erase a payment confirmation from caller input.
+            try:
+                confirmation_state = json.loads(metadata_raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                confirmation_state = {}
+            if (
+                isinstance(confirmation_state, dict)
+                and "payment_confirmation_verified" in confirmation_state
+            ):
+                metadata_to_store["payment_confirmation_verified"] = confirmation_state[
+                    "payment_confirmation_verified"
+                ]
+            else:
+                metadata_to_store.pop("payment_confirmation_verified", None)
+            _preserve_cryptobot_binding(confirmation_state, metadata_to_store)
+            if expected_cryptobot_invoice_id is not None:
+                # Claim a legacy invoice under the same DB write lock as reservation.
+                metadata_to_store["cryptobot_invoice_id"] = _cryptobot_identity(expected_cryptobot_invoice_id)
+            metadata_to_store["processing_attempt_id"] = uuid.uuid4().hex
             metadata_to_store["processing_started_at"] = (
                 time_utils.get_msk_now().isoformat()
             )
@@ -2719,10 +3604,147 @@ def reserve_pending_transaction(
         return None
 
 
+def _owned_processing_metadata(
+    conn: sqlite3.Connection, payment_id: str, expected_attempt_id: str | None
+) -> dict | None:
+    """Read the reservation for a caller, never grant it the current owner's id."""
+    row = conn.execute(
+        "SELECT status, metadata FROM transactions WHERE payment_id = ?",
+        (payment_id,),
+    ).fetchone()
+    if not row or row[0] != "processing":
+        return None
+    try:
+        stored = json.loads(row[1] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(stored, dict):
+        return None
+    if "processing_attempt_id" not in stored:
+        # Compatibility only for historical rows, never for a new reservation.
+        return stored if expected_attempt_id is None else None
+    owner = stored["processing_attempt_id"]
+    if (
+        not isinstance(owner, str)
+        or len(owner) != 32
+        or any(ch not in "0123456789abcdef" for ch in owner)
+        or owner != expected_attempt_id
+    ):
+        return None
+    return stored
+
+
+def is_reserved_transaction_owner(payment_id: str, metadata: dict) -> bool:
+    """Check ownership without changing transaction or caller state."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            return _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            ) is not None
+    except sqlite3.Error:
+        logger.exception("Failed to check payment attempt ownership")
+        return False
+
+
+def _cryptobot_payment_is_confirmed(row: dict, metadata: dict) -> bool:
+    """Use a durable verified receipt, or conservative evidence for old orders."""
+    protocol = _cryptobot_binding_protocol(metadata)
+    if protocol == "invalid" or (protocol == "v1" and metadata["cryptobot_binding_state"] != "bound"):
+        return False
+    if "payment_confirmation_verified" in metadata:
+        return metadata["payment_confirmation_verified"] is True
+    if (
+        str(row.get("payment_method") or "").lower() != "cryptobot"
+        or metadata.get("provider_payment_id") != row.get("payment_id")
+        or not metadata.get("cryptobot_invoice_id")
+        or str(row.get("currency_name") or "").upper() != "RUB"
+    ):
+        return False
+    try:
+        paid = Decimal(str(row.get("amount_currency")))
+        price = Decimal(str(metadata.get("price")))
+        return (
+            paid.is_finite()
+            and price.is_finite()
+            and paid > 0
+            and price > 0
+            and abs(paid - price) <= Decimal("1")
+        )
+    except (DecimalException, ValueError, TypeError, OverflowError):
+        return False
+
+
+def _paid_retry_is_confirmed(row: dict, metadata: dict) -> bool:
+    method = str(metadata.get("payment_method") or "").lower()
+    if not metadata.get("provider_payment_id"):
+        return False
+    if method == "telegram stars":
+        return True
+    return method == "cryptobot" and _cryptobot_payment_is_confirmed(row, metadata)
+
+
+def _processing_fulfillment_is_allowed(
+    conn: sqlite3.Connection, payment_id: str, stored: dict
+) -> bool:
+    row = conn.execute(
+        "SELECT * FROM transactions WHERE payment_id = ?", (payment_id,)
+    )
+    values = row.fetchone()
+    if values is None:
+        return False
+    item = dict(zip((column[0] for column in row.description), values))
+    # Check both representations so a caller cannot hide CryptoBot by changing
+    # its metadata method while the reserved transaction still names it.
+    if "cryptobot" in {
+        str(stored.get("payment_method") or "").lower(),
+        str(item.get("payment_method") or "").lower(),
+    }:
+        if (stored.get("cryptobot_invoice_id") and _cryptobot_invoice_used_elsewhere(
+                conn, payment_id, stored["cryptobot_invoice_id"])):
+            return False
+        return _cryptobot_payment_is_confirmed(item, stored)
+    return True
+
+
+def is_reserved_transaction_fulfillment_allowed(payment_id: str, metadata: dict) -> bool:
+    """Verify ownership and payment confirmation before external fulfillment."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN")
+            stored = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            )
+            return stored is not None and _processing_fulfillment_is_allowed(
+                conn, payment_id, stored
+            )
+    except sqlite3.Error:
+        logger.exception("Failed to check payment fulfillment permission")
+        return False
+
+
 def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> bool:
     """Persist resumable fulfillment state while a transaction is processing."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stored = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
+            )
+            if stored is None:
+                return False
+            metadata_to_store = dict(metadata)
+            _preserve_cryptobot_binding(stored, metadata_to_store)
+            if (
+                "payment_confirmation_verified" in stored
+                and "payment_confirmation_verified" not in metadata_to_store
+            ):
+                metadata_to_store["payment_confirmation_verified"] = stored[
+                    "payment_confirmation_verified"
+                ]
+            if stored.get("accounting_applied"):
+                metadata_to_store["accounting_applied"] = True
+            if stored.get("payment_confirmation_verified") is True:
+                metadata_to_store["payment_confirmation_verified"] = True
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -2730,7 +3752,7 @@ def update_reserved_transaction_metadata(payment_id: str, metadata: dict) -> boo
                 SET metadata = ?
                 WHERE payment_id = ? AND status = 'processing'
                 """,
-                (json.dumps(metadata), payment_id),
+                (json.dumps(metadata_to_store), payment_id),
             )
             conn.commit()
             return cursor.rowcount == 1
@@ -2751,6 +3773,56 @@ def recover_stale_processing_transactions(
     Payment fulfillment persists an absolute target before touching a panel, so
     global and single-host XUI/MTG purchases can all be resumed safely.
     """
+    # Flag acquisition/release uses this same owner-lock -> SQLite order.
+    # Keep the active-owner decision and CAS transition in one critical section.
+    # This protects workers already registered here; existing durable attempt
+    # fencing remains responsible for a late worker which has not registered yet.
+    with _pending_payment_owners_lock:
+        return _recover_stale_processing_transactions_locked(older_than_minutes)
+
+
+def _processing_user_active_locked(row) -> bool:
+    try:
+        user_id = int(row["user_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    # Another live order for this user is also a reason to postpone recovery.
+    # Membership matters: None is a real legacy owner, not an absent record.
+    return user_id in _pending_payment_owners
+
+
+def _processing_started_at(metadata, row):
+    # Diagnostic metadata is untrusted: do not send a malformed date or payload
+    # into the general date parser, which logs its input on parsing failures.
+    for value in (metadata.get("processing_started_at"), row["created_date"]):
+        if not isinstance(value, str):
+            continue
+        try:
+            started = datetime.fromisoformat(value)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            return time_utils.to_msk(started)
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return None
+
+
+def _valid_recovery_target(metadata) -> bool:
+    target = metadata.get("fulfillment_target_expiry_ms")
+    if isinstance(target, bool):
+        return False
+    # The writer saves integer milliseconds. Digit-only historical strings are
+    # safe without coercing floats, booleans, exponents or malformed targets.
+    if not (isinstance(target, int) or (
+            isinstance(target, str) and target.isascii() and target.isdigit())):
+        return False
+    try:
+        return 0 < int(target) <= 253402300799999
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _recover_stale_processing_transactions_locked(older_than_minutes: int) -> int:
     cutoff = time_utils.get_msk_now() - timedelta(
         minutes=max(5, int(older_than_minutes))
     )
@@ -2761,7 +3833,7 @@ def recover_stale_processing_transactions(
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT payment_id, metadata, created_date
+                SELECT payment_id, user_id, metadata, created_date
                 FROM transactions
                 WHERE status = 'processing'
                   AND metadata IS NOT NULL
@@ -2771,18 +3843,18 @@ def recover_stale_processing_transactions(
             for row in cursor.fetchall():
                 try:
                     metadata = json.loads(row["metadata"] or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
                     continue
                 if not metadata.get("provider_payment_id"):
                     continue
-                if not metadata.get("fulfillment_target_expiry_ms"):
+                if not _valid_recovery_target(metadata):
+                    continue
+                if _processing_user_active_locked(row):
                     continue
 
-                started_at = time_utils.parse_iso_to_msk(
-                    metadata.get("processing_started_at")
-                )
-                if not started_at:
-                    started_at = time_utils.parse_iso_to_msk(row["created_date"])
+                started_at = _processing_started_at(metadata, row)
                 if not started_at or started_at > cutoff:
                     continue
 
@@ -2794,14 +3866,127 @@ def recover_stale_processing_transactions(
                     UPDATE transactions
                     SET status = 'pending', metadata = ?
                     WHERE payment_id = ? AND status = 'processing'
+                      AND metadata = ?
                     """,
-                    (json.dumps(metadata), row["payment_id"]),
+                    (json.dumps(metadata), row["payment_id"], row["metadata"]),
                 )
                 recovered += cursor.rowcount
             conn.commit()
         return recovered
     except sqlite3.Error as e:
         logging.error("Failed to recover stale processing transactions: %s", e)
+        return 0
+
+
+def get_payment_recovery_diagnostics(older_than_minutes: int = 15) -> dict:
+    """Read-only operational counts, never identities or authorization to retry.
+
+    A recoverable count means the existing stale-recovery shape is present, not
+    that payment confirmation/fulfillment gates can be skipped. Malformed and
+    pre-target orders remain untouched for manual/provider reconciliation.
+    """
+    counts = {"stale_active": 0, "stale_recoverable": 0,
+              "stale_manual_review": 0, "invalid_processing_state": 0}
+    cutoff = time_utils.get_msk_now() - timedelta(minutes=max(5, int(older_than_minutes)))
+    try:
+        # Keep the same lock order as recovery and user-flag acquisition.
+        with _pending_payment_owners_lock:
+            with sqlite3.connect(Path(DB_FILE).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("SELECT user_id, metadata, created_date FROM transactions WHERE status='processing'").fetchall()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = None
+                if not isinstance(metadata, dict):
+                    counts["invalid_processing_state"] += 1
+                    continue
+                started = _processing_started_at(metadata, row)
+                if not started:
+                    counts["invalid_processing_state"] += 1
+                    continue
+                if started > cutoff:
+                    continue
+                if _processing_user_active_locked(row):
+                    counts["stale_active"] += 1
+                elif metadata.get("provider_payment_id") and _valid_recovery_target(metadata):
+                    counts["stale_recoverable"] += 1
+                else:
+                    counts["stale_manual_review"] += 1
+        return counts
+    except sqlite3.Error:
+        logger.error("Payment recovery diagnostics unavailable")
+        return {**counts, "unavailable": True}
+
+
+def recover_pre_fulfillment_yookassa_on_startup() -> int:
+    """Recover new YooKassa orders before starting any payment workers.
+
+    Only call at single-process application startup after the previous process
+    has stopped. A different instance id alone is not proof that it has stopped.
+    Legacy orders without an original protocol marker remain untouched.
+    """
+    recovered = 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT payment_id, metadata
+                FROM transactions
+                WHERE status = 'processing' AND payment_method = 'YooKassa'
+                """
+            )
+            for row in cursor.fetchall():
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
+                    continue
+                version = metadata.get("fulfillment_protocol_version")
+                owner = metadata.get("processing_instance_id")
+                if (
+                    type(version) is not int
+                    or version != 1
+                    or not isinstance(owner, str)
+                    or len(owner) != 32
+                    or any(ch not in "0123456789abcdef" for ch in owner)
+                    or owner == _PAYMENT_PROCESS_INSTANCE_ID
+                    or metadata.get("payment_method") != "YooKassa"
+                    or metadata.get("provider_payment_id") != row["payment_id"]
+                    or metadata.get("service_type") not in ("xui", "mtg")
+                    or "fulfillment_target_expiry_ms" in metadata
+                    or metadata.get("accounting_applied")
+                ):
+                    continue
+                # Only the protocol marker and a Telegram status notification
+                # are possible before the target is durably saved.
+                if any(
+                    key.startswith("fulfillment_")
+                    and key not in {
+                        "fulfillment_protocol_version",
+                        "fulfillment_status_message_sent_at",
+                    }
+                    for key in metadata
+                ):
+                    continue
+                metadata["recovered_from_interrupted_processing_at"] = _now_iso()
+                cursor.execute(
+                    """
+                    UPDATE transactions SET status = 'pending', metadata = ?
+                    WHERE payment_id = ? AND status = 'processing'
+                      AND metadata = ?
+                    """,
+                    (json.dumps(metadata), row["payment_id"], row["metadata"]),
+                )
+                recovered += cursor.rowcount
+            conn.commit()
+        return recovered
+    except sqlite3.Error as e:
+        logger.error("Failed to recover early YooKassa orders at startup: %s", e)
         return 0
 
 
@@ -2820,29 +4005,20 @@ def apply_payment_accounting_once(
     referrer_id: int | None,
     referral_reward: float,
     metadata: dict,
-) -> bool:
-    """Atomically apply purchase stats/referral credit once per provider payment."""
+) -> bool | None:
+    """True: applied now; False: already applied; None: caller cannot proceed."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute(
-                """
-                SELECT status, metadata
-                FROM transactions
-                WHERE payment_id = ?
-                """,
-                (payment_id,),
+            stored_metadata = _owned_processing_metadata(
+                conn, payment_id, metadata.get("processing_attempt_id")
             )
-            row = cursor.fetchone()
-            if not row or row["status"] != "processing":
+            if stored_metadata is None:
                 conn.rollback()
-                return False
-            try:
-                stored_metadata = json.loads(row["metadata"] or "{}")
-            except json.JSONDecodeError:
-                stored_metadata = {}
+                return None
+            if not _processing_fulfillment_is_allowed(conn, payment_id, stored_metadata):
+                return None
             if stored_metadata.get("accounting_applied"):
                 metadata["accounting_applied"] = True
                 conn.rollback()
@@ -2873,6 +4049,13 @@ def apply_payment_accounting_once(
                 )
 
             metadata["accounting_applied"] = True
+            if "payment_confirmation_verified" in stored_metadata:
+                metadata["payment_confirmation_verified"] = stored_metadata[
+                    "payment_confirmation_verified"
+                ]
+            else:
+                metadata.pop("payment_confirmation_verified", None)
+            _preserve_cryptobot_binding(stored_metadata, metadata)
             stored_metadata.update(metadata)
             cursor.execute(
                 """
@@ -2884,14 +4067,14 @@ def apply_payment_accounting_once(
             )
             if cursor.rowcount != 1:
                 conn.rollback()
-                return False
+                return None
             conn.commit()
             return True
     except sqlite3.Error as e:
         logging.error(
             "Failed to apply accounting for payment %s: %s", payment_id, e
         )
-        return False
+        return None
 
 
 def finalize_reserved_transaction(
@@ -2902,6 +4085,7 @@ def finalize_reserved_transaction(
     payment_method: str | None = None,
     amount_currency: float | int | None = None,
     currency_name: str | None = None,
+    expected_attempt_id: str | None = None,
 ) -> bool:
     """
     Complete a reserved transaction.
@@ -2911,6 +4095,32 @@ def finalize_reserved_transaction(
     target_status = "paid" if success else "pending"
     try:
         with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if metadata is not None:
+                metadata_attempt_id = metadata.get("processing_attempt_id")
+                if (
+                    expected_attempt_id is not None
+                    and expected_attempt_id != metadata_attempt_id
+                ):
+                    return False
+                expected_attempt_id = metadata_attempt_id
+            stored = _owned_processing_metadata(conn, payment_id, expected_attempt_id)
+            if stored is None:
+                return False
+            if success and not _processing_fulfillment_is_allowed(conn, payment_id, stored):
+                return False
+            metadata_to_store = None
+            if metadata is not None:
+                metadata_to_store = dict(metadata)
+                _preserve_cryptobot_binding(stored, metadata_to_store)
+                if "payment_confirmation_verified" not in stored:
+                    metadata_to_store.pop("payment_confirmation_verified", None)
+                for key, value in stored.items():
+                    if key.startswith("fulfillment_") or key in {
+                        "accounting_applied",
+                        "payment_confirmation_verified",
+                    }:
+                        metadata_to_store[key] = value
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -2928,7 +4138,7 @@ def finalize_reserved_transaction(
                 """,
                 (
                     target_status,
-                    json.dumps(metadata) if metadata is not None else None,
+                    json.dumps(metadata_to_store) if metadata_to_store is not None else None,
                     payment_method,
                     amount_currency,
                     currency_name,
@@ -3130,12 +4340,19 @@ def get_pending_paid_retry_transactions(limit: int = 100) -> list[dict]:
                 item = dict(row)
                 try:
                     metadata = json.loads(item.get("metadata") or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(metadata, dict):
                     continue
                 method = str(metadata.get("payment_method") or "").lower()
                 if method not in {"telegram stars", "cryptobot"}:
                     continue
                 if not metadata.get("provider_payment_id"):
+                    continue
+                if not _paid_retry_is_confirmed(item, metadata):
+                    continue
+                if (method == "cryptobot" and metadata.get("cryptobot_invoice_id")
+                        and _cryptobot_invoice_used_elsewhere(conn, item["payment_id"], metadata["cryptobot_invoice_id"])):
                     continue
                 item["metadata_dict"] = metadata
                 transactions.append(item)
@@ -3356,7 +4573,7 @@ def add_new_key(
             existing_key = get_key_by_email(key_email)
             if existing_key:
                 # Key already exists: update it instead of failing
-                updated = update_key_by_email(
+                updated = merge_provisioned_key_by_email(
                     key_email=key_email,
                     host_name=host_name,
                     xui_client_uuid=xui_client_uuid,
@@ -3372,7 +4589,7 @@ def add_new_key(
             return None
         if (
             "idx_vpn_keys_user_host_paid_unique" in message
-            or "UNIQUE constraint failed: vpn_keys.user_id, vpn_keys.host_name"
+            or "UNIQUE constraint failed: vpn_keys.user_id, vpn_keys.service_type, vpn_keys.host_name"
             in message
         ):
             try:
@@ -3380,12 +4597,12 @@ def add_new_key(
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     cursor.execute(
-                        "SELECT key_id, key_email FROM vpn_keys WHERE user_id = ? AND host_name = ? AND plan_id > 0 ORDER BY key_id DESC LIMIT 1",
-                        (user_id, host_name),
+                        "SELECT key_id, key_email FROM vpn_keys WHERE user_id = ? AND service_type = ? AND host_name = ? AND plan_id > 0 ORDER BY key_id DESC LIMIT 1",
+                        (user_id, service_type, host_name),
                     )
                     existing = cursor.fetchone()
                 if existing:
-                    updated = update_key_by_email(
+                    updated = merge_provisioned_key_by_email(
                         key_email=existing["key_email"],
                         host_name=host_name,
                         xui_client_uuid=xui_client_uuid,
@@ -3412,6 +4629,64 @@ def add_new_key(
     except sqlite3.Error as e:
         logging.error(f"Failed to add new key for user {user_id}: {e}")
         return None
+
+
+def merge_provisioned_key_by_email(
+    key_email: str,
+    host_name: str,
+    xui_client_uuid: str,
+    expiry_timestamp_ms: int,
+    connection_string: str | None = None,
+    plan_id: int = 0,
+):
+    """Persist an insert race without undoing a newer grant or client identity.
+
+    Explicit admin shortening uses update_key_info, not this insert/repair path.
+    Read and merge under one SQLite write transaction, including trial markers.
+    """
+    try:
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute(
+                "SELECT * FROM vpn_keys WHERE key_email = ?", (key_email,)
+            ).fetchone()
+            if not old:
+                return False
+            if (
+                old["host_name"] != host_name
+                or old["xui_client_uuid"] != xui_client_uuid
+            ):
+                logging.error(
+                    "Provisioning conflict has a different identity; existing key retained."
+                )
+                return False
+            old_expiry = time_utils.parse_iso_to_msk(old["expiry_date"])
+            if not old_expiry:
+                return False
+            old_ms = time_utils.get_timestamp_ms(old_expiry)
+            target_ms = max(old_ms, int(expiry_timestamp_ms))
+            old_plan = int(old["plan_id"] or 0)
+            incoming_plan = int(plan_id or 0)
+            # A late trial must never demote an already assigned tariff.
+            target_plan = old_plan if old_plan > 0 else incoming_plan
+            if target_ms != old_ms or target_plan != old_plan:
+                conn.execute(
+                    "UPDATE vpn_keys SET expiry_date = ?, plan_id = ? WHERE key_id = ?",
+                    (
+                        time_utils.from_timestamp_ms(target_ms),
+                        target_plan,
+                        old["key_id"],
+                    ),
+                )
+            conn.execute(
+                "DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,)
+            )
+            conn.commit()
+            return True
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        logging.error("Failed to merge provisioned key: %s", e)
+        return False
 
 
 def update_key_by_email(
@@ -3443,11 +4718,14 @@ def update_key_by_email(
                     "UPDATE vpn_keys SET host_name = ?, xui_client_uuid = ?, expiry_date = ?, plan_id = ? WHERE key_email = ?",
                     (host_name, xui_client_uuid, expiry_date, plan_id, key_email),
                 )
+            updated_count = cursor.rowcount
+            if updated_count != 1:
+                return False
             cursor.execute(
                 "DELETE FROM vpn_keys_missing WHERE key_email = ?", (key_email,)
             )
             conn.commit()
-            return True
+            return updated_count == 1
     except sqlite3.Error as e:
         logging.error(f"Failed to update key by email {key_email}: {e}")
         return False
@@ -4337,28 +5615,34 @@ def get_idle_onboarding_users(
         return []
 
 
-def ban_user(telegram_id: int):
+def ban_user(telegram_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET is_banned = 1 WHERE telegram_id = ?", (telegram_id,)
             )
+            updated = cursor.rowcount > 0
             conn.commit()
+            return updated
     except sqlite3.Error as e:
         logging.error(f"Failed to ban user {telegram_id}: {e}")
+        return False
 
 
-def unban_user(telegram_id: int):
+def unban_user(telegram_id: int) -> bool:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET is_banned = 0 WHERE telegram_id = ?", (telegram_id,)
             )
+            updated = cursor.rowcount > 0
             conn.commit()
+            return updated
     except sqlite3.Error as e:
         logging.error(f"Failed to unban user {telegram_id}: {e}")
+        return False
 
 
 def delete_user_keys(user_id: int) -> bool:
@@ -4367,6 +5651,9 @@ def delete_user_keys(user_id: int) -> bool:
             cursor = conn.cursor()
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
+            )
+            cursor.execute(
+                "DELETE FROM xui_ip_limit_user_events WHERE user_id = ?", (user_id,)
             )
             cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
             conn.commit()
@@ -4400,6 +5687,7 @@ def delete_keys_by_ids(key_ids: list[int]) -> int:
 
 
 def delete_user_everywhere(user_id: int) -> bool:
+    """Delete an operational user profile while preserving the payment ledger."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
@@ -4408,9 +5696,13 @@ def delete_user_everywhere(user_id: int) -> bool:
                 "UPDATE users SET referred_by = NULL WHERE referred_by = ?", (user_id,)
             )
             cursor.execute("DELETE FROM support_threads WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            # Transactions are accounting records. Removing them would rewrite
+            # historical revenue and invalidate closed profit distributions.
             cursor.execute(
                 "DELETE FROM xui_ip_limit_events WHERE user_id = ?", (user_id,)
+            )
+            cursor.execute(
+                "DELETE FROM xui_ip_limit_user_events WHERE user_id = ?", (user_id,)
             )
             cursor.execute("DELETE FROM vpn_keys WHERE user_id = ?", (user_id,))
             cursor.execute(
@@ -4555,7 +5847,23 @@ def cleanup_notifications(days_to_keep: int = 30):
 # ============================================================================
 
 
-def set_pending_payment(user_id: int, is_pending: bool) -> bool:
+def set_pending_payment(
+    user_id: int, is_pending: bool, *, owner: str | None = None
+) -> bool:
+    """Acquire or release the user's flag without releasing another owner.
+
+    Ownership is process-local under the supported single-process deployment.
+    Startup clears abandoned database flags before workers are started.
+    """
+    with _pending_payment_owners_lock:
+        if not is_pending and _pending_payment_owners.get(user_id) != owner:
+            return False
+        return _set_pending_payment_locked(user_id, is_pending, owner)
+
+
+def _set_pending_payment_locked(
+    user_id: int, is_pending: bool, owner: str | None
+) -> bool:
     """
     Set or clear pending payment flag to prevent race conditions when multiple
     payment webhooks arrive simultaneously for the same user.
@@ -4581,6 +5889,10 @@ def set_pending_payment(user_id: int, is_pending: bool) -> bool:
                 )
             conn.commit()
             if cursor.rowcount > 0:
+                if is_pending:
+                    _pending_payment_owners[user_id] = owner
+                else:
+                    _pending_payment_owners.pop(user_id, None)
                 logging.info(
                     f"Pending payment flag for user {user_id} set to {is_pending}"
                 )
@@ -4626,6 +5938,12 @@ def get_pending_payment_status(user_id: int) -> bool:
 
 
 def clear_all_pending_payments() -> int:
+    """Reset abandoned flags and local owners before starting any workers."""
+    with _pending_payment_owners_lock:
+        return _clear_all_pending_payments_locked()
+
+
+def _clear_all_pending_payments_locked() -> int:
     """
     Clear pending payment flags for all users.
     Used on startup to ensure no stale flags remain.
@@ -4638,6 +5956,7 @@ def clear_all_pending_payments() -> int:
                 "UPDATE users SET pending_payment = 0 WHERE pending_payment = 1"
             )
             conn.commit()
+            _pending_payment_owners.clear()
             affected = cursor.rowcount
             if affected > 0:
                 logging.info(

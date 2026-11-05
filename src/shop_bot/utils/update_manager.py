@@ -2,8 +2,6 @@ import logging
 import os
 import re
 import subprocess
-import sys
-import threading
 import time
 from pathlib import Path
 
@@ -27,6 +25,7 @@ def _run_command(
         text=True,
         check=False,
         cwd=str(cwd) if cwd else None,
+        timeout=30,
     )
 
 
@@ -109,88 +108,17 @@ def check_for_updates() -> dict:
 
 
 def perform_update() -> dict:
-    """
-    Performs `git fetch`, `git reset --hard`, `pip install`, and restarts the application.
-    This method ensures that any local modifications on the server are overwritten
-    by the latest version from GitHub.
-    """
-    try:
-        if os.getenv("ENABLE_WEB_UPDATES", "").strip().lower() not in _TRUTHY_VALUES:
-            return {
-                "status": "error",
-                "message": (
-                    "Web-обновления отключены в production. "
-                    "Используйте CI/CD или включите ENABLE_WEB_UPDATES=true вручную."
-                ),
-            }
-
-        _run_command(
-            [
-                "git",
-                "config",
-                "--global",
-                "--add",
-                "safe.directory",
-                _SAFE_GIT_DIRECTORY,
-            ]
-        )
-
-        is_dirty, details = _worktree_has_local_changes()
-        if is_dirty:
-            return {
-                "status": "error",
-                "message": (
-                    "Обновление отменено: в рабочем дереве есть локальные изменения. "
-                    f"Сначала разберите их вручную. Примеры: {details}"
-                ),
-            }
-
-        # 2. Fetch latest changes
-        logger.info("Fetching latest changes from GitHub...")
-        fetch_result = _run_command(["git", "fetch", "origin", "main"], cwd=_REPO_ROOT)
-        if fetch_result.returncode != 0:
-            return {
-                "status": "error",
-                "message": f"Git Fetch Failed: {(fetch_result.stderr or fetch_result.stdout or '').strip()}",
-            }
-
-        # 3. Reset --hard to origin/main (to overwrite local conflicts)
-        logger.info("Resetting local state to match GitHub (Force Update)...")
-        result = _run_command(["git", "reset", "--hard", "origin/main"], cwd=_REPO_ROOT)
-
-        if result.returncode != 0:
-            return {"status": "error", "message": f"Git Reset Failed: {result.stderr}"}
-
-        # 4. Pip Install in editable mode to accept new dependencies and keep volume sync
-        logger.info("Updating dependencies...")
-        install_result = _run_command(
-            [sys.executable, "-m", "pip", "install", "-e", "."], cwd=_REPO_ROOT
-        )
-
-        if install_result.returncode != 0:
-            logger.error("Dependency update failed: %s", install_result.stderr)
-            return {
-                "status": "error",
-                "message": (
-                    "Обновление прервано: зависимости не установились. "
-                    f"{(install_result.stderr or install_result.stdout or '').strip()}"
-                ),
-            }
-
-        logger.info("Update successful. Triggering restart in 3 seconds...")
-
-        def delayed_restart():
-            time.sleep(3)
-            logger.info("Restarting process now...")
-            os._exit(0)  # Forced exit to trigger Docker restart
-
-        threading.Thread(target=delayed_restart, daemon=True).start()
-
+    """Fail closed: releases require a verified image and a data-preserving rollback."""
+    if os.getenv("ENABLE_WEB_UPDATES", "").strip().lower() not in _TRUTHY_VALUES:
         return {
-            "status": "success",
-            "message": "Обновление скачано. Бот перезагрузится через несколько секунд...",
+            "status": "error",
+            "message": "Web-обновления отключены в production. Используйте проверенный образ приложения.",
         }
-
-    except Exception as e:
-        logger.error("Update failed: %s", e)
-        return {"status": "error", "message": str(e)}
+    return {
+        "status": "error",
+        "message": (
+            "Изменение работающих исходников через git/pip запрещено. "
+            "Обновите проверенный образ после резервного копирования; "
+            "откат должен сохранять текущую базу."
+        ),
+    }

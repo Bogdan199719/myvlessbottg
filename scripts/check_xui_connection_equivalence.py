@@ -27,10 +27,15 @@ BASE = (
 
 
 def main() -> int:
-    normalized_null_sniffing = _normalize_inbound_payload({"sniffing": None})
-    if normalized_null_sniffing.get("sniffing") != {"enabled": False}:
+    normalized_empty_fields = _normalize_inbound_payload(
+        {"streamSettings": None, "sniffing": {}}
+    )
+    if normalized_empty_fields.get("streamSettings") != "":
+        print("\nERROR: null inbound stream settings were not normalized.")
+        return 1
+    if normalized_empty_fields.get("sniffing") != {"enabled": False}:
         print(
-            "\nERROR: null inbound sniffing was not normalized to a disabled object."
+            "\nERROR: empty inbound sniffing was not normalized to a disabled object."
         )
         return 1
 
@@ -65,6 +70,12 @@ def main() -> int:
             "transport changes are not equivalent",
             BASE,
             BASE.replace("type=tcp", "type=xhttp"),
+            False,
+        ),
+        (
+            "missing Vision flow requires saved link refresh",
+            BASE.replace("&flow=xtls-rprx-vision", ""),
+            BASE,
             False,
         ),
     ]

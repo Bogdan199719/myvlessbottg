@@ -2,10 +2,15 @@ import uuid
 import time
 import json
 import asyncio
+import hashlib
+import hmac
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from shop_bot.utils import time_utils
 import logging
+import threading
+from functools import wraps
 from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from typing import List, Dict
 
@@ -18,8 +23,53 @@ from shop_bot.data_manager.database import (
     get_keys_for_host,
     update_key_by_email,
 )
+from shop_bot.modules.host_selector import panel_group_key
+from shop_bot.modules import subscription_operations
 
 logger = logging.getLogger(__name__)
+
+# A panel can replace an entire inbound from a stale snapshot. Keep every
+# read-modify-write on that physical panel in one worker thread at a time.
+# The lock belongs to the worker, so cancelling an awaiting coroutine cannot
+# release it while the HTTP request is still running.
+_panel_write_locks: dict[str, threading.Lock] = {}
+_panel_write_locks_guard = threading.Lock()
+
+
+def _get_panel_write_lock(host_url: str) -> threading.Lock:
+    panel_key = panel_group_key(host_url)
+    with _panel_write_locks_guard:
+        return _panel_write_locks.setdefault(panel_key, threading.Lock())
+
+
+def _serialize_host_write(operation):
+    @wraps(operation)
+    def guarded(host_name: str, *args, **kwargs):
+        host = get_host(host_name)
+        if not host:
+            return operation(host_name, *args, **kwargs)
+        with _get_panel_write_lock(host["host_url"]):
+            return operation(host_name, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_host_info_write(operation):
+    @wraps(operation)
+    def guarded(host_info: dict, *args, **kwargs):
+        with _get_panel_write_lock(host_info["host_url"]):
+            return operation(host_info, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_preflight_write(operation):
+    @wraps(operation)
+    def guarded(host_url: str, *args, **kwargs):
+        with _get_panel_write_lock(host_url):
+            return operation(host_url, *args, **kwargs)
+
+    return guarded
 
 
 # Error rate limiting: track last error per host to avoid log spam
@@ -30,6 +80,8 @@ _BEARER_FAILURE_CACHE_SECONDS = 300
 _XUI_LOGIN_ATTEMPTS = 3
 _XUI_LOGIN_RETRY_DELAYS_SECONDS = (1, 2)
 _LINK_FETCH_MAX_WORKERS = 6
+_SERVER_REMARK_MAX_LENGTH = 100
+_IP_ACTIVITY_FINGERPRINT_KEY = secrets.token_bytes(32)
 _TRANSIENT_NETWORK_ERROR_MARKERS = (
     "connection aborted",
     "connection reset",
@@ -143,13 +195,25 @@ def get_country_flag_by_host(host_name: str) -> str:
 
 
 def _build_server_remark(host_name: str) -> str:
+    """Build a client-visible server name without discarding Unicode.
+
+    An explicitly supplied country flag is part of the administrator's chosen
+    name and must not be duplicated. Names without a known flag keep their
+    original text and receive the country detected from their city/country
+    alias. Only URI-breaking control characters are replaced.
+    """
     country_flag = get_country_flag_by_host(host_name)
-    clean_server_name = (
-        host_name.replace(" ", "").encode("ascii", "ignore").decode("ascii")
+    display_name = "".join(
+        " " if ord(character) < 32 or ord(character) == 127 else character
+        for character in str(host_name or "")
     )
-    clean_server_name = "".join(c for c in clean_server_name if c.isalnum() or c == "_")
-    clean_server_name = clean_server_name.lstrip("_")
-    return f"{country_flag}{clean_server_name}"
+    display_name = display_name.strip()[:_SERVER_REMARK_MAX_LENGTH]
+
+    if any(flag in display_name for flag in COUNTRY_FLAGS):
+        return display_name
+    if not display_name:
+        return country_flag
+    return f"{country_flag} {display_name}"[:_SERVER_REMARK_MAX_LENGTH]
 
 
 def _replace_link_remark(connection_string: str, remark: str) -> str:
@@ -204,7 +268,23 @@ def connection_strings_equivalent(left: str | None, right: str | None) -> bool:
             result[key] = value
         return result
 
-    return _stable_query(left_parts.query) == _stable_query(right_parts.query)
+    if _stable_query(left_parts.query) != _stable_query(right_parts.query):
+        return False
+
+    if left_parts.fragment == right_parts.fragment:
+        return True
+
+    # 3x-ui may rotate sid/spx and return its own remark in the same refresh.
+    # Treat that combined response as equivalent, but keep a remark-only change
+    # significant so an intentional host rename is saved for clients.
+    def _volatile_query(query: str) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in parse_qsl(query, keep_blank_values=True)
+            if key in volatile_params
+        }
+
+    return _volatile_query(left_parts.query) != _volatile_query(right_parts.query)
 
 
 def _log_host_error(host_url: str, error: Exception) -> None:
@@ -241,37 +321,6 @@ def _is_transient_network_error(error: Exception) -> bool:
         return True
 
     return any(marker in error_msg for marker in _TRANSIENT_NETWORK_ERROR_MARKERS)
-
-
-def _attach_bearer_auth(api: Api, api_token: str) -> None:
-    """
-    Teach py3xui's current request layer to use 3x-ui v3 Bearer tokens.
-
-    py3xui 0.4.x only knows session-cookie requests. The 3x-ui panel now
-    accepts Authorization: Bearer <apiToken> under /panel/api/* and bypasses
-    CSRF for those callers. Keeping this adapter local lets existing cookie
-    login keep working for older panels.
-    """
-    token = api_token.strip()
-    if not token:
-        return
-
-    for api_part in (api.client, api.inbound, api.database, api.server):
-        original_request = api_part._request_with_retry
-
-        def _request_with_bearer(
-            method, url, headers, _original=original_request, **kwargs
-        ):
-            auth_headers = dict(headers or {})
-            auth_headers["Authorization"] = f"Bearer {token}"
-            return _original(method, url, auth_headers, **kwargs)
-
-        api_part.session = "__bearer_token__"
-        api_part.cookie_name = None
-        api_part._request_with_retry = _request_with_bearer
-
-    api.session = "__bearer_token__"
-    api.cookie_name = None
 
 
 def _bearer_recently_failed(host_url: str) -> bool:
@@ -324,10 +373,11 @@ def _set_cookie_auth(
 
 def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> bool:
     """
-    Login against 3x-ui builds that require a CSRF token on /login.
+    Explicit compatibility login for 3x-ui builds that require a CSRF token.
 
-    Newer 3x-ui SPA pages expose /csrf-token before login. py3xui 0.4.x does
-    not fetch or replay that token, so panels can return 403 on the legacy path.
+    Keeping this small fallback independent from the SDK also covers panels
+    with non-standard session-cookie behavior. The native SDK login remains
+    the final fallback for older installations.
     """
     session = requests.Session()
     csrf_url = f"{host_url.rstrip('/')}/csrf-token"
@@ -371,6 +421,32 @@ def _login_with_csrf(api: Api, host_url: str, username: str, password: str) -> b
     return False
 
 
+def _login_without_csrf(api: Api, host_url: str, username: str, password: str) -> bool:
+    """Retain cookie login compatibility with pre-CSRF 3x-ui panels."""
+    session = requests.Session()
+    login_url = f"{host_url.rstrip('/')}/login"
+    try:
+        login_response = session.post(
+            login_url,
+            headers={"Accept": "application/json"},
+            json={"username": username, "password": password},
+            timeout=10,
+        )
+        login_response.raise_for_status()
+        payload = login_response.json()
+        if not payload.get("success"):
+            return False
+
+        for cookie in session.cookies:
+            if cookie.value:
+                _set_cookie_auth(api, cookie.name, cookie.value)
+                return True
+    except Exception as e:
+        logger.debug("Legacy XUI login failed for '%s': %s", host_url, e)
+
+    return False
+
+
 def _json_string_to_dict(value):
     if isinstance(value, str):
         try:
@@ -386,19 +462,30 @@ def _normalize_inbound_payload(data: dict) -> dict:
     for field_name in ("settings", "streamSettings", "sniffing"):
         if field_name in normalized:
             normalized[field_name] = _json_string_to_dict(normalized[field_name])
-    # Recent 3x-ui versions may serialize disabled sniffing as JSON null,
-    # while py3xui's Inbound model requires a Sniffing object.
-    if normalized.get("sniffing") is None:
+
+    # Current 3x-ui versions expose streamSettings as optional. They may
+    # serialize an absent value as null (or an empty object), while py3xui
+    # 0.7.0 only accepts a modeled object or an empty string.
+    if normalized.get("streamSettings") in (None, {}):
+        normalized["streamSettings"] = ""
+
+    # 3x-ui also permits an empty/default sniffing object. py3xui 0.7.0
+    # still requires the enabled field, so supply the panel's false default
+    # without changing any other sniffing options returned by the panel.
+    sniffing = normalized.get("sniffing")
+    if sniffing in (None, ""):
         normalized["sniffing"] = {"enabled": False}
+    elif isinstance(sniffing, dict) and "enabled" not in sniffing:
+        normalized["sniffing"] = {**sniffing, "enabled": False}
     return normalized
 
 
 def _validate_inbound_payload(data: dict) -> Inbound:
     """Validate an inbound while retaining transports unknown to py3xui.
 
-    py3xui 0.4.x drops newer stream settings such as ``xhttpSettings`` from
-    its Pydantic model.  Keep the normalized raw stream payload on the model so
-    share-link generation can still include the server's transport parameters.
+    Keep the normalized raw stream payload on the model so future 3x-ui
+    transport fields remain available to share-link generation even before
+    the SDK models them explicitly.
     """
     normalized = _normalize_inbound_payload(data)
     inbound = Inbound.model_validate(normalized)
@@ -486,15 +573,21 @@ def login_to_host(
         _set_api_request_timeouts(api)
         if _login_with_csrf(api, host_url, username, password):
             return api
+        if _login_without_csrf(api, host_url, username, password):
+            return api
         api.login()
         return api
 
     for attempt in range(1, _XUI_LOGIN_ATTEMPTS + 1):
         try:
             if token and not _bearer_recently_failed(host_url):
-                api = Api(host=host_url, username=username, password=password)
+                api = Api(
+                    host=host_url,
+                    username=username,
+                    password=password,
+                    token=token,
+                )
                 _set_api_request_timeouts(api)
-                _attach_bearer_auth(api, token)
                 try:
                     target_inbound = _load_target_inbound(api)
                 except Exception as token_error:
@@ -651,8 +744,8 @@ def _build_client_for_inbound(
         identifier = email
         client_kwargs["password"] = client_identifier or str(uuid.uuid4())
     elif protocol in {"hysteria", "hysteria2"}:
-        # py3xui 0.4.0 does not model Hysteria's auth field, so Hysteria clients
-        # are created via raw API helpers instead of this pydantic model.
+        # py3xui 0.7.0 does not model Hysteria's auth field, so Hysteria clients
+        # are created via raw API helpers instead of this Pydantic model.
         client_kwargs["id"] = identifier
     else:
         client_kwargs["id"] = identifier
@@ -826,7 +919,11 @@ def _connection_string_for_client(
                 connection_string = candidate
         else:
             connection_string = candidate
-    if connection_string is None and protocol_lower in {"hysteria", "hysteria2"} and client_identifier:
+    if (
+        connection_string is None
+        and protocol_lower in {"hysteria", "hysteria2"}
+        and client_identifier
+    ):
         connection_string = get_connection_string(
             inbound, client_identifier, host_url, remark=remark
         )
@@ -912,6 +1009,46 @@ def _ip_value_from_panel_record(value) -> str | None:
     return text.split(" (", 1)[0].strip() or None
 
 
+def _ip_timestamp_from_panel_record(value) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        timestamp = float(value.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    if timestamp <= 0:
+        return None
+    return int(timestamp)
+
+
+def _fingerprint_ip(ip: str) -> str:
+    """Return a process-local fingerprint so callers never receive raw IPs."""
+    return hmac.new(
+        _IP_ACTIVITY_FINGERPRINT_KEY,
+        ip.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _activity_from_panel_values(values) -> list[dict]:
+    latest_by_fingerprint: dict[str, int] = {}
+    for value in values or []:
+        ip = _ip_value_from_panel_record(value)
+        timestamp = _ip_timestamp_from_panel_record(value)
+        if not ip or timestamp is None:
+            continue
+        fingerprint = _fingerprint_ip(ip)
+        previous = latest_by_fingerprint.get(fingerprint)
+        if previous is None or timestamp > previous:
+            latest_by_fingerprint[fingerprint] = timestamp
+    return [
+        {"fingerprint": fingerprint, "timestamp": timestamp}
+        for fingerprint, timestamp in latest_by_fingerprint.items()
+    ]
+
+
 def get_client_ip_counts_for_host(
     host_name: str, expected_emails: set[str] | None = None
 ) -> dict:
@@ -932,11 +1069,10 @@ def get_client_ip_counts_for_host(
 
     wanted = set(expected_emails or ())
     try:
-        payload = _raw_api_request(
-            api, requests.get, "panel/api/server/clientIps"
-        )
+        payload = _raw_api_request(api, requests.get, "panel/api/server/clientIps")
         rows = payload.get("obj") or []
         counts: dict[str, int] = {}
+        activity: dict[str, list[dict]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -952,12 +1088,15 @@ def get_client_ip_counts_for_host(
                 if ip
             }
             counts[email] = len(unique_ips)
+            activity[email] = _activity_from_panel_values(row.get("ips") or [])
         if wanted:
             for email in wanted:
                 counts.setdefault(email, 0)
+                activity.setdefault(email, [])
         return {
             "host": host_name,
             "counts": counts,
+            "activity": activity,
             "fail2ban": get_host_fail2ban_status_from_api(api),
         }
     except Exception as bulk_error:
@@ -967,26 +1106,25 @@ def get_client_ip_counts_for_host(
     # Compatibility path for older panels. It is intentionally bounded to the
     # keys expected on this physical panel.
     counts = {}
+    activity = {}
     for email in sorted(wanted):
         values = api.client.get_ips(email) or []
         unique_ips = {
-            ip
-            for ip in (_ip_value_from_panel_record(value) for value in values)
-            if ip
+            ip for ip in (_ip_value_from_panel_record(value) for value in values) if ip
         }
         counts[email] = len(unique_ips)
+        activity[email] = _activity_from_panel_values(values)
     return {
         "host": host_name,
         "counts": counts,
+        "activity": activity,
         "fail2ban": get_host_fail2ban_status_from_api(api),
     }
 
 
 def get_host_fail2ban_status_from_api(api: Api) -> dict:
     try:
-        payload = _raw_api_request(
-            api, requests.get, "panel/api/server/fail2banStatus"
-        )
+        payload = _raw_api_request(api, requests.get, "panel/api/server/fail2banStatus")
         status = payload.get("obj") or {}
         return {
             "enabled": bool(status.get("enabled")),
@@ -1085,6 +1223,36 @@ def _raw_client_payload_for_clients_api(client: dict) -> dict:
     }
 
 
+def _canonical_client_update_payload(
+    api: Api, email: str, changes: dict, current: dict | None = None
+) -> dict:
+    """Preserve the complete canonical client; overlay only bot-owned access state."""
+    if current is None:
+        current = _get_canonical_client(api, email)
+    payload = dict(current)
+    # The editor accepts model.Client, whereas GET returns ClientRecord.
+    # Its numeric id is not the VPN credential, and allowedIPs is stored JSON.
+    payload.pop("id", None)
+    if current.get("uuid"):
+        payload["id"] = current["uuid"]
+    payload.pop("uuid", None)
+    for field in ("allowedIPs", "reverse"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            payload[field] = json.loads(value) if value else None
+    for source, target in (("createdAt", "created_at"), ("updatedAt", "updated_at")):
+        if source in payload:
+            payload[target] = payload.pop(source)
+    for field in ("inboundIds", "traffic", "externalLinks", "usedTraffic", "tunnelAllowedIPs"):
+        payload.pop(field, None)
+    for field in ("expiryTime", "enable", "totalGB", "reset", "limitIp"):
+        if field in changes:
+            payload[field] = changes[field]
+    if not current.get("tgId") and changes.get("tgId"):
+        payload["tgId"] = changes["tgId"]
+    return payload
+
+
 def _add_client_v3(
     api: Api,
     inbound_id: int,
@@ -1104,12 +1272,7 @@ def _add_client_v3(
             raise
         if not email:
             raise
-        _raw_api_request(
-            api,
-            requests.post,
-            f"panel/api/clients/update/{quote(str(email), safe='')}",
-            update_payload or client_payload,
-        )
+        _update_canonical_client(api, str(email), update_payload or client_payload)
         _raw_api_request(
             api,
             requests.post,
@@ -1135,17 +1298,14 @@ def _add_client_compat(
 def _update_client_compat(api: Api, client_identifier: str, client: Client) -> None:
     email = getattr(client, "email", "") or client_identifier
     try:
-        _raw_api_request(
-            api,
-            requests.post,
-            f"panel/api/clients/update/{quote(email, safe='')}",
-            _client_payload_for_clients_api(client, client_identifier),
+        _update_canonical_client(
+            api, email, _client_payload_for_clients_api(client, client_identifier),
+            expected_identifier=client_identifier,
         )
         return
-    except Exception as e:
-        if not _is_legacy_client_write_fallback_error(e):
+    except Exception as exc:
+        if not _is_endpoint_not_found_error(exc):
             raise
-
     api.client.update(client_identifier, client)
 
 
@@ -1208,7 +1368,9 @@ def _get_raw_inbound_obj(api: Api, inbound_id: int) -> dict:
 def _get_raw_clients(api: Api, inbound_id: int) -> list[dict]:
     inbound_obj = _get_raw_inbound_obj(api, inbound_id)
     settings_raw = inbound_obj.get("settings") or "{}"
-    settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+    settings = (
+        json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+    )
     return settings.get("clients") or []
 
 
@@ -1289,28 +1451,20 @@ def _add_raw_client(api: Api, inbound_id: int, client: dict) -> None:
     )
 
 
-def _update_raw_client(
-    api: Api, inbound_id: int, client_identifier: str, client: dict
-) -> None:
+def _update_raw_client(api: Api, inbound_id: int, client_identifier: str, client: dict) -> None:
     email = client.get("email") or client_identifier
     try:
-        _raw_api_request(
-            api,
-            requests.post,
-            f"panel/api/clients/update/{quote(email, safe='')}",
-            _raw_client_payload_for_clients_api(client),
+        _update_canonical_client(
+            api, email, _raw_client_payload_for_clients_api(client),
+            expected_identifier=client_identifier,
         )
         return
-    except Exception as e:
-        if not _is_legacy_client_write_fallback_error(e):
+    except Exception as exc:
+        if not _is_endpoint_not_found_error(exc):
             raise
-
-    _raw_api_request(
-        api,
-        requests.post,
+    _raw_api_request(api, requests.post,
         f"panel/api/inbounds/updateClient/{quote(client_identifier, safe='')}",
-        {"id": inbound_id, "settings": json.dumps({"clients": [client]})},
-    )
+        {"id": inbound_id, "settings": json.dumps({"clients": [client]})})
 
 
 def _delete_raw_client(
@@ -1400,15 +1554,13 @@ def _refresh_reactivated_client_visual_state(
     api: Api, inbound_id: int, email: str
 ) -> None:
     """
-    Some 3x-ui builds keep a stale red "depleted/exhausted" badge in clientTraffics
-    after an expired client is renewed. Mimic the manual client toggle from the UI.
+    Clear stale traffic state without toggling real access off and on.
+
+    Expiry and enable are applied by the caller's client update. A visual badge
+    must not introduce a second disable operation or leave a renewed client
+    disabled when a best-effort re-enable request fails.
     """
     try:
-        _normalize_client_traffic_state(api, inbound_id, email)
-        _set_client_enabled_state(api, inbound_id, email, False)
-        time.sleep(0.15)
-        _set_client_enabled_state(api, inbound_id, email, True)
-        time.sleep(0.15)
         _normalize_client_traffic_state(api, inbound_id, email)
         logger.debug(
             "Refreshed visual exhausted-state for reactivated client '%s' on inbound %s",
@@ -1425,20 +1577,28 @@ def _refresh_reactivated_client_visual_state(
 
 
 def _normalize_client_traffic_state(api: Api, inbound_id: int, email: str) -> bool:
-    """Clear stale 3x-ui clientTraffics state for one client."""
+    """Repair depleted active access only; a reset must never revive expired access."""
     try:
+        try:
+            current = _get_canonical_client(api, email)
+        except Exception as exc:
+            if not _is_endpoint_not_found_error(exc):
+                raise
+            inbound = _get_inbound_by_id_compat(api, inbound_id)
+            client = _find_client_by_email(inbound, email) if inbound else None
+            if not client:
+                return False
+            current = {"enable": bool(client.enable), "expiryTime": client.expiry_time}
+        expiry = int(current.get("expiryTime") or 0)
+        now = time_utils.get_timestamp_ms(time_utils.get_msk_now())
+        if not current.get("enable") or (expiry != 0 and expiry <= now):
+            return False
+        if not _client_traffic_is_disabled(api, email):
+            return True
         _reset_client_traffic_compat(api, inbound_id, email)
-        logger.debug(
-            "Traffic state reset for client '%s' on inbound %s", email, inbound_id
-        )
         return True
-    except Exception as rst_err:
-        logger.warning(
-            "Could not reset traffic stats for client '%s' on inbound %s: %s",
-            email,
-            inbound_id,
-            rst_err,
-        )
+    except Exception:
+        logger.warning("Active client traffic recovery could not be verified")
         return False
 
 
@@ -1456,6 +1616,7 @@ def _client_traffic_is_disabled(api: Api, email: str) -> bool:
         return False
 
 
+@_serialize_preflight_write
 def validate_host_write_access(
     host_url: str,
     username: str,
@@ -1626,9 +1787,7 @@ def _get_vless_connection_string(
     # Common parameters
     base_link = f"vless://{user_uuid}@{hostname}:{port}?type={network}&encryption=none"
 
-    raw_stream_settings = getattr(
-        stream_settings, "_shop_bot_raw_stream_settings", {}
-    )
+    raw_stream_settings = getattr(stream_settings, "_shop_bot_raw_stream_settings", {})
     if not isinstance(raw_stream_settings, dict):
         raw_stream_settings = {}
 
@@ -1790,12 +1949,22 @@ def update_or_create_client_on_panel(
     telegram_id: str = None,
     absolute_expiry_ms: int | None = None,
     preserve_longer_expiry: bool = True,
+    client_identifier: str | None = None,
+    loaded_inbound: Inbound | None = None,
 ) -> tuple[str | None, int | None]:
     def _is_record_not_found_error(exc: Exception) -> bool:
         return "record not found" in str(exc).lower()
 
     try:
-        inbound_to_modify = _get_inbound_by_id_compat(api, inbound_id)
+        # Issuance already loaded this inbound while holding the panel write
+        # lock. Other callers retain the fresh-read behavior by default.
+        inbound_to_modify = (
+            loaded_inbound
+            if loaded_inbound is not None
+            else _get_inbound_by_id_compat(api, inbound_id)
+        )
+        if loaded_inbound is not None and loaded_inbound.id != inbound_id:
+            raise ValueError("Loaded inbound does not match the requested inbound")
         if not inbound_to_modify:
             raise ValueError(f"Could not find inbound with ID {inbound_id}")
 
@@ -1900,6 +2069,7 @@ def update_or_create_client_on_panel(
                     enable=should_enable_client,
                     expiry_time=new_expiry_ms,
                     telegram_id=telegram_id,
+                    client_identifier=client_identifier,
                 )
                 _add_raw_client(api, inbound_id, raw_client)
                 logger.info(
@@ -1914,8 +2084,6 @@ def update_or_create_client_on_panel(
         if client_index != -1:
             # Update existing client
             client_to_update = inbound_to_modify.settings.clients[client_index]
-            previous_expiry_ms = int(getattr(client_to_update, "expiry_time", 0) or 0)
-            previous_enabled = bool(getattr(client_to_update, "enable", True))
             client_to_update.expiry_time = new_expiry_ms
             client_to_update.enable = should_enable_client
 
@@ -1940,71 +2108,12 @@ def update_or_create_client_on_panel(
             client_uuid = _ensure_client_identifier_for_protocol(
                 protocol, client_to_update, email
             )
-            try:
-                # Update the already-loaded inbound as the primary path.
-                # This is more stable on panels that intermittently reject direct client.update
-                # with "record not found" for otherwise valid existing clients.
-                _update_inbound_compat(api, inbound_id, inbound_to_modify)
-                logger.info(
-                    f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id}"
-                )
-            except Exception as inbound_update_error:
-                if not _is_record_not_found_error(inbound_update_error):
-                    raise
+            # Never recreate an existing account after a failed write.
+            _update_client_compat(api, client_uuid, client_to_update)
+            logger.info("Updated existing client access after canonical verification")
 
-                logger.warning(
-                    f"Client '{email}' inbound.update failed with 'record not found' on inbound {inbound_id}. "
-                    "Trying client.update fallback."
-                )
-                try:
-                    _update_client_compat(api, client_uuid, client_to_update)
-                    logger.info(
-                        f"Updated existing client '{email}' (UUID: {client_uuid}) on inbound {inbound_id} "
-                        "via client.update fallback."
-                    )
-                except Exception as update_error:
-                    if not _is_record_not_found_error(update_error):
-                        raise
-
-                    # Panel can keep a stale reference in clients list; final fallback is safe recreate.
-                    logger.warning(
-                        f"Client '{email}' client.update fallback also failed with 'record not found' "
-                        f"on inbound {inbound_id}. Trying recreate fallback."
-                    )
-                    recreated_client, client_uuid = _build_client_for_inbound(
-                        inbound=inbound_to_modify,
-                        email=email,
-                        enable=should_enable_client,
-                        flow=target_flow,
-                        expiry_time=new_expiry_ms,
-                        telegram_id=telegram_id,
-                    )
-                    _add_client_compat(
-                        api, inbound_id, recreated_client, client_uuid
-                    )
-                    actual_uuid = _get_raw_client_identifier_by_email(
-                        api, inbound_id, protocol, email
-                    )
-                    if actual_uuid and actual_uuid != client_uuid:
-                        logger.warning(
-                            "Recreated client '%s' returned identifier '%s', but panel stores '%s'. Using panel identifier.",
-                            email,
-                            client_uuid,
-                            actual_uuid,
-                        )
-                        client_uuid = actual_uuid
-                    logger.info(
-                        "Recreated client '%s' on inbound %s", email, inbound_id
-                    )
-
-            reactivated_from_expired = should_enable_client and (
-                previous_expiry_ms <= current_ts_ms or not previous_enabled
-            )
-            # Reset traffic counters/state so 3x-ui no longer shows a stale
-            # "exhausted" (исчерпано) badge after a renewal.
+            # Recover stale traffic only after the canonical access write.
             _normalize_client_traffic_state(api, inbound_id, email)
-            if reactivated_from_expired:
-                _refresh_reactivated_client_visual_state(api, inbound_id, email)
 
         else:
             new_client, client_uuid = _build_client_for_inbound(
@@ -2014,6 +2123,7 @@ def update_or_create_client_on_panel(
                 flow=target_flow,
                 expiry_time=new_expiry_ms,
                 telegram_id=telegram_id,
+                client_identifier=client_identifier,
             )
 
             _add_client_compat(api, inbound_id, new_client, client_uuid)
@@ -2042,6 +2152,7 @@ def update_or_create_client_on_panel(
         logger.error(f"Error in update_or_create_client_on_panel: {e}", exc_info=True)
         return None, None
 
+
 async def create_or_update_key_on_host(
     host_name: str, email: str, days_to_add: int, telegram_id: str = None
 ) -> Dict | None:
@@ -2059,7 +2170,7 @@ async def create_or_update_key_on_host(
 async def create_or_update_key_on_host_seconds(
     host_name: str, email: str, seconds_to_add: int, telegram_id: str = None
 ) -> Dict | None:
-    return await asyncio.to_thread(
+    return await subscription_operations.run_worker(
         _create_or_update_key_on_host_sync,
         host_name,
         email,
@@ -2077,7 +2188,7 @@ async def create_or_update_key_on_host_absolute_expiry(
     telegram_id: str = None,
     preserve_longer_expiry: bool = True,
 ) -> Dict | None:
-    return await asyncio.to_thread(
+    return await subscription_operations.run_worker(
         _create_or_update_key_on_host_sync,
         host_name,
         email,
@@ -2089,6 +2200,7 @@ async def create_or_update_key_on_host_absolute_expiry(
     )
 
 
+@_serialize_host_write
 def _create_or_update_key_on_host_sync(
     host_name: str,
     email: str,
@@ -2125,6 +2237,7 @@ def _create_or_update_key_on_host_sync(
         telegram_id=telegram_id,
         absolute_expiry_ms=absolute_expiry_ms,
         preserve_longer_expiry=preserve_longer_expiry,
+        loaded_inbound=inbound,
     )
     if not client_uuid:
         logger.error(
@@ -2287,6 +2400,7 @@ async def fix_client_parameters_on_host(host_name: str, client_email: str) -> bo
     )
 
 
+@_serialize_host_write
 def _fix_client_parameters_on_host_sync(host_name: str, client_email: str) -> bool:
     """Sync version of fix_client_parameters_on_host"""
     host_data = get_host(host_name)
@@ -2369,6 +2483,7 @@ async def fix_all_client_parameters_on_host(host_name: str) -> int:
     return await asyncio.to_thread(_fix_all_client_parameters_on_host_sync, host_name)
 
 
+@_serialize_host_write
 def _fix_all_client_parameters_on_host_sync(host_name: str) -> int:
     host_data = get_host(host_name)
     if not host_data:
@@ -2506,10 +2621,71 @@ async def sync_clients_state_on_host(
     host_name: str, desired_by_email: dict[str, dict]
 ) -> dict:
     return await asyncio.to_thread(
-        _sync_clients_state_on_host_sync, host_name, desired_by_email
+        _sync_clients_state_with_user_guards, host_name, desired_by_email
     )
 
 
+def _sync_clients_state_with_user_guards(host_name, desired_by_email):
+    """A delayed DB snapshot must not roll back a foreground grant.
+
+    Reservations live in this worker until HTTP writes really finish, including
+    when an asyncio caller times out. Unavailable users retry next cycle.
+    """
+    reserved = set()
+    deferred_users = set()
+    safe = {}
+    try:
+        for state in desired_by_email.values():
+            if state.get("expiry_timestamp_ms") is None or not state.get("telegram_id"):
+                continue  # Compatibility for IP-limit-only administrative calls.
+            user_id = int(state["telegram_id"])
+            if user_id not in reserved and user_id not in deferred_users:
+                if subscription_operations.try_acquire(user_id):
+                    reserved.add(user_id)
+                else:
+                    deferred_users.add(user_id)
+        current = (
+            {key["key_email"]: key for key in get_keys_for_host(host_name)}
+            if reserved
+            else {}
+        )
+        for email, state in desired_by_email.items():
+            if state.get("expiry_timestamp_ms") is None or not state.get("telegram_id"):
+                safe[email] = state
+                continue
+            if int(state["telegram_id"]) in deferred_users:
+                continue
+            key = current.get(email)
+            expiry = (
+                time_utils.parse_iso_to_msk(key.get("expiry_date")) if key else None
+            )
+            if (
+                not expiry
+                or abs(
+                    time_utils.get_timestamp_ms(expiry)
+                    - int(state["expiry_timestamp_ms"])
+                )
+                > 1000
+            ):
+                continue
+            if str(key.get("xui_client_uuid")) != str(state.get("client_identifier")):
+                continue
+            safe[email] = state
+        result = _sync_clients_state_on_host_sync(host_name, safe)
+        result["deferred"] = len(desired_by_email) - len(safe)
+        if result["deferred"]:
+            logger.info(
+                "Deferred %s subscription states on host %s during concurrent changes.",
+                result["deferred"],
+                host_name,
+            )
+        return result
+    finally:
+        for user_id in reserved:
+            subscription_operations.release(user_id)
+
+
+@_serialize_host_write
 def _sync_clients_state_on_host_sync(
     host_name: str, desired_by_email: dict[str, dict]
 ) -> dict:
@@ -2523,6 +2699,7 @@ def _sync_clients_state_on_host_sync(
         "host": host_name,
         "checked": 0,
         "updated": 0,
+        "recreated": 0,
         "already_ok": 0,
         "not_found": 0,
         "traffic_fixed": 0,
@@ -2575,6 +2752,21 @@ def _sync_clients_state_on_host_sync(
                 result["checked"] += 1
                 raw_client = raw_clients_by_email.get(email)
                 if not raw_client:
+                    if state.get("recreate_missing"):
+                        recreated_identifier, _ = update_or_create_client_on_panel(
+                            api=api,
+                            inbound_id=inbound.id,
+                            email=email,
+                            absolute_expiry_ms=state.get("expiry_timestamp_ms"),
+                            preserve_longer_expiry=False,
+                            telegram_id=state.get("telegram_id"),
+                            client_identifier=state.get("client_identifier"),
+                        )
+                        if recreated_identifier:
+                            result["updated"] += 1
+                            result["recreated"] += 1
+                            continue
+                        result["errors"] += 1
                     result["not_found"] += 1
                     continue
 
@@ -2626,10 +2818,13 @@ def _sync_clients_state_on_host_sync(
                     changed = True
 
                 if changed:
-                    _update_raw_client(api, inbound.id, str(client_identifier), raw_client)
+                    _update_raw_client(
+                        api, inbound.id, str(client_identifier), raw_client
+                    )
                     result["updated"] += 1
-                    if needs_traffic_reset:
-                        _normalize_client_traffic_state(api, inbound.id, email)
+                    if needs_traffic_reset and target_enabled:
+                        if not _normalize_client_traffic_state(api, inbound.id, email):
+                            result["errors"] += 1
                 else:
                     result["already_ok"] += 1
 
@@ -2646,28 +2841,30 @@ def _sync_clients_state_on_host_sync(
             if getattr(client, "email", None)
         }
 
-        any_changed = False
-        # Track clients whose clientTraffics row must be normalized after the
-        # inbound update. In 3x-ui the panel can leave clientTraffics.enable=0
-        # after auto-expiry/traffic events, which renders as "исчерпано" even when
-        # DB state says the account should simply be disabled or active again.
-        #
-        # We therefore reset stats in two cases:
-        # - target_enabled=True and the record changed (renew, re-enable, cap fix)
-        # - target_enabled=False and we are disabling the client from DB state
-        #
-        # resetClientTraffic flips that stale traffic-state flag back to enabled in
-        # clientTraffics, while the real access state remains controlled by
-        # client.enable from inbound.update.
+        # Only active records may need stale traffic recovery. A reset can
+        # re-enable a canonical client, so it must never follow a disable.
         emails_to_reset_stats: set[str] = set()
-        reactivated_emails: set[str] = set()
-        ip_only_updates: list[Client] = []
-        now_ms = time_utils.get_timestamp_ms(time_utils.get_msk_now())
+        client_updates: list[Client] = []
 
         for email, state in desired_by_email.items():
             result["checked"] += 1
             client = clients_by_email.get(email)
             if not client:
+                if state.get("recreate_missing"):
+                    recreated_identifier, _ = update_or_create_client_on_panel(
+                        api=api,
+                        inbound_id=inbound.id,
+                        email=email,
+                        absolute_expiry_ms=state.get("expiry_timestamp_ms"),
+                        preserve_longer_expiry=False,
+                        telegram_id=state.get("telegram_id"),
+                        client_identifier=state.get("client_identifier"),
+                    )
+                    if recreated_identifier:
+                        result["updated"] += 1
+                        result["recreated"] += 1
+                        continue
+                    result["errors"] += 1
                 result["not_found"] += 1
                 continue
 
@@ -2716,8 +2913,6 @@ def _sync_clients_state_on_host_sync(
                 # resetClientTraffic is called explicitly.
                 if changed and needs_traffic_reset:
                     emails_to_reset_stats.add(email)
-                    if current_expiry_ms <= now_ms or not was_enabled:
-                        reactivated_emails.add(email)
                 else:
                     traffic_client = traffic_by_email.get(email)
                     if traffic_client and not bool(
@@ -2729,29 +2924,16 @@ def _sync_clients_state_on_host_sync(
                             host_name,
                         )
                         emails_to_reset_stats.add(email)
-                        reactivated_emails.add(email)
                         result["traffic_fixed"] += 1
-            elif enable_state_changed:
-                # When DB marks a key expired we want the host to show it as disabled,
-                # not as traffic-exhausted due to a stale clientTraffics flag.
-                emails_to_reset_stats.add(email)
 
             if changed:
-                if needs_traffic_reset:
-                    result["updated"] += 1
-                    any_changed = True
-                else:
-                    ip_only_updates.append(client)
+                client_updates.append(client)
             else:
                 result["already_ok"] += 1
 
-        if any_changed:
-            _update_inbound_compat(api, inbound.id, inbound_to_modify)
-
-        # A pure limitIp change can be applied to one client through the
-        # dedicated endpoint. Avoid rewriting/reloading the complete inbound,
-        # which keeps unrelated active connections untouched.
-        for client in ip_only_updates:
+        # Client-only writes preserve newly recreated/attached clients and
+        # avoid replacing the full inbound from an earlier snapshot.
+        for client in client_updates:
             try:
                 client_identifier = _ensure_client_identifier_for_protocol(
                     protocol, client, client.email
@@ -2760,20 +2942,19 @@ def _sync_clients_state_on_host_sync(
                 result["updated"] += 1
             except Exception as e:
                 result["errors"] += 1
+                emails_to_reset_stats.discard(client.email)
                 logger.warning(
-                    "Could not update IP limit for client '%s' on host '%s': %s",
+                    "Could not update client '%s' on host '%s': %s",
                     getattr(client, "email", ""),
                     host_name,
                     e,
                 )
 
-        # Reset traffic stats after inbound.update so 3x-ui clears stale
-        # "исчерпано" state from clientTraffics for both renewals and expiries.
+        # Recover only active clients after a verified write. The helper
+        # refuses expired/disabled records and skips healthy traffic state.
         for email in emails_to_reset_stats:
-            _normalize_client_traffic_state(api, inbound.id, email)
-
-        for email in reactivated_emails:
-            _refresh_reactivated_client_visual_state(api, inbound.id, email)
+            if not _normalize_client_traffic_state(api, inbound.id, email):
+                result["errors"] += 1
 
         return result
 
@@ -2789,6 +2970,7 @@ async def delete_client_on_host(host_name: str, client_email: str) -> bool:
     return await asyncio.to_thread(_delete_client_on_host_sync, host_name, client_email)
 
 
+@_serialize_host_write
 def _delete_client_on_host_sync(host_name: str, client_email: str) -> bool:
     host_data = get_host(host_name)
     if not host_data:
@@ -2852,7 +3034,10 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     """
     from shop_bot.data_manager.database import get_all_hosts
 
-    all_hosts = get_all_hosts(only_enabled=True)
+    # Database access and py3xui both use blocking I/O. Keep the existing
+    # sequential host order, but never block the application's shared asyncio
+    # loop (Telegram polling, payments and scheduler timers run on it too).
+    all_hosts = await asyncio.to_thread(get_all_hosts, only_enabled=True)
     if not all_hosts:
         logger.warning("No hosts configured in database. XTLS sync skipped.")
         return {"status": "no_hosts"}
@@ -2862,11 +3047,12 @@ async def sync_inbounds_xtls_from_all_hosts() -> dict[str, dict]:
     for host_info in all_hosts:
         host_name = host_info.get("host_name")
         logger.info(f"Starting XTLS sync for host: {host_name}")
-        results[host_name] = _sync_xtls_for_host(host_info)
+        results[host_name] = await asyncio.to_thread(_sync_xtls_for_host, host_info)
 
     return results
 
 
+@_serialize_host_info_write
 def _sync_xtls_for_host(host_info: dict) -> dict:
     """
     Synchronize XTLS settings for a single host.
@@ -3003,3 +3189,39 @@ def sync_inbounds_xtls_for_hosts(host_names: set[str]) -> dict[str, dict]:
         results[host_name] = _sync_xtls_for_host(host_info)
 
     return results
+
+
+def _get_canonical_client(api: Api, email: str) -> dict:
+    response = _raw_api_request(
+        api, requests.get, f"panel/api/clients/get/{quote(email, safe='')}"
+    )
+    obj = response.get("obj")
+    current = obj.get("client", obj) if isinstance(obj, dict) else None
+    if not isinstance(current, dict) or current.get("email") != email:
+        raise ValueError("Canonical client lookup returned an invalid record")
+    return current
+
+
+def _update_canonical_client(
+    api: Api, email: str, changes: dict, expected_identifier: str | None = None
+) -> None:
+    """Write one client, skip no-ops, and reject unverified access updates."""
+    before = _get_canonical_client(api, email)
+    if expected_identifier and expected_identifier not in {
+        before.get("uuid"), before.get("password"), before.get("auth")
+    }:
+        raise ValueError("Canonical client identity differs from the loaded client")
+    payload = _canonical_client_update_payload(api, email, changes, current=before)
+    owned = ("expiryTime", "enable", "totalGB", "reset", "limitIp", "tgId")
+    if all(before.get(k) == payload.get(k) for k in owned):
+        return
+    _raw_api_request(
+        api, requests.post, f"panel/api/clients/update/{quote(email, safe='')}", payload
+    )
+    after = _get_canonical_client(api, email)
+    if any(after.get(k) != payload.get(k) for k in owned):
+        raise ValueError("Canonical client access read-back failed")
+    # Do not silently accept loss of credentials, panel-managed fields or labels.
+    ignored = set(owned) | {"updatedAt", "updated_at", "traffic", "usedTraffic"}
+    if any(after.get(k) != v for k, v in before.items() if k not in ignored):
+        raise ValueError("Canonical client preservation read-back failed")

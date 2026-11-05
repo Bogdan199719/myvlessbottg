@@ -156,6 +156,8 @@ def _check_source_invariants() -> None:
         "stage_pending_restore(APP_ROOT, db_src, env_src)",
         "@after_this_request",
         "schedule_process_restart()",
+        'response.headers.setdefault("Cache-Control", "no-store, private")',
+        'response.headers.setdefault("Pragma", "no-cache")',
     )
     for fragment in required_app_fragments:
         assert fragment in app_source, f"missing admin safety invariant: {fragment}"

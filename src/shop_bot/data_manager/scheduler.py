@@ -1,11 +1,12 @@
+from shop_bot.modules import subscription_operations
 import asyncio
-import html
 import logging
 import math
 import time
 
 from datetime import datetime
 from shop_bot.utils import time_utils
+from shop_bot.utils.subscription_rules import configured_trial_days, is_trial_xui_key
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import Bot
@@ -18,9 +19,11 @@ from shop_bot.data_manager.database import host_slug as _host_slug
 from shop_bot.modules import xui_api
 from shop_bot.modules import mtg_api
 from shop_bot.modules import host_health
+from shop_bot.modules import host_selector
 from shop_bot.bot import handlers
 
 CHECK_INTERVAL_SECONDS = 60
+_STARTUP_DELAY_SECONDS = 10
 _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS = 300
 PAID_NOTIFY_HOURS = {24, 1, 0, -24, -72, -168}
 TRIAL_NOTIFY_HOURS = {1, 0, -24, -72}
@@ -44,9 +47,33 @@ _HOST_HEALTH_MAX_CONCURRENCY = 4
 _IP_LIMIT_INTERVAL_SECONDS = 5 * 60
 _IP_LIMIT_PANEL_TIMEOUT_SECONDS = 90
 _IP_LIMIT_MAX_CONCURRENCY = 4
+_IP_LIMIT_HISTORY_RETENTION_DAYS = 7
 
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_yookassa_payment_metadata(
+    stored_metadata: dict | None, provider_metadata: dict | None
+) -> dict:
+    """Keep local fulfillment checkpoints when refreshing payment metadata.
+
+    YooKassa only knows the immutable invoice snapshot. Fields written while
+    provisioning (notably the absolute expiry target) exist only in our DB and
+    must survive every provider status refresh, otherwise a retry can extend
+    already-provisioned hosts again.
+    """
+    stored = dict(stored_metadata or {})
+    merged = dict(stored)
+    merged.update(provider_metadata or {})
+
+    for key, value in stored.items():
+        if key.startswith("fulfillment_") or key in {
+            "accounting_applied",
+            "recovered_from_interrupted_processing_at",
+        }:
+            merged[key] = value
+    return merged
 
 
 def _bool_setting(key: str, default: bool = False) -> bool:
@@ -86,9 +113,7 @@ def _is_host_in_failure_backoff(host_name: str) -> bool:
 
 def _mark_host_failure(host_name: str, reason: str) -> None:
     was_in_backoff = _is_host_in_failure_backoff(host_name)
-    _host_failure_backoff[host_name] = (
-        time.monotonic() + _HOST_FAILURE_BACKOFF_SECONDS
-    )
+    _host_failure_backoff[host_name] = time.monotonic() + _HOST_FAILURE_BACKOFF_SECONDS
     if not was_in_backoff:
         logger.warning(
             "Scheduler: Host '%s' temporarily backed off for %s seconds after failure: %s",
@@ -114,9 +139,7 @@ def _is_mtg_host_in_failure_backoff(host_name: str) -> bool:
 
 def _mark_mtg_host_failure(host_name: str, reason: str) -> None:
     was_in_backoff = _is_mtg_host_in_failure_backoff(host_name)
-    _mtg_failure_backoff[host_name] = (
-        time.monotonic() + _MTG_FAILURE_BACKOFF_SECONDS
-    )
+    _mtg_failure_backoff[host_name] = time.monotonic() + _MTG_FAILURE_BACKOFF_SECONDS
     if not was_in_backoff:
         logger.warning(
             "Scheduler: MTG host '%s' temporarily backed off for %s seconds after failure: %s",
@@ -148,9 +171,7 @@ def format_time_left(hours: int) -> str:
             return f"{hours} часов"
 
 
-def _notification_type_for_expiry_cycle(
-    base_type: str, expiry_date: datetime
-) -> str:
+def _notification_type_for_expiry_cycle(base_type: str, expiry_date: datetime) -> str:
     expiry_ms = time_utils.get_timestamp_ms(expiry_date)
     return f"{base_type}:{expiry_ms}"
 
@@ -422,6 +443,26 @@ async def send_idle_onboarding_notification(
             )
             primary_text = "🎁 Попробовать бесплатно"
 
+        if not trial_enabled:
+            if hours_mark == 3:
+                message = (
+                    "☀️ <b>Ты заходил посмотреть VPN, но ещё не включил доступ.</b>\n\n"
+                    "Выбери подходящую подписку и подключи VPN на своих устройствах."
+                )
+            elif hours_mark == 24:
+                message = (
+                    "✨ <b>Маленькое напоминание</b>\n\n"
+                    "VPN пригодится, когда сайты не открываются, видео тормозит или "
+                    "нужен стабильный доступ в дороге.\n\n"
+                    "Можно выбрать подходящую подписку и подключиться."
+                )
+            else:
+                message = (
+                    "👋 <b>Последнее напоминание</b>\n\n"
+                    "Ты заходил в бот, но так и не подключил VPN. "
+                    "Если доступ ещё актуален, выбери подходящую подписку."
+                )
+
         builder = InlineKeyboardBuilder()
         if trial_enabled:
             builder.button(text=primary_text, callback_data="get_trial")
@@ -486,9 +527,7 @@ async def check_idle_onboarding_users(bot: Bot):
             if already_sent:
                 continue
 
-            sent_ok = await send_idle_onboarding_notification(
-                bot, user_id, hours_mark
-            )
+            sent_ok = await send_idle_onboarding_notification(bot, user_id, hours_mark)
             if sent_ok:
                 await asyncio.to_thread(
                     database.mark_notification_sent,
@@ -593,6 +632,9 @@ async def check_expiring_subscriptions(bot: Bot):
     logger.info("Scheduler: Checking for expiring subscriptions...")
     all_keys = await asyncio.to_thread(database.get_all_keys)
     current_time = time_utils.get_msk_now()
+    trial_days = configured_trial_days(
+        await asyncio.to_thread(database.get_setting, "trial_duration_days")
+    )
 
     # Determine global plan ids (host_name == 'ALL')
     try:
@@ -611,14 +653,15 @@ async def check_expiring_subscriptions(bot: Bot):
         try:
             service_type = key.get("service_type", "xui")
             plan_id = int(key.get("plan_id", 0) or 0)
-            if service_type == "xui" and plan_id == 0:
-                trial_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
-                    key
+            if service_type == "xui" and plan_id <= 0:
+                bucket = (
+                    trial_global_keys_by_user
+                    if is_trial_xui_key(key, trial_days)
+                    else paid_global_keys_by_user
                 )
+                bucket.setdefault(int(key["user_id"]), []).append(key)
             elif database.is_global_xui_key(key, global_plan_ids):
-                paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(
-                    key
-                )
+                paid_global_keys_by_user.setdefault(int(key["user_id"]), []).append(key)
             else:
                 remaining_keys.append(key)
         except Exception:
@@ -735,8 +778,7 @@ async def check_expiring_subscriptions(bot: Bot):
             user_id = key["user_id"]
 
             key_id = key["key_id"]
-            plan_id = int(key.get("plan_id", 0) or 0)
-            is_trial = plan_id == 0
+            is_trial = is_trial_xui_key(key, trial_days)
             service_type = key.get("service_type", "xui")
 
             if (
@@ -770,6 +812,7 @@ async def enforce_clients_state_from_db() -> None:
 
     total_checked = 0
     total_updated = 0
+    total_recreated = 0
     total_already_ok = 0
     total_not_found = 0
     total_errors = 0
@@ -784,8 +827,8 @@ async def enforce_clients_state_from_db() -> None:
     # exhausted its grace period. The panel still records IP observations with
     # limitIp=0; this behavior is verified by the bulk clientIps API.
     warning_ip_limit = 0
-    enforced_key_ids = (
-        await asyncio.to_thread(database.get_enforced_xui_ip_limit_key_ids)
+    enforced_user_ids = (
+        await asyncio.to_thread(database.get_enforced_xui_ip_limit_user_ids)
         if ip_limit_enabled
         else set()
     )
@@ -826,13 +869,18 @@ async def enforce_clients_state_from_db() -> None:
                 "enabled": expiry_date > now,
                 "expiry_timestamp_ms": time_utils.get_timestamp_ms(expiry_date),
                 "force_unlimited": True,
+                "recreate_missing": expiry_date > now,
+                "client_identifier": db_key.get("xui_client_uuid"),
+                "telegram_id": str(db_key.get("user_id") or ""),
                 "ip_limit": (
-                    configured_ip_limit
-                    if db_key.get("key_id") in enforced_key_ids
-                    else warning_ip_limit
-                )
-                if ip_limit_enabled
-                else 0,
+                    (
+                        configured_ip_limit
+                        if db_key.get("user_id") in enforced_user_ids
+                        else warning_ip_limit
+                    )
+                    if ip_limit_enabled
+                    else 0
+                ),
             }
 
         if desired_by_email:
@@ -858,6 +906,7 @@ async def enforce_clients_state_from_db() -> None:
                 _mark_host_success(host_name)
             total_checked += int(host_result.get("checked", 0))
             total_updated += int(host_result.get("updated", 0))
+            total_recreated += int(host_result.get("recreated", 0))
             total_already_ok += int(host_result.get("already_ok", 0))
             total_not_found += int(host_result.get("not_found", 0))
             total_traffic_fixed += int(host_result.get("traffic_fixed", 0))
@@ -865,9 +914,10 @@ async def enforce_clients_state_from_db() -> None:
             total_errors += int(host_result.get("errors", 0))
 
     logger.info(
-        "Scheduler: DB enforce finished. checked=%s updated=%s already_ok=%s not_found=%s traffic_fixed=%s ip_limit_fixed=%s expired_preserved=%s errors=%s",
+        "Scheduler: DB enforce finished. checked=%s updated=%s recreated=%s already_ok=%s not_found=%s traffic_fixed=%s ip_limit_fixed=%s expired_preserved=%s errors=%s",
         total_checked,
         total_updated,
+        total_recreated,
         total_already_ok,
         total_not_found,
         total_traffic_fixed,
@@ -894,10 +944,10 @@ def _load_xui_panel_snapshot(host: dict):
     if not api or not inbound:
         return None
 
-    full_inbound_details = api.inbound.get_by_id(inbound.id)
-    if not full_inbound_details or not getattr(
-        full_inbound_details, "settings", None
-    ):
+    # Use the same compatibility layer as provisioning: the SDK alone can
+    # lose raw transport settings (including XHTTP) or use a legacy API route.
+    full_inbound_details = xui_api._get_inbound_by_id_compat(api, inbound.id)
+    if not full_inbound_details or not getattr(full_inbound_details, "settings", None):
         return None
     return full_inbound_details
 
@@ -956,18 +1006,7 @@ async def sync_keys_with_panels():
 
                 if server_client:
                     await asyncio.to_thread(database.purge_missing_key, key_email)
-                    # Determine country flag based on server name
-                    country_flag = xui_api.get_country_flag_by_host(host_name)
-                    # Clean server name
-                    clean_server_name = (
-                        host_name.replace(" ", "")
-                        .encode("ascii", "ignore")
-                        .decode("ascii")
-                    )
-                    clean_server_name = "".join(
-                        c for c in clean_server_name if c.isalnum() or c == "_"
-                    ).lstrip("_")
-                    server_remark = f"{country_flag}{clean_server_name}"
+                    server_remark = xui_api._build_server_remark(host_name)
 
                     # Generate fresh connection string
                     new_connection_string = xui_api.get_connection_string(
@@ -1169,7 +1208,22 @@ async def auto_provision_new_hosts_for_global_users():
     provision_timeout = _provision_timeout_seconds()
 
     for user_id, user_keys in keys_by_user.items():
+        # Most users have complete access; avoid reserving them unnecessarily.
+        snapshot_now = time_utils.get_msk_now()
+        active_snapshot_hosts = {
+            k.get("host_name")
+            for k in user_keys
+            if k.get("service_type", "xui") == "xui"
+            and (expiry := time_utils.parse_iso_to_msk(k.get("expiry_date")))
+            and expiry > snapshot_now
+        }
+        if not active_snapshot_hosts or enabled_host_names <= active_snapshot_hosts:
+            continue
+        if not subscription_operations.try_acquire(user_id):
+            continue  # A foreground grant will finish; retry on the next pass.
         try:
+            # The initial global snapshot may predate a foreground grant.
+            user_keys = await asyncio.to_thread(database.get_user_keys, user_id)
             # Filter active global access keys. Paid global keys and trial keys
             # both represent access to all enabled XUI hosts.
             now = time_utils.get_msk_now()
@@ -1286,8 +1340,8 @@ async def auto_provision_new_hosts_for_global_users():
                             database.get_key_by_email, res["email"]
                         )
                         if existing_key:
-                            await asyncio.to_thread(
-                                database.update_key_by_email,
+                            persisted = await asyncio.to_thread(
+                                database.merge_provisioned_key_by_email,
                                 key_email=res["email"],
                                 host_name=host_name,
                                 xui_client_uuid=res["client_uuid"],
@@ -1296,7 +1350,7 @@ async def auto_provision_new_hosts_for_global_users():
                                 plan_id=first_global_plan_id,
                             )
                         else:
-                            await asyncio.to_thread(
+                            persisted = await asyncio.to_thread(
                                 database.add_new_key,
                                 user_id=user_id,
                                 host_name=host_name,
@@ -1306,13 +1360,17 @@ async def auto_provision_new_hosts_for_global_users():
                                 connection_string=res.get("connection_string"),
                                 plan_id=first_global_plan_id,
                             )
+                        if not persisted:
+                            raise RuntimeError("Auto-provision result could not be safely persisted")
                         total_keys_created += 1
                         _mark_host_success(host_name)
                         logger.info(
                             f"Scheduler: Successfully created key for user {user_id} on host '{host_name}'"
                         )
                     else:
-                        _mark_host_failure(host_name, "auto-provision returned no result")
+                        _mark_host_failure(
+                            host_name, "auto-provision returned no result"
+                        )
                         logger.error(
                             f"Scheduler: Failed to create key for user {user_id} on host '{host_name}'"
                         )
@@ -1337,6 +1395,8 @@ async def auto_provision_new_hosts_for_global_users():
                 f"Scheduler: Error processing user {user_id} for auto-provision: {e}"
             )
             total_errors += 1
+        finally:
+            subscription_operations.release(user_id)
 
     logger.info(
         f"Scheduler: Auto-provision finished. Users processed: {total_users_processed}, Keys created: {total_keys_created}, Errors: {total_errors}"
@@ -1354,9 +1414,10 @@ async def refresh_xui_host_health() -> dict:
     semaphore = asyncio.Semaphore(_HOST_HEALTH_MAX_CONCURRENCY)
     host_groups: dict[str, list[dict]] = {}
     for host in hosts:
-        host_groups.setdefault(str(host.get("host_url") or host["host_name"]), []).append(
-            host
-        )
+        host_groups.setdefault(
+            host_selector.panel_group_key(host.get("host_url"), host["host_name"]),
+            [],
+        ).append(host)
 
     async def _probe(group_hosts: list[dict]) -> None:
         host_name = group_hosts[0]["host_name"]
@@ -1425,10 +1486,10 @@ async def refresh_xui_host_health() -> dict:
 
 
 async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
-    """Collect per-client IP counts once per physical panel and process breaches."""
+    """Process fresh, subscription-wide IP activity without retaining raw IPs."""
     result = {
         "panels": 0,
-        "keys": 0,
+        "users": 0,
         "warnings": 0,
         "enforced": 0,
         "resolved": 0,
@@ -1439,6 +1500,9 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
 
     limit_count = _int_setting("ip_limit_max_ips", 10, 1, 100)
     grace_hours = _int_setting("ip_limit_warning_grace_hours", 24, 1, 168)
+    activity_window_minutes = _int_setting(
+        "ip_limit_activity_window_minutes", 10, 1, 60
+    )
     hosts = await asyncio.to_thread(database.get_all_hosts, True)
     if not hosts:
         return result
@@ -1447,29 +1511,40 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
     # The bulk IP endpoint is panel-wide, so query each physical panel once.
     host_groups: dict[str, list[dict]] = {}
     for host in hosts:
-        group_key = str(host.get("host_url") or host.get("host_name") or "")
+        group_key = host_selector.panel_group_key(
+            host.get("host_url"), host.get("host_name")
+        )
         host_groups.setdefault(group_key, []).append(host)
 
     now = time_utils.get_msk_now()
+    now_timestamp = int(time.time())
+    activity_cutoff = now_timestamp - activity_window_minutes * 60
     semaphore = asyncio.Semaphore(_IP_LIMIT_MAX_CONCURRENCY)
-    observations: list[dict] = []
+    activity_by_user: dict[int, set[str]] = {}
+    observed_user_ids: set[int] = set()
+    snapshot_complete = True
 
     async def _collect(group: list[dict]) -> None:
+        nonlocal snapshot_complete
         representative = group[0]
         keys_by_email: dict[str, dict] = {}
         for host in group:
             host_name = host.get("host_name")
             if not host_name:
                 continue
-            host_keys = await asyncio.to_thread(
-                database.get_keys_for_host, host_name
-            )
+            host_keys = await asyncio.to_thread(database.get_keys_for_host, host_name)
             for key in host_keys:
                 email = key.get("key_email")
                 expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
                 if not email or not expiry or expiry <= now:
                     continue
                 keys_by_email[str(email)] = key
+                try:
+                    user_id = int(key["user_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                observed_user_ids.add(user_id)
+                activity_by_user.setdefault(user_id, set())
 
         if not keys_by_email:
             return
@@ -1489,6 +1564,7 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                 representative.get("host_name"),
                 e,
             )
+            snapshot_complete = False
             return
 
         result["panels"] += 1
@@ -1500,88 +1576,111 @@ async def monitor_xui_ip_limits(bot: Bot | None = None) -> dict:
                 "observations skipped to avoid promising unenforced limits.",
                 representative.get("host_name"),
             )
+            snapshot_complete = False
             return
 
-        counts = panel_result.get("counts") or {}
+        activity = panel_result.get("activity") or {}
         for email, key in keys_by_email.items():
-            observations.append(
-                {
-                    "key_id": key.get("key_id"),
-                    "user_id": key.get("user_id"),
-                    "host_name": key.get("host_name"),
-                    "key_email": email,
-                    "ip_count": int(counts.get(email, 0) or 0),
-                }
-            )
+            try:
+                user_id = int(key["user_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            for item in activity.get(email) or []:
+                fingerprint = str(item.get("fingerprint") or "")
+                try:
+                    timestamp = int(item.get("timestamp"))
+                except (TypeError, ValueError):
+                    continue
+                if fingerprint and activity_cutoff <= timestamp <= now_timestamp + 60:
+                    activity_by_user[user_id].add(fingerprint)
 
     await asyncio.gather(*(_collect(group) for group in host_groups.values()))
-    result["keys"] = len(observations)
+    if not snapshot_complete:
+        logger.warning(
+            "Scheduler: Global IP-limit snapshot incomplete; no user states changed."
+        )
+        return result
+
+    observed_user_ids.update(
+        await asyncio.to_thread(database.get_pending_xui_ip_limit_user_ids)
+    )
+    observations = [
+        {
+            "user_id": user_id,
+            "ip_count": len(activity_by_user.get(user_id, set())),
+        }
+        for user_id in sorted(observed_user_ids)
+    ]
+    result["users"] = len(observations)
     actions = await asyncio.to_thread(
-        database.process_xui_ip_limit_observations,
+        database.process_xui_ip_limit_user_observations,
         observations,
         limit_count,
         grace_hours,
+        2,
     )
     result["warnings"] = len(actions["warnings"])
     result["enforced"] = len(actions["enforced"])
     result["resolved"] = len(actions["resolved"])
+    pruned_history = await asyncio.to_thread(
+        database.prune_xui_ip_limit_user_history,
+        _IP_LIMIT_HISTORY_RETENTION_DAYS,
+    )
+    if pruned_history:
+        logger.info(
+            "Scheduler: Removed %s completed IP-limit event(s) older than %s days.",
+            pruned_history,
+            _IP_LIMIT_HISTORY_RETENTION_DAYS,
+        )
 
-    warnings_by_user: dict[int, list[dict]] = {}
     for warning in actions["warnings"]:
-        warnings_by_user.setdefault(int(warning["user_id"]), []).append(warning)
-
-    for user_id, user_warnings in warnings_by_user.items():
+        user_id = int(warning["user_id"])
         if bot is None:
             continue
-        details = "\n".join(
-            f"• <b>{html.escape(str(item['host_name']))}</b>: "
-            f"{item['ip_count']} IP при лимите {item['limit_count']}"
-            for item in user_warnings[:10]
-        )
         message = (
-            "⚠️ <b>Предупреждение о подключениях</b>\n\n"
-            "Обнаружено превышение количества одновременно используемых "
-            f"IP-адресов:\n{details}\n\n"
-            "Сейчас доступ ещё не ограничен. Пожалуйста, отключите лишние "
-            f"устройства в течение {grace_hours} ч. После этого 3x-ui будет "
-            "автоматически отключать подключения сверх лимита.\n\n"
-            "Если это ваши устройства или мобильная сеть часто меняет IP, "
-            "напишите в поддержку."
+            "⚠️ <b>Превышен лимит подключений</b>\n\n"
+            "В вашей подписке обнаружено "
+            f"<b>{warning['ip_count']} активных подключений</b> при лимите "
+            f"<b>{warning['limit_count']}</b>.\n\n"
+            "Доступ пока продолжает работать. Пожалуйста, отключите лишние "
+            f"устройства в течение <b>{grace_hours} ч.</b> После окончания "
+            "этого срока подключения сверх лимита будут автоматически "
+            "блокироваться.\n\n"
+            "Если все подключения принадлежат вам или IP-адрес часто меняется "
+            "из-за мобильной сети, напишите в поддержку — мы проверим ситуацию "
+            "и поможем разобраться."
         )
         try:
             await bot.send_message(user_id, message, parse_mode="HTML")
-            for warning in user_warnings:
-                await asyncio.to_thread(
-                    database.mark_xui_ip_limit_warning_result,
-                    warning["key_id"],
-                    None,
-                )
+            await asyncio.to_thread(
+                database.mark_xui_ip_limit_user_warning_result,
+                user_id,
+                None,
+            )
         except TelegramForbiddenError as e:
-            for warning in user_warnings:
-                await asyncio.to_thread(
-                    database.mark_xui_ip_limit_warning_result,
-                    warning["key_id"],
-                    f"Telegram delivery forbidden: {e}",
-                )
+            await asyncio.to_thread(
+                database.mark_xui_ip_limit_user_warning_result,
+                user_id,
+                f"Telegram delivery forbidden: {e}",
+            )
         except Exception as e:
             result["errors"] += 1
             logger.warning(
-                "Scheduler: Could not send IP-limit warning for user %s (%s key(s)): %s",
+                "Scheduler: Could not send IP-limit warning for user %s: %s",
                 user_id,
-                len(user_warnings),
                 e,
             )
 
     if actions["enforced"]:
         logger.warning(
-            "Scheduler: IP limit moved to enforcement for %s key(s).",
+            "Scheduler: IP limit moved to enforcement for %s user(s).",
             len(actions["enforced"]),
         )
     logger.info(
-        "Scheduler: IP-limit monitor finished. panels=%s keys=%s warnings=%s "
+        "Scheduler: IP-limit monitor finished. panels=%s users=%s warnings=%s "
         "enforced=%s resolved=%s errors=%s",
         result["panels"],
-        result["keys"],
+        result["users"],
         result["warnings"],
         result["enforced"],
         result["resolved"],
@@ -1813,11 +1912,15 @@ async def process_pending_yookassa_payments(bot: Bot) -> None:
             )
             continue
 
-        metadata = {}
-        if hasattr(payment, "metadata") and payment.metadata:
-            metadata = dict(payment.metadata)
-        if not metadata:
-            metadata = dict(tx.get("metadata_dict") or {})
+        stored_metadata = dict(tx.get("metadata_dict") or {})
+        provider_metadata = (
+            dict(payment.metadata)
+            if hasattr(payment, "metadata") and payment.metadata
+            else {}
+        )
+        metadata = _merge_yookassa_payment_metadata(
+            stored_metadata, provider_metadata
+        )
         if not metadata:
             logger.error(
                 "Scheduler: YooKassa payment %s succeeded but has no metadata.",
@@ -1856,6 +1959,7 @@ async def process_pending_yookassa_payments(bot: Bot) -> None:
             payment_method="YooKassa",
             amount_currency=float(api_amount) if api_amount is not None else None,
             currency_name=api_currency,
+            preserve_fulfillment_state=True,
         )
         if reserved_metadata is None:
             logger.info(
@@ -1924,18 +2028,13 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
         if not payment_id:
             continue
 
-        metadata = dict(tx.get("metadata_dict") or {})
-        method = metadata.get("payment_method") or tx.get("payment_method") or "Unknown"
-        currency_name = tx.get("currency_name")
-        amount_currency = tx.get("amount_currency")
-
+        # The queue is only a list of candidate ids. Another attempt may have
+        # returned a newer checkpoint to pending since this snapshot was read.
         reserved_metadata = await asyncio.to_thread(
             database.reserve_pending_transaction,
             payment_id,
-            metadata,
-            payment_method=method,
-            amount_currency=amount_currency,
-            currency_name=currency_name,
+            preserve_fulfillment_state=True,
+            require_paid_confirmation=True,
         )
         if reserved_metadata is None:
             logger.info(
@@ -1962,9 +2061,6 @@ async def process_pending_paid_provider_retries(bot: Bot) -> None:
             payment_id,
             success=bool(processed_ok),
             metadata=reserved_metadata,
-            payment_method=method,
-            amount_currency=amount_currency,
-            currency_name=currency_name,
         )
         if not finalized:
             logger.error(
@@ -2008,9 +2104,72 @@ async def expire_stale_unpaid_stars_payments() -> None:
         )
 
 
+async def _run_scheduler_step(controller, cycle, name, operation):
+    monitor = getattr(controller, "runtime_health", None)
+    if monitor:
+        monitor.progress(cycle, name)
+    try:
+        await operation()
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        if monitor:
+            monitor.step_failed(cycle, name)
+        logger.error("Scheduler step failed: cycle=%s step=%s error=%s",
+                     cycle, name, type(error).__name__)
+        return False
+
+
+async def periodic_payment_check(bot_controller: BotController) -> None:
+    """Keep payment recovery moving even when a maintenance panel is slow."""
+    logger.info("Payment recovery scheduler has been started.")
+    monitor = getattr(bot_controller, "runtime_health", None)
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
+    while True:
+        cycle_error = False
+        if monitor:
+            monitor.cycle_started("payments")
+        try:
+            if bot_controller.get_status().get("is_running"):
+                bot = bot_controller.get_bot_instance()
+                if bot:
+                    step_ok = await _run_scheduler_step(
+                        bot_controller, "payments", "recover_interrupted_payment_processing",
+                        lambda: recover_interrupted_payment_processing(),
+                    )
+                    cycle_error = cycle_error or not step_ok
+                    step_ok = await _run_scheduler_step(
+                        bot_controller, "payments", "process_pending_yookassa_payments",
+                        lambda: process_pending_yookassa_payments(bot),
+                    )
+                    cycle_error = cycle_error or not step_ok
+                    step_ok = await _run_scheduler_step(
+                        bot_controller, "payments", "process_pending_paid_provider_retries",
+                        lambda: process_pending_paid_provider_retries(bot),
+                    )
+                    cycle_error = cycle_error or not step_ok
+                    step_ok = await _run_scheduler_step(
+                        bot_controller, "payments", "expire_stale_unpaid_stars_payments",
+                        lambda: expire_stale_unpaid_stars_payments(),
+                    )
+                    cycle_error = cycle_error or not step_ok
+                else:
+                    logger.warning(
+                        "Payment scheduler: Bot is marked as running, but instance is not available."
+                    )
+        except Exception:
+            cycle_error = True
+            logger.exception("Payment scheduler: cycle failed")
+        if monitor:
+            monitor.cycle_finished("payments", error=cycle_error)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
 async def periodic_subscription_check(bot_controller: BotController):
     logger.info("Scheduler has been started.")
-    await asyncio.sleep(10)
+    monitor = getattr(bot_controller, "runtime_health", None)
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
 
     # Track when XTLS sync was last performed (run every 5 min instead of every CHECK_INTERVAL)
     xtls_sync_interval = 300  # 5 minutes
@@ -2020,6 +2179,9 @@ async def periodic_subscription_check(bot_controller: BotController):
     last_client_state_enforce_time = 0
 
     while True:
+        cycle_error = False
+        if monitor:
+            monitor.cycle_started("subscriptions")
         try:
             current_time = time.time()
             # Expiry is already stored in Xray. This pass is a reconciliation
@@ -2029,67 +2191,85 @@ async def periodic_subscription_check(bot_controller: BotController):
                 current_time - last_client_state_enforce_time
                 >= _CLIENT_STATE_ENFORCE_INTERVAL_SECONDS
             ):
-                await enforce_clients_state_from_db()
-                last_client_state_enforce_time = time.time()
+                step_ok = await _run_scheduler_step(
+                    bot_controller, "subscriptions", "enforce_clients_state_from_db",
+                    lambda: enforce_clients_state_from_db(),
+                )
+                cycle_error = cycle_error or not step_ok
+                if step_ok:
+                    last_client_state_enforce_time = time.time()
 
             # Enforce MTG proxy states (start active, stop expired)
-            await enforce_mtg_proxies_state()
+            step_ok = await _run_scheduler_step(
+                bot_controller, "subscriptions", "enforce_mtg_proxies_state",
+                lambda: enforce_mtg_proxies_state(),
+            )
+            cycle_error = cycle_error or not step_ok
 
             if _bool_setting("panel_sync_enabled", default=False):
-                await sync_keys_with_panels()
+                step_ok = await _run_scheduler_step(
+                    bot_controller, "subscriptions", "sync_keys_with_panels",
+                    lambda: sync_keys_with_panels(),
+                )
+                cycle_error = cycle_error or not step_ok
             else:
                 logger.debug(
                     "Scheduler: panel sync disabled (panel_sync_enabled=false)."
                 )
 
             # Run cleanup once per cycle (or could be less frequent, but this is cheap)
-            await cleanup_old_notifications()
+            step_ok = await _run_scheduler_step(
+                bot_controller, "subscriptions", "cleanup_old_notifications",
+                lambda: cleanup_old_notifications(),
+            )
+            cycle_error = cycle_error or not step_ok
 
             # Auto-provision new hosts for global subscription users
-            await auto_provision_new_hosts_for_global_users()
+            step_ok = await _run_scheduler_step(
+                bot_controller, "subscriptions", "auto_provision_new_hosts_for_global_users",
+                lambda: auto_provision_new_hosts_for_global_users(),
+            )
+            cycle_error = cycle_error or not step_ok
 
             # Run XTLS sync separately on its own interval (every 5 minutes)
             current_time = time.time()
-            if (
-                current_time - last_host_health_time
-                >= _HOST_HEALTH_INTERVAL_SECONDS
-            ):
-                await refresh_xui_host_health()
-                last_host_health_time = time.time()
+            if current_time - last_host_health_time >= _HOST_HEALTH_INTERVAL_SECONDS:
+                step_ok = await _run_scheduler_step(
+                    bot_controller, "subscriptions", "refresh_xui_host_health",
+                    lambda: refresh_xui_host_health(),
+                )
+                cycle_error = cycle_error or not step_ok
+                if step_ok:
+                    last_host_health_time = time.time()
 
             if current_time - last_ip_limit_time >= _IP_LIMIT_INTERVAL_SECONDS:
                 warning_bot = None
                 if bot_controller.get_status().get("is_running"):
                     warning_bot = bot_controller.get_bot_instance()
-                await monitor_xui_ip_limits(warning_bot)
-                last_ip_limit_time = time.time()
+                step_ok = await _run_scheduler_step(
+                    bot_controller, "subscriptions", "monitor_xui_ip_limits",
+                    lambda: monitor_xui_ip_limits(warning_bot),
+                )
+                cycle_error = cycle_error or not step_ok
+                if step_ok:
+                    last_ip_limit_time = time.time()
 
             if (
                 _bool_setting("xtls_sync_enabled", default=False)
                 and current_time - last_xtls_sync_time >= xtls_sync_interval
             ):
-                await periodic_xtls_sync()
-                last_xtls_sync_time = current_time
+                step_ok = await _run_scheduler_step(
+                    bot_controller, "subscriptions", "periodic_xtls_sync",
+                    lambda: periodic_xtls_sync(),
+                )
+                cycle_error = cycle_error or not step_ok
+                if step_ok:
+                    last_xtls_sync_time = current_time
             elif current_time - last_xtls_sync_time >= xtls_sync_interval:
                 logger.debug("Scheduler: XTLS sync disabled (xtls_sync_enabled=false).")
 
-            if bot_controller.get_status().get("is_running"):
-                bot = bot_controller.get_bot_instance()
-                if bot:
-                    await recover_interrupted_payment_processing()
-                    await process_pending_yookassa_payments(bot)
-                    await process_pending_paid_provider_retries(bot)
-                    await expire_stale_unpaid_stars_payments()
-                    await check_expiring_subscriptions(bot)
-                    await check_idle_onboarding_users(bot)
-                else:
-                    logger.warning(
-                        "Scheduler: Bot is marked as running, but instance is not available."
-                    )
-            else:
-                logger.info("Scheduler: Bot is stopped, skipping user notifications.")
-
         except Exception as e:
+            cycle_error = True
             logger.error(
                 f"Scheduler: An unhandled error occurred in the main loop: {e}",
                 exc_info=True,
@@ -2098,4 +2278,34 @@ async def periodic_subscription_check(bot_controller: BotController):
         logger.info(
             f"Scheduler: Cycle finished. Next check in {CHECK_INTERVAL_SECONDS} seconds."
         )
+        if monitor:
+            monitor.cycle_finished("subscriptions", error=cycle_error)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def periodic_notification_check(bot_controller):
+    """Keep notifications independent of slow panel maintenance."""
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
+    monitor = getattr(bot_controller, "runtime_health", None)
+    while True:
+        error = False
+        if monitor:
+            monitor.cycle_started("notifications")
+        try:
+            if bot_controller.get_status().get("is_running"):
+                bot = bot_controller.get_bot_instance()
+                if bot:
+                    for operation in (check_expiring_subscriptions, check_idle_onboarding_users):
+                        ok = await _run_scheduler_step(
+                            bot_controller, "notifications", operation.__name__,
+                            lambda operation=operation: operation(bot),
+                        )
+                        error = error or not ok
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = True
+            logger.error("Notification cycle failed: %s", type(exc).__name__)
+        if monitor:
+            monitor.cycle_finished("notifications", error=error)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)

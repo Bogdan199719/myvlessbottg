@@ -182,7 +182,8 @@ def main() -> int:
         assert database.create_pending_transaction(
             "accounting-once", 101, 200.0, accounting_metadata
         )
-        assert database.reserve_pending_transaction("accounting-once")
+        accounting_metadata = database.reserve_pending_transaction("accounting-once")
+        assert accounting_metadata
         assert database.apply_payment_accounting_once(
             "accounting-once", 101, 200.0, 1, 102, 20.0, accounting_metadata
         )
@@ -239,6 +240,9 @@ def main() -> int:
             now,
         )
         assert free_summary["status"] == "free"
+        assert free_summary["earliest_active_expiry"] == time_utils.parse_iso_to_msk(
+            active_expiry
+        )
 
         paid_summary = _summarize_user_subscription(
             {"paid_transaction_count": 1, "free_transaction_count": 0},
@@ -273,6 +277,15 @@ def main() -> int:
             now,
         )
         assert expired_free_summary["status"] == "free_expired"
+
+        assert database.is_global_xui_key(
+            {"service_type": "xui", "plan_id": 0, "key_email": "user101-global-host"},
+            set(),
+        )
+        assert not database.is_global_xui_key(
+            {"service_type": "xui", "plan_id": 0, "key_email": "user101-local-host"},
+            set(),
+        )
 
     print("Subscription business-rule checks: OK")
     return 0

@@ -62,6 +62,8 @@ def _check_route_invariants() -> None:
     source = APP_PATH.read_text(encoding="utf-8")
     users_source = _function_source(source, "users_page")
     keys_source = _function_source(source, "keys_page")
+    bulk_users_source = _function_source(source, "bulk_users_route")
+    bulk_keys_source = _function_source(source, "bulk_keys_route")
 
     assert "get_user_keys(" not in users_source, (
         "users_page must not issue one key query per user"
@@ -75,6 +77,11 @@ def _check_route_invariants() -> None:
     assert '"connection_string"' not in keys_source.split(
         '"search":', 1
     )[1], "key secrets must not be included in the search text"
+    assert '_requested_bulk_ids("user_ids")' in bulk_users_source
+    assert '{"ban", "unban", "revoke", "delete"}' in bulk_users_source
+    assert '_requested_bulk_ids("key_ids", limit=250)' in bulk_keys_source
+    assert "_delete_remote_user_key(key)" in bulk_keys_source
+    assert "delete_keys_by_ids(revoked_ids)" in bulk_keys_source
 
 
 def _check_templates() -> None:
@@ -100,6 +107,12 @@ def _check_templates() -> None:
         "admin key secrets must be loaded on demand, not embedded in HTML"
     )
     assert "data-secret-url=" in keys_template
+    assert 'id="bulkUsersForm"' in users_template
+    assert 'name="user_ids"' in users_template
+    assert "data-bulk-select-all" in users_template
+    assert 'id="bulkKeysForm"' in keys_template
+    assert "data-bulk-values=" in keys_template
+    assert "data-bulk-select-all" in keys_template
 
     app_source = APP_PATH.read_text(encoding="utf-8")
     assert '@flask_app.route("/keys/<int:key_id>/secret")' in app_source

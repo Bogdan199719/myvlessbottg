@@ -42,6 +42,39 @@ def build_happ_redirect_url(subscription_token: str | None) -> str | None:
     return f"{domain.rstrip('/')}/happ/{token}"
 
 
+def build_incy_redirect_url(subscription_token: str | None) -> str | None:
+    domain = (get_setting("domain") or "").strip()
+    token = (subscription_token or "").strip()
+    if not domain or not token:
+        return None
+    if not domain.startswith(("http://", "https://")):
+        domain = f"https://{domain}"
+    return f"{domain.rstrip('/')}/incy/{token}"
+
+
+def _add_subscription_client_buttons(
+    builder: InlineKeyboardBuilder,
+    subscription_token: str,
+) -> None:
+    buttons = []
+    happ_url = build_happ_redirect_url(subscription_token)
+    if happ_url:
+        buttons.append(
+            InlineKeyboardButton(
+                text="🔌 Happ", url=happ_url, style="success"
+            )
+        )
+    incy_url = build_incy_redirect_url(subscription_token)
+    if incy_url:
+        buttons.append(
+            InlineKeyboardButton(
+                text="📲 Incy", url=incy_url, style="primary"
+            )
+        )
+    if buttons:
+        builder.row(*buttons)
+
+
 def create_main_menu_keyboard(
     user_keys: list, trial_available: bool, is_admin: bool
 ) -> InlineKeyboardMarkup:
@@ -354,50 +387,40 @@ def create_global_link_keyboard(
     subscription_link: str, subscription_token: str
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    happ_url = build_happ_redirect_url(subscription_token)
-    if happ_url:
-        builder.button(
-            text="🔌 Подключить в Happ",
-            url=happ_url,
-            style="success",
-        )
+    _add_subscription_client_buttons(builder, subscription_token)
     builder.row(
         InlineKeyboardButton(
-            text="📋 Скопировать ссылку",
-            copy_text=CopyTextButton(text=subscription_link),
-            style="primary",
-        )
+            text="📱 QR-код", callback_data=f"global_qr_{subscription_token}"
+        ),
+        InlineKeyboardButton(text="📖 Инструкция", callback_data="global_howto"),
     )
-    builder.button(text="📱 QR-код", callback_data=f"global_qr_{subscription_token}")
-    builder.button(text="📖 Инструкция", callback_data="global_howto")
-    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
-    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main_menu"))
     return builder.as_markup()
 
 
 def create_global_sub_keyboard(subscription_token: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    happ_url = build_happ_redirect_url(subscription_token)
-    if happ_url:
-        builder.button(
-            text="🔌 Подключить в Happ",
-            url=happ_url,
+    _add_subscription_client_buttons(builder, subscription_token)
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Продлить подписку",
+            callback_data="select_host_new_ALL",
             style="success",
         )
-    builder.button(
-        text="➕ Продлить подписку",
-        callback_data="select_host_new_ALL",
-        style="success",
     )
-    builder.button(
-        text="🔗 Ссылка подписки",
-        callback_data=f"global_link_{subscription_token}",
-        style="primary",
+    builder.row(
+        InlineKeyboardButton(
+            text="🔗 Показать ссылку",
+            callback_data=f"global_link_{subscription_token}",
+        ),
+        InlineKeyboardButton(
+            text="📱 QR-код", callback_data=f"global_qr_{subscription_token}"
+        ),
     )
-    builder.button(text="📱 QR-код", callback_data=f"global_qr_{subscription_token}")
-    builder.button(text="📖 Инструкция", callback_data="global_howto")
-    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
-    builder.adjust(1)
+    builder.row(
+        InlineKeyboardButton(text="📖 Инструкция", callback_data="global_howto"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main_menu"),
+    )
     return builder.as_markup()
 
 
@@ -498,40 +521,53 @@ def create_proxy_keys_keyboard(mtg_keys: list) -> InlineKeyboardMarkup:
 
 def create_global_info_keyboard(subscription_token: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    happ_url = build_happ_redirect_url(subscription_token)
-    if happ_url:
-        builder.button(
-            text="🔌 Подключить в Happ",
-            url=happ_url,
+    _add_subscription_client_buttons(builder, subscription_token)
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Продлить подписку",
+            callback_data="select_host_new_ALL",
             style="success",
         )
-    builder.button(
-        text="➕ Продлить подписку",
-        callback_data="select_host_new_ALL",
-        style="success",
     )
-    builder.button(
-        text="🔗 Ссылка подписки",
-        callback_data=f"global_link_{subscription_token}",
-        style="primary",
+    builder.row(
+        InlineKeyboardButton(
+            text="🔗 Показать ссылку",
+            callback_data=f"global_link_{subscription_token}",
+        ),
+        InlineKeyboardButton(
+            text="📱 QR-код", callback_data=f"global_qr_{subscription_token}"
+        ),
     )
-    builder.button(text="📱 QR-код", callback_data=f"global_qr_{subscription_token}")
-    builder.button(text="📖 Инструкция", callback_data="global_howto")
-    builder.button(text="← Назад", callback_data="manage_keys")
-    builder.adjust(1)
+    builder.row(
+        InlineKeyboardButton(text="📖 Инструкция", callback_data="global_howto"),
+        InlineKeyboardButton(text="← Назад", callback_data="manage_keys"),
+    )
     return builder.as_markup()
 
 
-def create_howto_vless_keyboard() -> InlineKeyboardMarkup:
+def create_howto_vless_keyboard(
+    subscription_token: str | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🌍 Что такое подписка", callback_data="global_howto")
-    builder.button(text="📱 Android", callback_data="howto_android")
-    builder.button(text="📱 iOS", callback_data="howto_ios")
-    builder.button(text="💻 Windows", callback_data="howto_windows")
-    builder.button(text="🍎 MacOS", callback_data="howto_macos")
-    builder.button(text="🐧 Linux", callback_data="howto_linux")
-    builder.button(text="🏠 В меню", callback_data="back_to_main_menu")
-    builder.adjust(1, 2, 2, 1)
+    if subscription_token:
+        _add_subscription_client_buttons(builder, subscription_token)
+    builder.row(
+        InlineKeyboardButton(
+            text="🌍 Что такое подписка", callback_data="global_howto"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="📱 Android", callback_data="howto_android"),
+        InlineKeyboardButton(text="📱 iOS", callback_data="howto_ios"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="💻 Windows", callback_data="howto_windows"),
+        InlineKeyboardButton(text="🍎 MacOS", callback_data="howto_macos"),
+    )
+    builder.row(InlineKeyboardButton(text="🐧 Linux", callback_data="howto_linux"))
+    builder.row(
+        InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main_menu")
+    )
     return builder.as_markup()
 
 
@@ -562,54 +598,24 @@ def create_welcome_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    if channel_url and terms_url and privacy_url and is_subscription_forced:
-        builder.button(text="📢 Перейти в канал", url=channel_url)
+    if channel_url:
+        builder.button(
+            text=(
+                "📢 Перейти в канал"
+                if is_subscription_forced
+                else "📢 Наш канал (не обязательно)"
+            ),
+            url=channel_url,
+        )
+    if terms_url:
         builder.button(text="📄 Условия использования", url=terms_url)
+    if privacy_url:
         builder.button(text="🔒 Политика конфиденциальности", url=privacy_url)
-        builder.button(
-            text="✅ Я подписался",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
-    elif channel_url and terms_url and privacy_url:
-        builder.button(text="📢 Наш канал (не обязательно)", url=channel_url)
-        builder.button(text="📄 Условия использования", url=terms_url)
-        builder.button(text="🔒 Политика конфиденциальности", url=privacy_url)
-        builder.button(
-            text="✅ Принимаю условия",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
-    elif terms_url and privacy_url:
-        builder.button(text="📄 Условия использования", url=terms_url)
-        builder.button(text="🔒 Политика конфиденциальности", url=privacy_url)
-        builder.button(
-            text="✅ Принимаю условия",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
-    elif terms_url:
-        builder.button(text="📄 Условия использования", url=terms_url)
-        builder.button(
-            text="✅ Принимаю условия",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
-    elif privacy_url:
-        builder.button(text="🔒 Политика конфиденциальности", url=privacy_url)
-        builder.button(
-            text="✅ Принимаю условия",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
-    else:
-        if channel_url:
-            builder.button(text="📢 Наш канал (не обязательно)", url=channel_url)
-        builder.button(
-            text="✅ Я подписался",
-            callback_data="check_subscription_and_agree",
-            style="success",
-        )
+    builder.button(
+        text="✅ Я подписался" if is_subscription_forced else "✅ Принимаю условия",
+        callback_data="check_subscription_and_agree",
+        style="success",
+    )
     builder.adjust(1)
     return builder.as_markup()
 

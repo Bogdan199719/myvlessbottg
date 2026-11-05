@@ -1,5 +1,6 @@
 import os
 import logging
+import math
 import asyncio
 import concurrent.futures
 import json
@@ -18,7 +19,10 @@ import time as _time
 from collections import defaultdict
 from hmac import compare_digest
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from shop_bot.utils import time_utils, update_manager
+from shop_bot.utils.login_attempts import login_is_limited, record_login_failure
+from shop_bot.utils.subscription_rules import configured_trial_days, is_trial_xui_key
 from shop_bot.utils.admin_ids import normalize_admin_telegram_ids
 from shop_bot.utils.ip_allowlist import get_client_ip, is_ip_allowlisted
 from shop_bot.version import APP_VERSION
@@ -50,7 +54,9 @@ logger = logging.getLogger(__name__)
 from yookassa import Configuration
 from yookassa import Payment
 
-from shop_bot.modules import mtg_api, xui_api
+from shop_bot.modules import host_selector, mtg_api, xui_api
+from shop_bot.modules.panel_jobs import run_panel_jobs
+from shop_bot.modules import subscription_operations
 from shop_bot.bot import handlers
 from shop_bot.webhook_server.subscription_api import subscription_bp
 from shop_bot.webhook_server.restore_manager import (
@@ -63,7 +69,10 @@ from shop_bot.data_manager.database import (
     update_setting,
     get_all_hosts,
     get_all_xui_host_health,
-    get_xui_ip_limit_events,
+    get_enforced_xui_ip_limit_user_ids,
+    get_xui_ip_limit_user_events,
+    enforce_xui_ip_limit_user_now,
+    release_xui_ip_limit_users,
     get_plans_for_host,
     create_host,
     delete_host,
@@ -85,6 +94,8 @@ from shop_bot.data_manager.database import (
     update_key_info,
     get_plan_by_id,
     reserve_pending_transaction,
+    get_cryptobot_binding_state,
+    update_reserved_transaction_metadata,
     finalize_reserved_transaction,
     get_all_keys_with_usernames,
     update_key_connection_string,
@@ -137,6 +148,7 @@ ADMIN_LIST_DEFAULT_PER_PAGE = 50
 ADMIN_LIST_ALLOWED_PER_PAGE = {25, 50, 100}
 XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS = 120
 XUI_FIX_HOST_TIMEOUT_SECONDS = 60
+XUI_MAINTENANCE_PANEL_CONCURRENCY = 3
 
 
 def _admin_list_request_args(allowed_statuses: set[str]) -> tuple[str, str, int, int]:
@@ -196,15 +208,8 @@ def _is_xui_key(key: dict) -> bool:
     return key.get("service_type", "xui") != "mtg"
 
 
-def _is_trial_key(key: dict) -> bool:
-    return _is_xui_key(key) and _key_plan_id(key) <= 0
-
-
 def _configured_trial_duration_days() -> float:
-    try:
-        return max(1.0, float(get_setting("trial_duration_days") or 1))
-    except (TypeError, ValueError):
-        return 1.0
+    return configured_trial_days(get_setting("trial_duration_days"))
 
 
 def _user_has_paid_subscription(user: dict) -> bool:
@@ -227,23 +232,14 @@ def _key_is_trial_for_user(
     user: dict | None = None,
     trial_duration_days: float | None = None,
 ) -> bool:
-    if not _is_trial_key(key):
+    if not _is_xui_key(key) or _key_plan_id(key) > 0:
         return False
-
-    created = time_utils.parse_iso_to_msk(key.get("created_date"))
-    expiry = time_utils.parse_iso_to_msk(key.get("expiry_date"))
-    if not created or not expiry:
-        return True
-
     configured_days = (
         trial_duration_days
         if trial_duration_days is not None
         else _configured_trial_duration_days()
     )
-    grace_seconds = 6 * 3600
-    return (expiry - created).total_seconds() <= (
-        configured_days * 86400 + grace_seconds
-    )
+    return is_trial_xui_key(key, configured_days)
 
 
 def _key_is_trial_for_owner(
@@ -302,6 +298,7 @@ def _summarize_user_subscription(
     active_total = 0
     paid_keys_total = 0
     latest_paid_expiry = None
+    earliest_active_expiry = None
 
     for key in keys:
         if not _is_xui_key(key):
@@ -318,6 +315,8 @@ def _summarize_user_subscription(
             continue
 
         active_total += 1
+        if earliest_active_expiry is None or expiry < earliest_active_expiry:
+            earliest_active_expiry = expiry
 
         if is_trial_key:
             trial_active += 1
@@ -378,6 +377,7 @@ def _summarize_user_subscription(
         "label": label,
         "css_class": css_class,
         "active_total": active_total,
+        "earliest_active_expiry": earliest_active_expiry,
         "paid_active": paid_active,
         "trial_active": trial_active,
         "paid_keys_total": paid_keys_total,
@@ -669,28 +669,15 @@ def _sanitize_csv_cell(value) -> str:
 
 def _reserve_pending_transaction_for_cryptobot(
     payment_id: str,
-    *,
-    amount_currency=None,
-    currency_name: str | None = None,
+    invoice_id: str,
+    paid_amount,
 ) -> dict | None:
     return reserve_pending_transaction(
         payment_id,
         payment_method="CryptoBot",
-        amount_currency=amount_currency,
-        currency_name=currency_name,
+        expected_cryptobot_invoice_id=invoice_id,
+        expected_cryptobot_amount=paid_amount,
     )
-
-
-def _extract_cryptobot_secret_from_request() -> str | None:
-    header_secret = (request.headers.get("X-CryptoBot-Secret") or "").strip()
-    if header_secret:
-        return header_secret
-
-    authorization = (request.headers.get("Authorization") or "").strip()
-    if authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-
-    return None
 
 
 def _is_valid_cryptobot_signature() -> bool:
@@ -757,6 +744,7 @@ ALL_SETTINGS_KEYS = [
     "ip_limit_enabled",
     "ip_limit_max_ips",
     "ip_limit_warning_grace_hours",
+    "ip_limit_activity_window_minutes",
     "subscription_live_sync",
     "subscription_live_stats",
     "subscription_allow_fallback_host_fetch",
@@ -861,16 +849,29 @@ def create_webhook_app(bot_controller_instance):
     def healthz():
         db_ok = False
         try:
-            with sqlite3.connect(DB_FILE, timeout=2) as conn:
-                conn.execute("SELECT 1")
+            database_uri = Path(DB_FILE).resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(database_uri, uri=True, timeout=0.25) as conn:
+                for table, column in (
+                    ("users", "telegram_id"), ("vpn_keys", "key_id"),
+                    ("transactions", "payment_id"), ("bot_settings", "key"),
+                ):
+                    conn.execute(f"SELECT {column} FROM {table} LIMIT 0")
             db_ok = True
         except sqlite3.Error:
-            logger.exception("Health check failed: database is unavailable")
+            logger.error("Health check failed: application database is unavailable")
 
         loop = current_app.config.get("EVENT_LOOP")
         loop_ok = bool(loop and loop.is_running())
-        status_code = 200 if db_ok and loop_ok else 503
-        payload = {"status": "ok" if status_code == 200 else "degraded"}
+        monitor = getattr(_bot_controller, "runtime_health", None)
+        diagnostics = monitor.snapshot() if monitor else {
+            "failed": [], "warnings": ["monitoring_unavailable"],
+        }
+        status_code = 200 if db_ok and loop_ok and not diagnostics["failed"] else 503
+        payload = {
+            "status": "ok" if status_code == 200 else "degraded",
+            "database": "ok" if db_ok else "unavailable",
+            "runtime": diagnostics,
+        }
         return Response(
             json.dumps(payload, ensure_ascii=False),
             status=status_code,
@@ -931,6 +932,12 @@ def create_webhook_app(bot_controller_instance):
             "form-action 'self'",
         )
 
+        if request.endpoint != "static" and (
+            session.get("logged_in") or request.path == "/login"
+        ):
+            response.headers.setdefault("Cache-Control", "no-store, private")
+            response.headers.setdefault("Pragma", "no-cache")
+
         forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
         is_https = request.is_secure or forwarded_proto.lower() == "https"
         if not is_https:
@@ -955,6 +962,21 @@ def create_webhook_app(bot_controller_instance):
         "fix_parameters": {"status": "idle", "message": "Не запускалась"},
         "maintenance": {"status": "idle", "message": "Не запускалась"},
     }
+    maintenance_task_lock = threading.Lock()
+    maintenance_task_active = False
+
+    def _try_start_maintenance_task() -> bool:
+        nonlocal maintenance_task_active
+        with maintenance_task_lock:
+            if maintenance_task_active:
+                return False
+            maintenance_task_active = True
+            return True
+
+    def _finish_maintenance_task() -> None:
+        nonlocal maintenance_task_active
+        with maintenance_task_lock:
+            maintenance_task_active = False
 
     def _task_status_snapshot() -> dict:
         with task_status_lock:
@@ -977,13 +999,75 @@ def create_webhook_app(bot_controller_instance):
     def inject_current_year():
         return {"current_year": time_utils.get_msk_now().year}
 
+    def _admin_session_fingerprint() -> str:
+        credentials = json.dumps(
+            [get_setting("panel_login"), get_setting("panel_password")],
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hmac.new(
+            str(current_app.secret_key).encode("utf-8"), credentials, hashlib.sha256
+        ).hexdigest()
+
     def login_required(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if not session.get("logged_in", False):
+            fingerprint = session.get("admin_credential_fingerprint")
+            authenticated = (
+                session.get("logged_in", False)
+                and isinstance(fingerprint, str)
+                and compare_digest(fingerprint, _admin_session_fingerprint())
+            )
+            if not authenticated:
+                session.pop("logged_in", None)
+                session.pop("admin_credential_fingerprint", None)
+                session.pop("_csrf_token", None)
                 next_path = request.full_path if request.query_string else request.path
                 return redirect(url_for("login_page", next=next_path))
             return f(*args, **kwargs)
+
+        return decorated_function
+
+    _bulk_xui_action_lock = threading.Lock()
+
+    def single_bulk_xui_action(redirect_endpoint: str):
+        """Reject overlapping bulk panel mutations from retries or other tabs."""
+
+        def decorator(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                if not _bulk_xui_action_lock.acquire(blocking=False):
+                    flash(
+                        "Другая массовая операция уже выполняется. "
+                        "Дождитесь её завершения.",
+                        "warning",
+                    )
+                    return redirect(url_for(redirect_endpoint))
+                try:
+                    return f(*args, **kwargs)
+                finally:
+                    _bulk_xui_action_lock.release()
+
+            return decorated_function
+
+        return decorator
+
+    def single_manual_issue_per_user(f):
+        """Reject overlapping admin subscription operations for one user."""
+
+        @wraps(f)
+        def decorated_function(user_id, *args, **kwargs):
+            normalized_user_id = int(user_id)
+            if not subscription_operations.try_acquire(normalized_user_id):
+                flash(
+                    "Для этого пользователя уже выполняется выдача или синхронизация. "
+                    "Дождитесь её завершения и повторите действие.",
+                    "warning",
+                )
+                return redirect(url_for("users_page"))
+            try:
+                return f(user_id, *args, **kwargs)
+            finally:
+                subscription_operations.release(normalized_user_id)
 
         return decorated_function
 
@@ -1021,18 +1105,14 @@ def create_webhook_app(bot_controller_instance):
             client_is_allowlisted = is_ip_allowlisted(
                 client_ip, settings.get("admin_ip_allowlist")
             )
-            now = _time.time()
+            now = _time.monotonic()
             if not client_is_allowlisted:
                 with _login_attempts_lock:
-                    _login_attempts[client_ip] = [
-                        t
-                        for t in _login_attempts[client_ip]
-                        if now - t < _LOGIN_WINDOW_SECONDS
-                    ]
-                    login_is_limited = (
-                        len(_login_attempts[client_ip]) >= _LOGIN_MAX_ATTEMPTS
+                    login_limited = login_is_limited(
+                        _login_attempts, client_ip, now,
+                        _LOGIN_WINDOW_SECONDS, _LOGIN_MAX_ATTEMPTS,
                     )
-                if login_is_limited:
+                if login_limited:
                     flash(
                         "Слишком много попыток входа. Попробуйте через 5 минут.",
                         "danger",
@@ -1048,6 +1128,7 @@ def create_webhook_app(bot_controller_instance):
                 with _login_attempts_lock:
                     _login_attempts.pop(client_ip, None)
                 session["logged_in"] = True
+                session["admin_credential_fingerprint"] = _admin_session_fingerprint()
                 session.permanent = True
                 session.pop("_csrf_token", None)  # Rotate CSRF token on login
                 next_url = (request.args.get("next") or "").strip()
@@ -1057,7 +1138,10 @@ def create_webhook_app(bot_controller_instance):
             else:
                 if not client_is_allowlisted:
                     with _login_attempts_lock:
-                        _login_attempts[client_ip].append(now)
+                        record_login_failure(
+                            _login_attempts, client_ip, now,
+                            _LOGIN_WINDOW_SECONDS, _LOGIN_MAX_ATTEMPTS,
+                        )
                 flash("Неверный логин или пароль", "danger")
         return render_template("login.html")
 
@@ -1065,6 +1149,8 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def logout_page():
         session.pop("logged_in", None)
+        session.pop("admin_credential_fingerprint", None)
+        session.pop("_csrf_token", None)
         flash("Вы успешно вышли.", "success")
         return redirect(url_for("login_page"))
 
@@ -1286,6 +1372,19 @@ def create_webhook_app(bot_controller_instance):
         vlad_share = _parse_percent_value(
             settings.get("profit_vlad_share_percent"), 60.0
         )
+        # The partner agreement is deliberately kept explicit here: all receipts
+        # first belong to Vlad, he pays 9% tax from the full revenue, and the
+        # remaining pool is divided 40% / 60%.  Never silently distribute an
+        # over- or under-allocated pool because of a damaged setting value.
+        if abs((bogdan_share + vlad_share) - 100.0) > 0.000001:
+            logger.error(
+                "Invalid partner shares in settings: Bogdan=%s, Vlad=%s. "
+                "Using contractual 40/60 shares.",
+                bogdan_share,
+                vlad_share,
+            )
+            bogdan_share, vlad_share = 40.0, 60.0
+
         return {
             "bogdan_share_percent": bogdan_share,
             "vlad_share_percent": vlad_share,
@@ -1298,33 +1397,44 @@ def create_webhook_app(bot_controller_instance):
         }
 
     def _calculate_partner_profit(revenue_rub: float, settings: dict) -> dict:
-        revenue = max(0.0, float(revenue_rub or 0.0))
-        bogdan_share = float(settings["bogdan_share_percent"])
-        vlad_share = float(settings["vlad_share_percent"])
-        tax_percent = float(settings["vlad_tax_percent"])
-        server_cost = float(settings["server_cost_rub"])
+        money = Decimal("0.01")
+        revenue = max(Decimal("0"), Decimal(str(revenue_rub or 0))).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
+        bogdan_share = Decimal(str(settings["bogdan_share_percent"]))
+        vlad_share = Decimal(str(settings["vlad_share_percent"]))
+        tax_percent = Decimal(str(settings["vlad_tax_percent"]))
+        server_cost = max(
+            Decimal("0"), Decimal(str(settings["server_cost_rub"]))
+        ).quantize(money, rounding=ROUND_HALF_UP)
 
-        total_tax = revenue * tax_percent / 100
+        # Contractual order: revenue -> Vlad's tax -> server costs -> 40/60.
+        total_tax = (revenue * tax_percent / Decimal("100")).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
         revenue_after_tax = revenue - total_tax
         profit_pool = revenue_after_tax - server_cost
-        bogdan_profit = profit_pool * bogdan_share / 100
-        vlad_net = profit_pool * vlad_share / 100
+        bogdan_profit = (profit_pool * bogdan_share / Decimal("100")).quantize(
+            money, rounding=ROUND_HALF_UP
+        )
+        # Keep the recorded partner amounts exactly equal to the pool to kopeck.
+        vlad_net = profit_pool - bogdan_profit
 
         return {
-            "revenue_rub": round(revenue, 2),
-            "revenue_after_tax_rub": round(revenue_after_tax, 2),
-            "profit_pool_rub": round(profit_pool, 2),
-            "bogdan_share_percent": bogdan_share,
-            "vlad_share_percent": vlad_share,
-            "vlad_tax_percent": tax_percent,
-            "server_cost_rub": round(server_cost, 2),
-            "server_share_rub": round(server_cost, 2),
-            "bogdan_gross_rub": round(bogdan_profit, 2),
-            "bogdan_profit_rub": round(bogdan_profit, 2),
-            "vlad_gross_rub": round(vlad_net, 2),
-            "vlad_tax_rub": round(total_tax, 2),
-            "vlad_net_rub": round(vlad_net, 2),
-            "total_net_rub": round(bogdan_profit + vlad_net, 2),
+            "revenue_rub": float(revenue),
+            "revenue_after_tax_rub": float(revenue_after_tax),
+            "profit_pool_rub": float(profit_pool),
+            "bogdan_share_percent": float(bogdan_share),
+            "vlad_share_percent": float(vlad_share),
+            "vlad_tax_percent": float(tax_percent),
+            "server_cost_rub": float(server_cost),
+            "server_share_rub": float(server_cost),
+            "bogdan_gross_rub": float(bogdan_profit),
+            "bogdan_profit_rub": float(bogdan_profit),
+            "vlad_gross_rub": float(vlad_net),
+            "vlad_tax_rub": float(total_tax),
+            "vlad_net_rub": float(vlad_net),
+            "total_net_rub": float(bogdan_profit + vlad_net),
         }
 
     def _month_bounds(now: datetime, offset: int = 0) -> tuple[datetime, datetime]:
@@ -1506,8 +1616,17 @@ def create_webhook_app(bot_controller_instance):
             item["vlad_display"] = _profit_display_amount(calculation.get("vlad_net_rub"))
         history = get_profit_distributions(limit=8, include_void=True)
         for row in history:
+            journal_revenue = get_paid_revenue_between(
+                row.get("period_start"), row.get("period_end")
+            )
+            reconciliation_delta = round(
+                float(row.get("revenue_rub") or 0) - journal_revenue, 2
+            )
             row["period_start_label"] = _format_profit_dt(row.get("period_start"))
             row["period_end_label"] = _format_profit_dt(row.get("period_end"))
+            row["journal_revenue_rub"] = journal_revenue
+            row["reconciliation_delta_rub"] = reconciliation_delta
+            row["is_reconciled"] = abs(reconciliation_delta) < 0.01
             row["status_label"] = {
                 "active": "рассчитано",
                 "paid": "выплачено",
@@ -1532,7 +1651,9 @@ def create_webhook_app(bot_controller_instance):
             "history": history,
         }
 
-    def _build_dashboard_analytics(days: int | None = 30) -> dict:
+    def _build_dashboard_analytics(
+        days: int | None = 30, purchase_kind: str = "all"
+    ) -> dict:
         period_key = "all" if days is None else str(days)
         start_day = None
         if days is None:
@@ -1567,6 +1688,7 @@ def create_webhook_app(bot_controller_instance):
             "dates": dates,
             "labels": [_format_chart_day(day) for day in dates],
             "period": period_key,
+            "purchase_kind": purchase_kind,
             "period_days": days,
             "period_label": _format_period_label(period_key),
             "series": {
@@ -1600,6 +1722,11 @@ def create_webhook_app(bot_controller_instance):
                 "expired_trial_users": 0,
                 "paying_users": 0,
                 "paid_transaction_users": 0,
+                "completed_transactions": 0,
+                "matching_completed_transactions": 0,
+                "existing_paid_transaction_users": 0,
+                "archived_paid_transaction_users": 0,
+                "current_user_conversion_percent": 0.0,
                 "period_paid_transaction_users": 0,
                 "paid_subscription_users": 0,
                 "active_subscriptions": 0,
@@ -1626,6 +1753,7 @@ def create_webhook_app(bot_controller_instance):
 
         today_key = time_utils.get_msk_now().date().isoformat()
         now = time_utils.get_msk_now()
+        analytics["checked_at"] = time_utils.format_msk(now)
 
         try:
             with sqlite3.connect(DB_FILE) as conn:
@@ -1824,7 +1952,7 @@ def create_webhook_app(bot_controller_instance):
                 }
                 paid_transactions: list[dict] = []
 
-                for row in cursor.fetchall():
+                for row in cursor:
                     status = str(row["status"] or "unknown")
                     status_counts[status] = status_counts.get(status, 0) + 1
                     transaction_date = row["paid_date"] or row["created_date"]
@@ -1838,8 +1966,17 @@ def create_webhook_app(bot_controller_instance):
                     if status != "paid":
                         continue
 
+                    analytics["summary"]["completed_transactions"] += 1
+
                     is_free_promo = method == "Promo" and amount <= 0
                     is_monetary_payment = amount > 0 and not is_free_promo
+                    matches_purchase_kind = (
+                        purchase_kind == "all"
+                        or (purchase_kind == "money" and is_monetary_payment)
+                        or (purchase_kind == "promo" and is_free_promo)
+                    )
+                    if matches_purchase_kind:
+                        analytics["summary"]["matching_completed_transactions"] += 1
 
                     if is_free_promo:
                         analytics["summary"]["all_time_free_promos"] += 1
@@ -1887,24 +2024,29 @@ def create_webhook_app(bot_controller_instance):
                         plan_bucket["revenue"] += amount
                         plan_bucket["orders"] += 1
 
-                    paid_transactions.append(
-                        {
-                            "payment_id": row["payment_id"],
-                            "user_id": row["user_id"],
-                            "username": row["username"] or "N/A",
-                            "amount": amount,
-                            "method": method,
-                            "plan": plan_name,
-                            "date": transaction_date,
-                            "date_label": _format_transaction_dt(transaction_date),
-                            "is_free_promo": is_free_promo,
-                        }
-                    )
+                    if matches_purchase_kind and len(paid_transactions) < 200:
+                        paid_transactions.append(
+                            {
+                                "payment_id": row["payment_id"],
+                                "user_id": row["user_id"],
+                                "username": row["username"] or "N/A",
+                                "amount": amount,
+                                "method": method,
+                                "plan": plan_name,
+                                "date": transaction_date,
+                                "date_label": _format_transaction_dt(transaction_date),
+                                "is_free_promo": is_free_promo,
+                            }
+                        )
 
                 period_revenue = sum(analytics["series"]["revenue"].values())
                 period_orders = sum(analytics["series"]["orders"].values())
                 period_users = sum(analytics["series"]["users"].values())
                 paying_users.update(paid_transaction_users)
+                existing_user_ids = {
+                    int(user["telegram_id"]) for user in users_for_status
+                }
+                existing_payers = paid_transaction_users & existing_user_ids
                 analytics["summary"].update(
                     {
                         "today_users": analytics["series"]["users"].get(today_key, 0),
@@ -1917,6 +2059,15 @@ def create_webhook_app(bot_controller_instance):
                         "period_orders": period_orders,
                         "paying_users": len(paid_transaction_users),
                         "paid_transaction_users": len(paid_transaction_users),
+                        "existing_paid_transaction_users": len(existing_payers),
+                        "archived_paid_transaction_users": len(
+                            paid_transaction_users - existing_user_ids
+                        ),
+                        "current_user_conversion_percent": (
+                            round(len(existing_payers) / total_users * 100, 1)
+                            if total_users
+                            else 0.0
+                        ),
                         "period_paid_transaction_users": len(
                             period_paid_transaction_users
                         ),
@@ -1941,9 +2092,7 @@ def create_webhook_app(bot_controller_instance):
                         "active_paid_users_without_payment": len(
                             active_paid_users - paid_transaction_users
                         ),
-                        "expired_paid_users": user_status_counts[
-                            "paid_expired_users"
-                        ],
+                        "expired_paid_users": user_status_counts["paid_expired_users"],
                         "trial_users": user_status_counts["trial_users"],
                         "trial_used_users": len(trial_used_users),
                         "expired_trial_users": user_status_counts[
@@ -1977,11 +2126,7 @@ def create_webhook_app(bot_controller_instance):
                     key=lambda item: item["revenue"],
                     reverse=True,
                 )[:5]
-                analytics["paid_transactions"] = sorted(
-                    paid_transactions,
-                    key=lambda item: str(item.get("date") or ""),
-                    reverse=True,
-                )
+                analytics["paid_transactions"] = paid_transactions
                 analytics["transaction_statuses"] = [
                     {
                         "status": status,
@@ -2012,6 +2157,56 @@ def create_webhook_app(bot_controller_instance):
             raise TimeoutError(
                 f"Операция с XUI-панелью превысила лимит ожидания ({timeout}с). Проверьте доступность сервера."
             ) from exc
+
+    async def _sync_ip_limit_value(events: list[dict], limit_count: int) -> dict:
+        """Apply one native IP-limit value to the selected XUI keys."""
+        safe_limit_count = max(0, int(limit_count))
+        desired_by_host: dict[str, dict[str, dict]] = {}
+        for event in events:
+            host_name = str(event.get("host_name") or "")
+            key_email = str(event.get("key_email") or "")
+            if not host_name or not key_email:
+                continue
+            desired_by_host.setdefault(host_name, {})[key_email] = {
+                "ip_limit": safe_limit_count
+            }
+
+        results = await asyncio.gather(
+            *(
+                xui_api.sync_clients_state_on_host(host_name, desired_by_email)
+                for host_name, desired_by_email in desired_by_host.items()
+            )
+        )
+        return {
+            "targeted": len(events),
+            "checked": sum(int(item.get("checked", 0)) for item in results),
+            "updated": sum(int(item.get("updated", 0)) for item in results),
+            "not_found": sum(int(item.get("not_found", 0)) for item in results),
+            "errors": sum(int(item.get("errors", 0)) for item in results),
+        }
+
+    def _ip_limit_targets_for_users(user_ids: list[int]) -> list[dict]:
+        """Expand a global user decision to every XUI key in their subscription."""
+        targets: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for user_id in sorted(set(int(value) for value in user_ids)):
+            for key in get_user_keys(user_id):
+                if str(key.get("service_type") or "xui") != "xui":
+                    continue
+                host_name = str(key.get("host_name") or "")
+                key_email = str(key.get("key_email") or "")
+                identity = (host_name, key_email)
+                if not host_name or not key_email or identity in seen:
+                    continue
+                seen.add(identity)
+                targets.append(
+                    {
+                        "user_id": user_id,
+                        "host_name": host_name,
+                        "key_email": key_email,
+                    }
+                )
+        return targets
 
     def _run_auto_provision_for_global_users(context_host_name: str) -> bool:
         """Run global users auto-provisioning from admin host actions."""
@@ -2110,10 +2305,27 @@ def create_webhook_app(bot_controller_instance):
                 safe_settings[f"{secret_key}_configured"] = True
                 safe_settings[secret_key] = ""
 
+        ip_limit_events = get_xui_ip_limit_user_events(100)
+        ip_limit_active_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") in {"warning", "enforced"}
+        ]
+        ip_limit_history_events = [
+            event
+            for event in ip_limit_events
+            if event.get("state") not in {"warning", "enforced"}
+        ]
+
         return {
             "settings": safe_settings,
             "hosts": hosts,
-            "ip_limit_events": get_xui_ip_limit_events(100),
+            "ip_limit_events": ip_limit_events,
+            "ip_limit_active_events": ip_limit_active_events,
+            "ip_limit_history_events": ip_limit_history_events,
+            "ip_limit_enforced_count": len(
+                get_enforced_xui_ip_limit_user_ids()
+            ),
             "global_plans": get_plans_for_host("ALL", service_type="xui"),
             "mtg_hosts": mtg_hosts,
             "payment_rules": get_all_payment_rules(),
@@ -2156,37 +2368,55 @@ def create_webhook_app(bot_controller_instance):
                 continue
             keys_by_host.setdefault(host_name, []).append(key)
 
-        total_updated = 0
-        total_hosts = 0
-        total_errors = 0
-        hosts = [h["host_name"] for h in get_all_hosts(only_enabled=True)]
-        for host_name in hosts:
-            if host_name not in keys_by_host:
+        host_groups: dict[str, list[dict]] = defaultdict(list)
+        for host in get_all_hosts(only_enabled=True):
+            host_name = host.get("host_name")
+            if not host_name or host_name not in keys_by_host:
                 continue
-            total_hosts += 1
-            try:
-                mapping = await asyncio.wait_for(
-                    xui_api.get_connection_strings_for_host(host_name),
-                    timeout=XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS,
-                )
-            except Exception as k_e:
-                total_errors += 1
-                logger.warning(
-                    f"Failed to sync host '{host_name}': {k_e!r}", exc_info=True
-                )
-                await asyncio.sleep(0.5)
-                continue
+            group_key = host_selector.panel_group_key(host.get("host_url"), host_name)
+            host_groups[group_key].append(host)
 
-            for key in keys_by_host[host_name]:
-                email = key.get("key_email")
-                if not email:
-                    continue
-                conn = mapping.get(email)
-                if conn:
-                    update_key_connection_string(key["key_id"], conn)
-                    total_updated += 1
+        semaphore = asyncio.Semaphore(XUI_MAINTENANCE_PANEL_CONCURRENCY)
 
-            await asyncio.sleep(0.5)
+        async def _sync_panel(group_hosts: list[dict]) -> dict[str, int]:
+            panel_updated = 0
+            panel_errors = 0
+            async with semaphore:
+                # Logical hosts on one physical panel share its API and are kept
+                # sequential to avoid login/session and inbound update races.
+                for host in group_hosts:
+                    host_name = host["host_name"]
+                    try:
+                        mapping = await asyncio.wait_for(
+                            xui_api.get_connection_strings_for_host(host_name),
+                            timeout=XUI_CONFIG_SYNC_HOST_TIMEOUT_SECONDS,
+                        )
+                    except Exception as k_e:
+                        panel_errors += 1
+                        logger.warning(
+                            f"Failed to sync host '{host_name}': {k_e!r}",
+                            exc_info=True,
+                        )
+                        continue
+
+                    for key in keys_by_host[host_name]:
+                        email = key.get("key_email")
+                        if not email:
+                            continue
+                        conn = mapping.get(email)
+                        if conn:
+                            await asyncio.to_thread(
+                                update_key_connection_string, key["key_id"], conn
+                            )
+                            panel_updated += 1
+            return {"updated": panel_updated, "errors": panel_errors}
+
+        panel_results = await asyncio.gather(
+            *(_sync_panel(group) for group in host_groups.values())
+        )
+        total_updated = sum(result["updated"] for result in panel_results)
+        total_errors = sum(result["errors"] for result in panel_results)
+        total_hosts = sum(len(group) for group in host_groups.values())
 
         return {
             "updated": total_updated,
@@ -2195,25 +2425,42 @@ def create_webhook_app(bot_controller_instance):
         }
 
     async def _fix_clients_job() -> dict:
-        total_fixed = 0
-        total_hosts = 0
-        total_errors = 0
-        hosts = [h["host_name"] for h in get_all_hosts(only_enabled=True)]
-        for host_name in hosts:
-            total_hosts += 1
-            try:
-                fixed = await asyncio.wait_for(
-                    xui_api.fix_all_client_parameters_on_host(host_name),
-                    timeout=XUI_FIX_HOST_TIMEOUT_SECONDS,
-                )
-                total_fixed += int(fixed)
-            except Exception as k_e:
-                total_errors += 1
-                logger.warning(
-                    f"Failed to fix clients on host '{host_name}': {k_e!r}",
-                    exc_info=True,
-                )
-            await asyncio.sleep(1)
+        host_groups: dict[str, list[dict]] = defaultdict(list)
+        for host in get_all_hosts(only_enabled=True):
+            host_name = host.get("host_name")
+            if not host_name:
+                continue
+            group_key = host_selector.panel_group_key(host.get("host_url"), host_name)
+            host_groups[group_key].append(host)
+
+        semaphore = asyncio.Semaphore(XUI_MAINTENANCE_PANEL_CONCURRENCY)
+
+        async def _fix_panel(group_hosts: list[dict]) -> dict[str, int]:
+            panel_fixed = 0
+            panel_errors = 0
+            async with semaphore:
+                for host in group_hosts:
+                    host_name = host["host_name"]
+                    try:
+                        fixed = await asyncio.wait_for(
+                            xui_api.fix_all_client_parameters_on_host(host_name),
+                            timeout=XUI_FIX_HOST_TIMEOUT_SECONDS,
+                        )
+                        panel_fixed += int(fixed)
+                    except Exception as k_e:
+                        panel_errors += 1
+                        logger.warning(
+                            f"Failed to fix clients on host '{host_name}': {k_e!r}",
+                            exc_info=True,
+                        )
+            return {"fixed": panel_fixed, "errors": panel_errors}
+
+        panel_results = await asyncio.gather(
+            *(_fix_panel(group) for group in host_groups.values())
+        )
+        total_fixed = sum(result["fixed"] for result in panel_results)
+        total_errors = sum(result["errors"] for result in panel_results)
+        total_hosts = sum(len(group) for group in host_groups.values())
 
         return {
             "fixed": total_fixed,
@@ -2251,7 +2498,12 @@ def create_webhook_app(bot_controller_instance):
         )
         total_pages = ceil(total_transactions / per_page)
 
-        analytics = _build_dashboard_analytics(days=period_days)
+        purchase_kind = (request.args.get("purchases") or "all").strip().lower()
+        if purchase_kind not in {"all", "money", "promo"}:
+            purchase_kind = "all"
+        analytics = _build_dashboard_analytics(
+            days=period_days, purchase_kind=purchase_kind
+        )
         profit = _build_profit_context(
             analytics["summary"]["period_revenue"], selected_period, period_days
         )
@@ -2346,6 +2598,11 @@ def create_webhook_app(bot_controller_instance):
             return redirect(request.referrer or url_for("dashboard_page"))
 
         revenue = get_paid_revenue_between(period_start, period_end)
+        # The default is only a convenience for the next close.  The amount is
+        # captured in this period's immutable calculation, not inferred later.
+        settings["server_cost_rub"] = _parse_money_value(
+            request.form.get("server_cost_rub"), settings["server_cost_rub"]
+        )
         calculated = _calculate_partner_profit(revenue, settings)
         distribution_id = create_profit_distribution(
             period_start=period_start,
@@ -2440,8 +2697,9 @@ def create_webhook_app(bot_controller_instance):
             )
             return redirect(request.referrer or url_for("dashboard_page"))
 
-        default_revenue = get_paid_revenue_between(period_start, period_end)
-        revenue = _parse_money_value(request.form.get("revenue_rub"), default_revenue)
+        # Revenue is always rebuilt from the paid transaction journal.  Manual
+        # entry here made a "closed" period impossible to reconcile later.
+        revenue = get_paid_revenue_between(period_start, period_end)
         calculated = _calculate_partner_profit(revenue, settings)
         ok = update_profit_distribution(
             distribution_id,
@@ -2491,9 +2749,9 @@ def create_webhook_app(bot_controller_instance):
     def void_profit_distribution_route(distribution_id: int):
         ok = void_profit_distribution(distribution_id)
         flash(
-            "Фиксация отменена. Следующий расчёт снова учтёт этот период."
+            "Невыплаченная фиксация отменена. Следующий расчёт снова учтёт этот период."
             if ok
-            else "Активная фиксация не найдена.",
+            else "Отменить можно только невыплаченную фиксацию.",
             "success" if ok else "warning",
         )
         return redirect(request.referrer or url_for("dashboard_page"))
@@ -2526,15 +2784,44 @@ def create_webhook_app(bot_controller_instance):
             "support_only",
             "no_subscription",
             "banned",
+            "trial_used",
+            "paid_ever",
         }
         query, selected_status, requested_page, per_page = (
             _admin_list_request_args(allowed_statuses)
         )
         normalized_query = query.casefold()
+        paid_user_ids: set[int] = set()
+        if selected_status == "paid_ever":
+            try:
+                with sqlite3.connect(DB_FILE) as conn:
+                    paid_user_ids = {
+                        int(row[0])
+                        for row in conn.execute(
+                            """
+                            SELECT DISTINCT user_id
+                            FROM transactions
+                            WHERE status = 'paid' AND COALESCE(amount_rub, 0) > 0
+                            """
+                        )
+                    }
+            except sqlite3.Error as e:
+                logger.error("Failed to load paying users: %s", e, exc_info=True)
+
         filtered_users = []
         for user in users:
             summary = user["subscription_summary"]
-            if selected_status != "all" and summary["status"] != selected_status:
+            if selected_status == "trial_used" and not user.get("trial_used"):
+                continue
+            if (
+                selected_status == "paid_ever"
+                and int(user["telegram_id"]) not in paid_user_ids
+            ):
+                continue
+            if (
+                selected_status not in {"all", "trial_used", "paid_ever"}
+                and summary["status"] != selected_status
+            ):
                 continue
             searchable = " ".join(
                 str(value or "")
@@ -3069,6 +3356,51 @@ def create_webhook_app(bot_controller_instance):
         )
         return _admin_secret_response(subscription_link, "Subscription URL")
 
+    @flask_app.route("/keys/bulk", methods=["POST"])
+    @login_required
+    @single_bulk_xui_action("keys_page")
+    def bulk_keys_route():
+        if (request.form.get("bulk_action") or "").strip() != "revoke":
+            flash("Выберите действие для отмеченных ключей.", "warning")
+            return redirect(url_for("keys_page"))
+
+        key_ids = _requested_bulk_ids("key_ids", limit=250)
+        if not key_ids:
+            flash("Отметьте хотя бы один ключ.", "warning")
+            return redirect(url_for("keys_page"))
+
+        revoked_ids: list[int] = []
+        skipped = 0
+        failed = 0
+        for key_id in key_ids:
+            key = get_key_by_id(key_id)
+            if not key:
+                skipped += 1
+                continue
+            try:
+                if _delete_remote_user_key(key):
+                    revoked_ids.append(key_id)
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                logger.exception("Bulk key revoke failed for key %s", key_id)
+
+        if revoked_ids:
+            local_deleted_count = delete_keys_by_ids(revoked_ids)
+            if local_deleted_count != len(revoked_ids):
+                failed += len(revoked_ids) - local_deleted_count
+        else:
+            local_deleted_count = 0
+
+        flash(
+            f"Отзыв ключей завершён: удалено — {local_deleted_count}; "
+            f"пропущено — {skipped}; с ошибкой — {failed}. "
+            "Ключи с ошибками сохранены в базе для повторной попытки.",
+            "success" if failed == 0 else "warning",
+        )
+        return redirect(url_for("keys_page"))
+
     @flask_app.route("/users/<int:user_id>/subscription-secret")
     @login_required
     def user_subscription_secret_route(user_id: int):
@@ -3083,13 +3415,45 @@ def create_webhook_app(bot_controller_instance):
     def tasks_status_route():
         return {"status": "success", "tasks": _task_status_snapshot()}
 
+    def single_key_duration_operation(f):
+        @wraps(f)
+        def wrapped(key_id):
+            key = get_key_by_id(key_id)
+            if not key:
+                return f(key_id)
+            user_id = key["user_id"]
+            if not subscription_operations.try_acquire(user_id):
+                flash(
+                    "Для этого пользователя уже выполняется выдача или синхронизация. Повторите позже.",
+                    "warning",
+                )
+                return redirect(url_for("keys_page"))
+            try:
+                return f(key_id)
+            finally:
+                subscription_operations.release(user_id)
+
+        return wrapped
+
+
     @flask_app.route("/keys/adjust/<int:key_id>", methods=["POST"])
     @login_required
+    @single_key_duration_operation
     def adjust_key_duration(key_id):
         """Adjust key duration by days and/or hours. Supports negative values to reduce duration."""
         try:
-            days_to_adjust = int(request.form.get("days", 0))
-            hours_to_adjust = int(request.form.get("hours", 0))
+            try:
+                days_to_adjust = int((request.form.get("days") or "0").strip())
+                hours_to_adjust = int((request.form.get("hours") or "0").strip())
+            except (AttributeError, ValueError):
+                flash("Дни и часы должны быть целыми числами.", "warning")
+                return redirect(url_for("keys_page"))
+            if not -365 <= days_to_adjust <= 365 or not -23 <= hours_to_adjust <= 23:
+                flash(
+                    "Допустимо от -365 до 365 дней и от -23 до 23 часов.",
+                    "warning",
+                )
+                return redirect(url_for("keys_page"))
 
             # Calculate total seconds to adjust
             total_seconds = days_to_adjust * 86400 + hours_to_adjust * 3600
@@ -3137,7 +3501,19 @@ def create_webhook_app(bot_controller_instance):
                         keys_to_adjust.append(k)
 
             success_count = 0
+            failed_hosts = []
             new_expiry_date = None
+            positive_target_ms = None
+            if total_seconds > 0:
+                stored_expiries = [
+                    time_utils.parse_iso_to_msk(item.get("expiry_date"))
+                    for item in keys_to_adjust
+                ]
+                stored_expiries = [value for value in stored_expiries if value]
+                duration_base = max([time_utils.get_msk_now(), *stored_expiries])
+                positive_target_ms = time_utils.get_timestamp_ms(
+                    duration_base + timedelta(seconds=total_seconds)
+                )
 
             for k in keys_to_adjust:
                 if k.get("service_type") == "mtg":
@@ -3150,21 +3526,34 @@ def create_webhook_app(bot_controller_instance):
                             k.get("xui_client_uuid"),
                         )
                         continue
-                    current_expiry = time_utils.parse_iso_to_msk(k.get("expiry_date"))
-                    current_expiry_ms = (
-                        int(current_expiry.timestamp() * 1000)
-                        if current_expiry
-                        else 0
+                    panel_details = _run_async(
+                        mtg_api.get_proxy_details(k["host_name"], k["key_email"])
                     )
-                    new_expiry_ms = _run_async(
-                        mtg_api.renew_proxy_for_user(
-                            k["host_name"],
-                            k["key_email"],
-                            node_id,
-                            days_to_adjust,
-                            current_expiry_ms,
+                    panel_expiry_ms = int(
+                        (panel_details or {}).get("expiry_timestamp_ms") or 0
+                    )
+                    if panel_expiry_ms <= 0 or positive_target_ms is None:
+                        logger.error(
+                            "Cannot safely extend MTG key_id=%s: panel expiry is unavailable.",
+                            k.get("key_id"),
                         )
-                    )
+                        continue
+                    if panel_expiry_ms >= positive_target_ms:
+                        new_expiry_ms = panel_expiry_ms
+                    else:
+                        remaining_ms = positive_target_ms - panel_expiry_ms
+                        renew_days = max(
+                            1, (remaining_ms + 86_400_000 - 1) // 86_400_000
+                        )
+                        new_expiry_ms = _run_async(
+                            mtg_api.renew_proxy_for_user(
+                                k["host_name"],
+                                k["key_email"],
+                                node_id,
+                                renew_days,
+                                panel_expiry_ms,
+                            )
+                        )
                     if not new_expiry_ms:
                         continue
                     expiry_dt = time_utils.from_timestamp_ms(new_expiry_ms)
@@ -3180,15 +3569,33 @@ def create_webhook_app(bot_controller_instance):
                     new_expiry_date = expiry_dt
                     continue
 
-                # Call XUI logic to adjust on panel using seconds for precision.
-                result = _run_async(
-                    xui_api.create_or_update_key_on_host_seconds(
-                        host_name=k["host_name"],
-                        email=k["key_email"],
-                        seconds_to_add=total_seconds,
-                        telegram_id=None,  # Admin adjustment, no telegram_id available
+                try:
+                    if positive_target_ms is not None:
+                        result = _run_async(
+                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                                host_name=k["host_name"],
+                                email=k["key_email"],
+                                target_expiry_ms=positive_target_ms,
+                                telegram_id=None,
+                                preserve_longer_expiry=True,
+                            )
+                        )
+                    else:
+                        result = _run_async(
+                            xui_api.create_or_update_key_on_host_seconds(
+                                host_name=k["host_name"],
+                                email=k["key_email"],
+                                seconds_to_add=total_seconds,
+                                telegram_id=None,
+                            )
+                        )
+                except TimeoutError:
+                    logger.exception(
+                        "Timed out adjusting key_id=%s on host %s",
+                        k["key_id"], k["host_name"],
                     )
-                )
+                    failed_hosts.append(k["host_name"])
+                    continue
 
                 if result:
                     # Update local DB with new expiry from result
@@ -3207,6 +3614,16 @@ def create_webhook_app(bot_controller_instance):
                         continue
                     success_count += 1
                     new_expiry_date = expiry_dt
+                else:
+                    failed_hosts.append(k["host_name"])
+
+            if failed_hosts:
+                flash(
+                    f"Не удалось обновить {len(failed_hosts)} ключ(а): "
+                    + ", ".join(failed_hosts)
+                    + ". Проверьте сроки перед повторной попыткой.",
+                    "warning",
+                )
 
             if success_count > 0:
                 # Format the change message
@@ -3222,7 +3639,7 @@ def create_webhook_app(bot_controller_instance):
 
                 # Notify User
                 bot = _bot_controller.get_bot_instance()
-                if bot:
+                if bot and not failed_hosts:
                     user_id = key_data["user_id"]
                     if total_seconds > 0:
                         msg_text = (
@@ -3245,7 +3662,12 @@ def create_webhook_app(bot_controller_instance):
                             bot.send_message(user_id, msg_text, parse_mode="HTML"), loop
                         )
 
-                if is_global:
+                if is_global and failed_hosts:
+                    flash(
+                        f"Частично обновлено {success_count} из {len(keys_to_adjust)} ключей.",
+                        "warning",
+                    )
+                elif is_global:
                     flash(
                         f"Глобальная подписка {action_text}! Обновлено {success_count} ключей на {time_str}.",
                         "success",
@@ -3274,10 +3696,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/sync", methods=["POST"])
     @login_required
     def sync_keys_configs():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3306,10 +3737,14 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "sync_configs", "error", f"Ошибка синхронизации: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_sync_all_keys_wrapper(), loop)
             flash("Синхронизация ключей запущена в фоне. Проверьте логи позже.", "info")
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Error syncing keys: {e}", exc_info=True)
             _set_task_status("sync_configs", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить синхронизацию ключей.", "danger")
@@ -3319,10 +3754,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/fix-parameters", methods=["POST"])
     @login_required
     def fix_client_parameters():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3351,12 +3795,16 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "fix_parameters", "error", f"Ошибка исправления: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_fix_all_clients_wrapper(), loop)
             flash(
                 "Исправление параметров запущено в фоне. Проверьте логи позже.", "info"
             )
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Fix parameters error: {e}", exc_info=True)
             _set_task_status("fix_parameters", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить исправление параметров клиентов.", "danger")
@@ -3365,10 +3813,19 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/keys/maintenance", methods=["POST"])
     @login_required
     def maintenance_route():
+        task_acquired = False
         try:
             loop = current_app.config.get("EVENT_LOOP")
             if not loop or not loop.is_running():
                 flash("Цикл событий недоступен. Перезапустите приложение.", "danger")
+                return redirect(url_for("keys_page"))
+
+            task_acquired = _try_start_maintenance_task()
+            if not task_acquired:
+                flash(
+                    "Другая задача обслуживания уже выполняется. Дождитесь её завершения.",
+                    "warning",
+                )
                 return redirect(url_for("keys_page"))
 
             _set_task_status(
@@ -3427,10 +3884,14 @@ def create_webhook_app(bot_controller_instance):
                     _set_task_status(
                         "maintenance", "error", f"Ошибка обслуживания: {e}"
                     )
+                finally:
+                    _finish_maintenance_task()
 
             asyncio.run_coroutine_threadsafe(_maintenance_wrapper(), loop)
             flash("Комплексное обслуживание запущено в фоне.", "info")
         except Exception as e:
+            if task_acquired:
+                _finish_maintenance_task()
             logger.error(f"Maintenance route error: {e}", exc_info=True)
             _set_task_status("maintenance", "error", f"Не удалось запустить: {e}")
             flash("Не удалось запустить комплексное обслуживание.", "danger")
@@ -3482,13 +3943,19 @@ def create_webhook_app(bot_controller_instance):
                 ip_limit_grace = int(
                     request.form.get("ip_limit_warning_grace_hours", "24")
                 )
+                ip_limit_activity_window = int(
+                    request.form.get("ip_limit_activity_window_minutes", "10")
+                )
                 if not 1 <= ip_limit_max <= 100:
                     raise ValueError
                 if not 1 <= ip_limit_grace <= 168:
                     raise ValueError
+                if not 1 <= ip_limit_activity_window <= 60:
+                    raise ValueError
             except (TypeError, ValueError):
                 flash(
-                    "Лимит IP должен быть от 1 до 100, время предупреждения — от 1 до 168 часов.",
+                    "Лимит IP должен быть от 1 до 100, окно активности — от 1 "
+                    "до 60 минут, время предупреждения — от 1 до 168 часов.",
                     "danger",
                 )
                 return redirect(url_for("settings_page"))
@@ -3557,6 +4024,114 @@ def create_webhook_app(bot_controller_instance):
         return render_template(
             "settings.html", **_load_settings_page_context(), **common_data
         )
+
+    def _release_ip_limits_from_admin(user_ids: list[int] | None):
+        released = release_xui_ip_limit_users(user_ids)
+        if not released:
+            flash("Активные ограничения для снятия не найдены.", "warning")
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        released_user_ids = [int(item["user_id"]) for item in released]
+        targets = _ip_limit_targets_for_users(released_user_ids)
+        try:
+            result = _run_async(
+                _sync_ip_limit_value(targets, 0),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limits were released in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                f"В базе снято ограничений: {len(released)}. Панели не ответили сразу; "
+                "фоновая синхронизация повторит сброс автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                f"Снято ограничений: {len(released)}. Не удалось сразу обновить: "
+                f"{result['errors'] + result['not_found']}; фоновая синхронизация "
+                "повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Снято ограничений: {len(released)}. Мониторинг продолжает работу.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/enforce",
+        methods=["POST"],
+    )
+    @login_required
+    def enforce_ip_limit_route(user_id: int):
+        enforced = enforce_xui_ip_limit_user_now(user_id)
+        if not enforced:
+            flash(
+                "Предупреждение не найдено или ограничение уже применено.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        try:
+            configured_limit = max(
+                1,
+                min(int(get_setting("ip_limit_max_ips") or 10), 100),
+            )
+        except (TypeError, ValueError):
+            configured_limit = 10
+
+        try:
+            targets = _ip_limit_targets_for_users([user_id])
+            result = _run_async(
+                _sync_ip_limit_value(targets, configured_limit),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error(
+                "IP limit was enforced in DB, but immediate panel sync failed: %s",
+                e,
+                exc_info=True,
+            )
+            flash(
+                "Ограничение включено в базе. Панель не ответила сразу; "
+                "фоновая синхронизация повторит применение автоматически.",
+                "warning",
+            )
+            return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+        if result["errors"] or result["not_found"]:
+            flash(
+                "Ограничение включено. Панель не подтвердила применение; "
+                "фоновая синхронизация повторит попытку.",
+                "warning",
+            )
+        else:
+            flash(
+                f"Принудительное ограничение {configured_limit} IP включено "
+                "на всех конфигурациях пользователя.",
+                "success",
+            )
+        return redirect(url_for("settings_page") + "#ip-limit-settings")
+
+    @flask_app.route(
+        "/settings/ip-limit-users/<int:user_id>/release",
+        methods=["POST"],
+    )
+    @login_required
+    def release_ip_limit_route(user_id: int):
+        return _release_ip_limits_from_admin([user_id])
+
+    @flask_app.route("/settings/ip-limit-users/release-all", methods=["POST"])
+    @login_required
+    def release_all_ip_limits_route():
+        return _release_ip_limits_from_admin(None)
 
     @flask_app.route("/start-shop-bot", methods=["POST"])
     @login_required
@@ -3633,73 +4208,264 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/ban/<int:user_id>", methods=["POST"])
     @login_required
     def ban_user_route(user_id):
-        ban_user(user_id)
-        flash(f"Пользователь {user_id} был заблокирован.", "success")
+        if ban_user(user_id):
+            flash(f"Пользователь {user_id} был заблокирован.", "success")
+        else:
+            flash("Блокировка не сохранена. Проверьте пользователя и логи.", "danger")
         return redirect(url_for("users_page"))
 
-    @flask_app.route("/users/unban/<int:user_id>", methods=["POST"])
-    @login_required
-    def unban_user_route(user_id):
-        unban_user(user_id)
-        flash(f"Пользователь {user_id} был разблокирован.", "success")
-        return redirect(url_for("users_page"))
+    def _requested_bulk_ids(field_name: str, *, limit: int = 100) -> list[int]:
+        """Parse a bounded, de-duplicated list of positive integer form IDs."""
+        parsed_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_value in request.form.getlist(field_name):
+            try:
+                item_id = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if item_id <= 0 or item_id in seen:
+                continue
+            seen.add(item_id)
+            parsed_ids.append(item_id)
+            if len(parsed_ids) >= limit:
+                break
+        return parsed_ids
 
-    @flask_app.route("/users/revoke/<int:user_id>", methods=["POST"])
-    @login_required
-    def revoke_keys_route(user_id):
+    def _revoke_user_keys(user_id: int) -> dict:
+        """Revoke a user's keys remotely and delete only successful local rows."""
         keys_to_revoke = get_user_keys(user_id)
-        success_count = 0
         deleted_key_ids: list[int] = []
         failed_keys: list[str] = []
 
         for key in keys_to_revoke:
             try:
-                result = _delete_remote_user_key(key)
-                if result:
-                    success_count += 1
+                if _delete_remote_user_key(key):
                     if key.get("key_id") is not None:
                         deleted_key_ids.append(int(key["key_id"]))
                 else:
                     failed_keys.append(
                         key.get("key_email") or f"key:{key.get('key_id')}"
                     )
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    f"Failed to revoke key '{key.get('key_email')}' for user {user_id}: {e}",
+                    "Failed to revoke key '%s' for user %s: %s",
+                    key.get("key_email"),
+                    user_id,
+                    exc,
                     exc_info=True,
                 )
                 failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
 
         if deleted_key_ids:
-            delete_keys_by_ids(deleted_key_ids)
+            local_deleted_count = delete_keys_by_ids(deleted_key_ids)
+            if local_deleted_count != len(deleted_key_ids):
+                failed_keys.append("ошибка удаления отозванных ключей из локальной БД")
+        return {
+            "total": len(keys_to_revoke),
+            "revoked": local_deleted_count if deleted_key_ids else 0,
+            "failed": failed_keys,
+        }
 
-        if success_count == len(keys_to_revoke):
+    @flask_app.route("/users/unban/<int:user_id>", methods=["POST"])
+    @login_required
+    def unban_user_route(user_id):
+        if unban_user(user_id):
+            flash(f"Пользователь {user_id} был разблокирован.", "success")
+        else:
+            flash("Разблокировка не сохранена. Проверьте пользователя и логи.", "danger")
+        return redirect(url_for("users_page"))
+
+    @flask_app.route("/users/revoke/<int:user_id>", methods=["POST"])
+    @login_required
+    def revoke_keys_route(user_id):
+        result = _revoke_user_keys(user_id)
+        if not result["failed"]:
             flash(
-                f"Все {len(keys_to_revoke)} ключей для пользователя {user_id} были успешно отозваны.",
+                f"Все {result['total']} ключей для пользователя {user_id} были успешно отозваны.",
                 "success",
             )
         else:
             flash(
-                f"Удалось отозвать {success_count} из {len(keys_to_revoke)} ключей для пользователя {user_id}. "
+                f"Удалось отозвать {result['revoked']} из {result['total']} ключей для пользователя {user_id}. "
                 "Локально удалены только успешно отозванные ключи; остальные сохранены для повторной попытки.",
                 "warning",
             )
-            if failed_keys:
-                logger.warning(
-                    "User %s revoke aborted for keys still present on remote side: %s",
-                    user_id,
-                    ", ".join(failed_keys),
+            logger.warning(
+                "User %s revoke aborted for keys still present on remote side: %s",
+                user_id,
+                ", ".join(result["failed"]),
+            )
+
+        return redirect(url_for("users_page"))
+
+    @flask_app.route("/users/bulk", methods=["POST"])
+    @login_required
+    @single_bulk_xui_action("users_page")
+    def bulk_users_route():
+        action = (request.form.get("bulk_action") or "").strip()
+        user_ids = _requested_bulk_ids("user_ids")
+        allowed_actions = {"ban", "unban", "revoke", "delete"}
+        if action not in allowed_actions or not user_ids:
+            flash("Выберите пользователей и массовое действие.", "warning")
+            return redirect(url_for("users_page"))
+
+        completed = 0
+        skipped = 0
+        failed = 0
+        for user_id in user_ids:
+            if not get_user(user_id):
+                skipped += 1
+                continue
+            try:
+                if action == "ban":
+                    if not ban_user(user_id):
+                        failed += 1
+                        continue
+                elif action == "unban":
+                    if not unban_user(user_id):
+                        failed += 1
+                        continue
+                elif action == "revoke":
+                    result = _revoke_user_keys(user_id)
+                    if result["failed"]:
+                        failed += 1
+                        continue
+                else:
+                    result = _revoke_user_keys(user_id)
+                    if result["failed"]:
+                        failed += 1
+                        continue
+                    if not delete_user_everywhere(user_id):
+                        failed += 1
+                        continue
+                completed += 1
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "Bulk user action '%s' failed for user %s", action, user_id
                 )
 
+        action_labels = {
+            "ban": "заблокировано",
+            "unban": "разблокировано",
+            "revoke": "ключи отозваны",
+            "delete": "удалено",
+        }
+        category = "success" if failed == 0 else "warning"
+        flash(
+            f"Массовое действие завершено: {action_labels[action]} — {completed}; "
+            f"пропущено — {skipped}; с ошибкой — {failed}.",
+            category,
+        )
         return redirect(url_for("users_page"))
 
     @flask_app.route("/users/issue-key/<int:user_id>", methods=["POST"])
     @login_required
+    @single_manual_issue_per_user
     def issue_key_route(user_id):
         try:
+            custom_days_raw = (request.form.get("custom_days") or "").strip()
             plan_id = request.form.get("plan_id")
+
+            user = get_user(user_id)
+            if not user:
+                flash("Ошибка: Пользователь не найден.", "danger")
+                return redirect(url_for("users_page"))
+
+            # A custom number of days sets one expiry for every existing key.
+            # Keep plan IDs so a trial grant does not become a paid purchase.
+            if custom_days_raw:
+                try:
+                    custom_days = int(custom_days_raw)
+                except ValueError:
+                    flash("Количество дней должно быть целым числом.", "danger")
+                    return redirect(url_for("users_page"))
+                if not 1 <= custom_days <= 3650:
+                    flash("Укажите от 1 до 3650 дней.", "warning")
+                    return redirect(url_for("users_page"))
+
+                user_keys = get_user_keys(user_id)
+                if not user_keys:
+                    flash(
+                        "У пользователя ещё нет подписки. Сначала выдайте тариф.",
+                        "warning",
+                    )
+                    return redirect(url_for("users_page"))
+
+                if any(key.get("service_type") == "mtg" for key in user_keys):
+                    flash(
+                        "Для Telegram Proxy нельзя установить точный срок через эту форму.",
+                        "warning",
+                    )
+                    return redirect(url_for("users_page"))
+
+                target_expiry_ms = time_utils.get_timestamp_ms(
+                    time_utils.get_msk_now() + timedelta(days=custom_days)
+                )
+                updated_count = 0
+
+                async def update_duration(key):
+                    nonlocal updated_count
+                    try:
+                        result = await asyncio.wait_for(
+                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                                host_name=key["host_name"],
+                                email=key["key_email"],
+                                target_expiry_ms=target_expiry_ms,
+                                telegram_id=str(user_id),
+                                preserve_longer_expiry=False,
+                            ),
+                            timeout=45,
+                        )
+                        if not result or abs(
+                            int(result["expiry_timestamp_ms"]) - target_expiry_ms
+                        ) > 1000:
+                            logger.error(
+                                "Manual duration grant did not reach target for user=%s key_id=%s",
+                                user_id,
+                                key["key_id"],
+                            )
+                            return
+                        if await asyncio.to_thread(
+                            update_key_info,
+                            key["key_id"],
+                            time_utils.from_timestamp_ms(
+                                result["expiry_timestamp_ms"]
+                            ),
+                            result.get("connection_string"),
+                        ):
+                            updated_count += 1
+                    except Exception:
+                        logger.exception(
+                            "Manual duration grant failed for user=%s key_id=%s",
+                            user_id,
+                            key.get("key_id"),
+                        )
+
+                _run_async(
+                    run_panel_jobs(
+                        user_keys, lambda key: key["host_name"], update_duration
+                    ),
+                    timeout=45 * (len(user_keys) + 1),
+                )
+
+                if updated_count != len(user_keys):
+                    flash(
+                        f"Срок установлен не для всех ключей: {updated_count} из {len(user_keys)}. "
+                        "Проверьте сроки в разделе «Ключи» и повторите установку срока.",
+                        "warning" if updated_count else "danger",
+                    )
+                    return redirect(url_for("users_page"))
+
+                flash(
+                    f"Пользователю установлен срок {custom_days} дн. от текущего момента "
+                    f"({updated_count} ключей).",
+                    "success",
+                )
+                return redirect(url_for("users_page"))
+
             if not plan_id:
-                flash("Ошибка: не выбран тариф.", "danger")
+                flash("Выберите тариф или укажите количество бонусных дней.", "danger")
                 return redirect(url_for("users_page"))
 
             plan = get_plan_by_id(int(plan_id))
@@ -3711,11 +4477,6 @@ def create_webhook_app(bot_controller_instance):
                     "VPN можно выдать только как единую глобальную подписку.",
                     "warning",
                 )
-                return redirect(url_for("users_page"))
-
-            user = get_user(user_id)
-            if not user:
-                flash("Ошибка: Пользователь не найден.", "danger")
                 return redirect(url_for("users_page"))
 
             month_qty = plan["months"]
@@ -3743,43 +4504,119 @@ def create_webhook_app(bot_controller_instance):
 
             issued_count = 0
 
-            if plan["host_name"] == "ALL":
+            if plan.get("service_type") == "mtg":
+                host_name = plan["host_name"]
+                existing_key_db = next(
+                    (
+                        key
+                        for key in user_keys
+                        if key.get("service_type") == "mtg"
+                        and key.get("host_name") == host_name
+                    ),
+                    None,
+                )
+                if existing_key_db:
+                    try:
+                        node_id = int(existing_key_db.get("xui_client_uuid") or 0)
+                    except (TypeError, ValueError):
+                        node_id = 0
+                    if node_id <= 0:
+                        flash(
+                            "У существующего Telegram Proxy некорректный ID узла.",
+                            "danger",
+                        )
+                        return redirect(url_for("users_page"))
+                    expiry_ms = _run_async(
+                        mtg_api.renew_proxy_for_user(
+                            host_name,
+                            existing_key_db["key_email"],
+                            node_id,
+                            days_to_add,
+                        )
+                    )
+                    if expiry_ms:
+                        updated = update_key_info(
+                            existing_key_db["key_id"],
+                            time_utils.from_timestamp_ms(expiry_ms),
+                        )
+                        updated = updated and update_key_plan_id(
+                            existing_key_db["key_id"], int(plan["plan_id"])
+                        )
+                        issued_count = 1 if updated else 0
+                else:
+                    key_number = get_next_key_number(user_id)
+                    email = f"user{user_id}key{key_number}mtg"
+                    result = _run_async(
+                        mtg_api.create_proxy_for_user(host_name, email, days_to_add)
+                    )
+                    if result:
+                        new_key_id = add_new_key(
+                            user_id=user_id,
+                            host_name=host_name,
+                            xui_client_uuid=str(result["node_id"]),
+                            key_email=email,
+                            expiry_timestamp_ms=result["expiry_timestamp_ms"],
+                            connection_string=result["connection_string"],
+                            plan_id=plan["plan_id"],
+                            service_type="mtg",
+                        )
+                        issued_count = 1 if new_key_id else 0
+
+                if not issued_count:
+                    flash("Не удалось выдать или продлить Telegram Proxy.", "danger")
+                    return redirect(url_for("users_page"))
+                msg = "Telegram Proxy успешно выдан или продлён!"
+
+            elif plan["host_name"] == "ALL":
                 # Global Plan
                 hosts = get_all_hosts(only_enabled=True)
+                current_expiries = [
+                    time_utils.parse_iso_to_msk(key.get("expiry_date"))
+                    for key in user_keys
+                    if key.get("service_type", "xui") == "xui"
+                ]
+                current_expiries = [value for value in current_expiries if value]
+                global_base_dt = max([time_utils.get_msk_now(), *current_expiries])
+                global_target_expiry_ms = time_utils.get_timestamp_ms(
+                    global_base_dt + timedelta(days=days_to_add)
+                )
 
                 # We need a key number for any NEW keys we might create
                 # To be consistent with existing logic, we fetch it once
                 key_number = get_next_key_number(user_id)
 
-                for h in hosts:
+                async def issue_host(h):
+                    nonlocal issued_count
                     try:
                         existing_key_db = _find_existing_manual_issue_key(
                             h["host_name"]
                         )
 
                         if existing_key_db:
-                            # Manual issuance should set the exact plan duration from now,
-                            # not extend the user's remaining time. Reuse trial keys too,
-                            # otherwise admin issuance creates duplicate clients on the panel.
-                            result = _run_async(
+                            # A manual plan grant is additive: paid time already on the
+                            # account must never be shortened or replaced.
+                            result = await asyncio.wait_for(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=existing_key_db["key_email"],
-                                    target_expiry_ms=target_expiry_ms,
+                                    target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
-                                    preserve_longer_expiry=False,
-                                )
+                                    preserve_longer_expiry=True,
+                                ),
+                                timeout=45,
                             )
                             if result:
                                 expiry_dt = time_utils.from_timestamp_ms(
                                     result["expiry_timestamp_ms"]
                                 )
-                                updated = update_key_info(
+                                updated = await asyncio.to_thread(
+                                    update_key_info,
                                     existing_key_db["key_id"],
                                     expiry_dt,
                                     result["connection_string"],
                                 )
-                                updated = updated and update_key_plan_id(
+                                updated = updated and await asyncio.to_thread(
+                                    update_key_plan_id,
                                     existing_key_db["key_id"], int(plan["plan_id"])
                                 )
                                 if not updated:
@@ -3788,22 +4625,24 @@ def create_webhook_app(bot_controller_instance):
                                         h["host_name"],
                                         existing_key_db["key_id"],
                                     )
-                                    continue
+                                    return
                                 issued_count += 1
                         else:
                             # Create new key
                             email = f"user{user_id}-global-{h['host_name'].replace(' ', '').lower()}"
-                            result = _run_async(
+                            result = await asyncio.wait_for(
                                 xui_api.create_or_update_key_on_host_absolute_expiry(
                                     host_name=h["host_name"],
                                     email=email,
-                                    target_expiry_ms=target_expiry_ms,
+                                    target_expiry_ms=global_target_expiry_ms,
                                     telegram_id=str(user_id),
                                     preserve_longer_expiry=False,
-                                )
+                                ),
+                                timeout=45,
                             )
                             if result:
-                                new_key_id = add_new_key(
+                                new_key_id = await asyncio.to_thread(
+                                    add_new_key,
                                     user_id=user_id,
                                     host_name=h["host_name"],
                                     xui_client_uuid=result["client_uuid"],
@@ -3817,12 +4656,18 @@ def create_webhook_app(bot_controller_instance):
                                         "Manual global issue created host %s but DB persistence failed.",
                                         h["host_name"],
                                     )
-                                    continue
+                                    return
                                 issued_count += 1
                     except Exception as e_h:
                         logger.error(
                             f"Failed to issue manual key on host {h['host_name']}: {e_h}"
                         )
+
+                _run_async(
+                    run_panel_jobs(hosts, lambda h: h["host_name"], issue_host),
+                    timeout=45 * (len(hosts) + 1),
+                )
+
                 if issued_count == 0:
                     flash(
                         "Не удалось создать/обновить ни один ключ на серверах XUI.",
@@ -3838,7 +4683,8 @@ def create_webhook_app(bot_controller_instance):
                     )
                     flash(
                         f"Подписка выдана не полностью: {issued_count} из {len(hosts)} серверов. "
-                        "Статистика не начислена; проверьте недоступные хосты и повторите операцию.",
+                        "Статистика не начислена. Не повторяйте общую выдачу: после проверки серверов "
+                        "обработайте только отставшие ключи в разделе «Ключи».",
                         "warning",
                     )
                     return redirect(url_for("users_page"))
@@ -3853,16 +4699,13 @@ def create_webhook_app(bot_controller_instance):
                     existing_key_db = _find_existing_manual_issue_key(host_name)
 
                     if existing_key_db:
-                        # Manual issuance should set the exact plan duration from now,
-                        # not extend the user's remaining time. Reuse trial keys too,
-                        # otherwise admin issuance creates duplicate clients on the panel.
+                        # Preserve the existing remainder and add the tariff duration.
                         result = _run_async(
-                            xui_api.create_or_update_key_on_host_absolute_expiry(
+                            xui_api.create_or_update_key_on_host_seconds(
                                 host_name=host_name,
                                 email=existing_key_db["key_email"],
-                                target_expiry_ms=target_expiry_ms,
+                                seconds_to_add=days_to_add * 86400,
                                 telegram_id=str(user_id),
-                                preserve_longer_expiry=False,
                             )
                         )
                         if result:
@@ -3958,39 +4801,15 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/users/delete/<int:user_id>", methods=["POST"])
     @login_required
     def delete_user_route(user_id):
-        keys_to_revoke = get_user_keys(user_id)
-        success_count = 0
-        deleted_key_ids: list[int] = []
-        failed_keys: list[str] = []
-
-        for key in keys_to_revoke:
-            try:
-                result = _delete_remote_user_key(key)
-                if result:
-                    success_count += 1
-                    if key.get("key_id") is not None:
-                        deleted_key_ids.append(int(key["key_id"]))
-                else:
-                    failed_keys.append(
-                        key.get("key_email") or f"key:{key.get('key_id')}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to delete key '{key.get('key_email')}' for user {user_id}: {e}",
-                    exc_info=True,
-                )
-                failed_keys.append(key.get("key_email") or f"key:{key.get('key_id')}")
-
-        if failed_keys:
-            if deleted_key_ids:
-                delete_keys_by_ids(deleted_key_ids)
+        result = _revoke_user_keys(user_id)
+        if result["failed"]:
             logger.warning(
                 "User %s deletion cancelled because some remote keys remain: %s",
                 user_id,
-                ", ".join(failed_keys),
+                ", ".join(result["failed"]),
             )
             flash(
-                f"Удаление пользователя {user_id} остановлено: удалось удалить {success_count} из {len(keys_to_revoke)} ключей. "
+                f"Удаление пользователя {user_id} остановлено: удалось удалить {result['revoked']} из {result['total']} ключей. "
                 "Пользователь сохранён в БД, а локально удалены только уже удалённые на сервере ключи.",
                 "warning",
             )
@@ -4004,16 +4823,10 @@ def create_webhook_app(bot_controller_instance):
             )
             return redirect(url_for("users_page"))
 
-        if success_count == len(keys_to_revoke):
-            flash(
-                f"Пользователь {user_id} и все его данные были удалены. Ключей отозвано: {success_count}.",
-                "success",
-            )
-        else:
-            flash(
-                f"Пользователь {user_id} удален из базы, но удалось отозвать {success_count} из {len(keys_to_revoke)} ключей. Проверьте логи.",
-                "warning",
-            )
+        flash(
+            f"Пользователь {user_id} и все его данные были удалены. Ключей отозвано: {result['revoked']}.",
+            "success",
+        )
 
         return redirect(url_for("users_page"))
 
@@ -4269,7 +5082,25 @@ def create_webhook_app(bot_controller_instance):
     @login_required
     def add_plan_route():
         service_type = request.form.get("service_type", "xui")
-        host_name = request.form["host_name"]
+        host_name = request.form.get("host_name", "").strip()
+        plan_name = request.form.get("plan_name", "").strip()
+        try:
+            months = int(request.form.get("months", ""))
+            price_decimal = Decimal(request.form.get("price", ""))
+        except (InvalidOperation, ValueError, TypeError):
+            flash("Срок и цена тарифа должны быть числами.", "danger")
+            return redirect(url_for("settings_page"))
+        if (
+            service_type not in {"xui", "mtg"}
+            or not host_name
+            or not plan_name
+            or not 1 <= months <= 120
+            or not price_decimal.is_finite()
+            or price_decimal <= 0
+            or price_decimal > Decimal("1000000")
+        ):
+            flash("Проверьте тип услуги, название, срок и цену тарифа.", "danger")
+            return redirect(url_for("settings_page"))
         if service_type == "xui" and host_name != "ALL":
             flash(
                 "VPN продается только как единая подписка. Добавляйте XUI-тарифы в блоке глобальных тарифов.",
@@ -4279,9 +5110,9 @@ def create_webhook_app(bot_controller_instance):
 
         create_plan(
             host_name=host_name,
-            plan_name=request.form["plan_name"],
-            months=int(request.form["months"]),
-            price=float(request.form["price"]),
+            plan_name=plan_name,
+            months=months,
+            price=float(price_decimal),
             service_type=service_type,
         )
         flash(f"Новый тариф для хоста '{host_name}' добавлен.", "success")
@@ -4513,6 +5344,7 @@ def create_webhook_app(bot_controller_instance):
     @flask_app.route("/yookassa-webhook", methods=["POST"])
     def yookassa_webhook_handler():
         reserved_payment_id: str | None = None
+        reserved_attempt_id: str | None = None
         try:
             shop_id = get_setting("yookassa_shop_id")
             secret_key = get_setting("yookassa_secret_key")
@@ -4537,6 +5369,18 @@ def create_webhook_app(bot_controller_instance):
                     return "Bad Request", 400
 
                 if _is_webhook_processed("yookassa", payment_id):
+                    return "OK", 200
+
+                # Do not spend an external API call/thread on arbitrary public
+                # webhook input.  Only locally created pending payments are
+                # eligible for provider verification and fulfillment.
+                local_status = _get_transaction_status(str(payment_id))
+                if local_status in {"paid", "processing"}:
+                    return "OK", 200
+                if local_status != "pending":
+                    logger.warning(
+                        "YooKassa webhook rejected unknown local payment id."
+                    )
                     return "OK", 200
 
                 Configuration.account_id = shop_id
@@ -4593,6 +5437,7 @@ def create_webhook_app(bot_controller_instance):
                 reserved_metadata = reserve_pending_transaction(
                     payment_id,
                     metadata=metadata,
+                    preserve_fulfillment_state=True,
                     payment_method="YooKassa",
                     amount_currency=(
                         float(api_amount) if api_amount is not None else None
@@ -4612,11 +5457,36 @@ def create_webhook_app(bot_controller_instance):
                         payment_id,
                     )
                     return "Service Unavailable", 503
-                metadata = reserved_metadata
                 reserved_payment_id = payment_id
+                reserved_attempt_id = reserved_metadata.get("processing_attempt_id")
+                metadata = reserved_metadata
 
                 bot = _bot_controller.get_bot_instance()
                 payment_processor = handlers.process_successful_payment
+
+                if bot is None or payment_processor is None:
+                    finalized = finalize_reserved_transaction(
+                        payment_id,
+                        success=False,
+                        metadata=metadata,
+                        payment_method="YooKassa",
+                        amount_currency=(
+                            float(api_amount) if api_amount is not None else None
+                        ),
+                        currency_name=api_currency,
+                    )
+                    reserved_payment_id = None
+                    if not finalized:
+                        logger.error(
+                            "YooKassa webhook: failed to release reserved transaction %s while the bot or payment processor is unavailable.",
+                            payment_id,
+                        )
+                    else:
+                        logger.warning(
+                            "YooKassa webhook: bot or payment processor is unavailable; payment %s returned to the retry queue.",
+                            payment_id,
+                        )
+                    return "Service Unavailable", 503
 
                 if metadata and bot is not None and payment_processor is not None:
                     loop = current_app.config.get("EVENT_LOOP")
@@ -4673,28 +5543,21 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             if reserved_payment_id:
                 finalize_reserved_transaction(
-                    reserved_payment_id, success=False, payment_method="YooKassa"
+                    reserved_payment_id,
+                    success=False,
+                    payment_method="YooKassa",
+                    expected_attempt_id=reserved_attempt_id,
                 )
             logger.error(f"Error in yookassa webhook handler: {e}", exc_info=True)
             return "Error", 500
 
-    def _cryptobot_webhook_handler_impl(path_secret_valid: bool = False):
+    def _cryptobot_webhook_handler_impl():
         reserved_payment_id: str | None = None
+        reserved_attempt_id: str | None = None
         try:
-            signature_valid = _is_valid_cryptobot_signature()
-
-            configured_secret = get_setting("cryptobot_webhook_secret")
-            request_secret = _extract_cryptobot_secret_from_request()
-            legacy_secret_valid = (
-                not get_setting("cryptobot_token")
-                and bool(configured_secret)
-                and bool(request_secret)
-                and compare_digest(str(request_secret), str(configured_secret))
-            )
-
-            if not signature_valid and not legacy_secret_valid and not path_secret_valid:
+            if not _is_valid_cryptobot_signature():
                 logger.warning(
-                    "CryptoBot Webhook: missing valid signature and legacy secret check failed."
+                    "CryptoBot Webhook: missing or invalid HMAC signature."
                 )
                 return "Forbidden", 403
 
@@ -4766,11 +5629,32 @@ def create_webhook_app(bot_controller_instance):
                     )
                     return "Bad Request", 400
 
+                # Validate before passing provider values to SQLite. A signed
+                # notification still needs a usable, finite positive amount.
+                try:
+                    if isinstance(cb_amount, bool):
+                        raise ValueError("Boolean payment amount")
+                    paid_amount = Decimal(str(cb_amount))
+                    if not paid_amount.is_finite() or paid_amount <= 0:
+                        raise ValueError("Non-positive or non-finite payment amount")
+                    cb_amount = float(paid_amount)
+                    if not math.isfinite(cb_amount) or cb_amount <= 0:
+                        raise ValueError("Payment amount cannot be stored safely")
+                except (InvalidOperation, ValueError, TypeError, OverflowError):
+                    logger.error("CryptoBot webhook: Invalid paid amount.")
+                    return "Bad Request", 400
+                currency_name = "RUB"
+
                 if payment_id:
+                    invoice_identity = external_invoice_id or external_id_fallback
+                    binding = get_cryptobot_binding_state(payment_id, invoice_identity, paid_amount)
+                    if binding in {"awaiting_binding", "unavailable", "missing"}:
+                        return "Service Unavailable", 503
+                    if binding != "match":
+                        logger.warning("CryptoBot invoice ownership mismatch; transaction unchanged")
+                        return "Bad Request", 400
                     metadata = _reserve_pending_transaction_for_cryptobot(
-                        payment_id,
-                        amount_currency=cb_amount,
-                        currency_name=currency_name,
+                        payment_id, str(invoice_identity), paid_amount,
                     )
                     if metadata is None:
                         local_status = _get_transaction_status(payment_id)
@@ -4800,42 +5684,61 @@ def create_webhook_app(bot_controller_instance):
                             local_status,
                         )
                         return "Service Unavailable", 503
+                    reserved_payment_id = payment_id
+                    reserved_attempt_id = metadata.get("processing_attempt_id")
                     payload_price = metadata.get("price")
                     metadata["payment_method"] = "CryptoBot"
                     metadata["provider_payment_id"] = payment_id
-                    metadata["cryptobot_invoice_id"] = str(
-                        external_invoice_id or external_id_fallback or ""
-                    )
-                    reserved_payment_id = payment_id
+                    # The reservation already claimed the canonical provider ID.
+                    # Do not replace it with raw webhook formatting.
+                    assert metadata.get("cryptobot_invoice_id")
                 else:
                     logger.error(
                         "CryptoBot webhook: paid invoice payload has no known pending transaction id."
                     )
                     return "Bad Request", 400
 
-                # Cross-check actual paid amount against payload price
-                if cb_amount:
-                    try:
-                        if abs(float(cb_amount) - float(payload_price)) > 1.0:
-                            if reserved_payment_id:
-                                finalize_reserved_transaction(
-                                    reserved_payment_id,
-                                    success=False,
-                                    metadata=metadata,
-                                    payment_method="CryptoBot",
-                                    amount_currency=cb_amount,
-                                    currency_name=currency_name,
-                                )
-                                reserved_payment_id = None
-                            logger.error(
-                                f"CryptoBot webhook: Amount mismatch! "
-                                f"paid={cb_amount}, payload_price={payload_price}"
-                            )
-                            return "Bad Request", 400
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            f"CryptoBot webhook: Could not compare amounts: {cb_amount} vs {payload_price}"
-                        )
+                # Keep the established one-ruble tolerance, but never treat a
+                # missing or malformed invoice price as successful validation.
+                try:
+                    if isinstance(payload_price, bool):
+                        raise ValueError("Boolean invoice price")
+                    expected_price = Decimal(str(payload_price))
+                    price_matches = (
+                        expected_price.is_finite()
+                        and expected_price > 0
+                        and math.isfinite(float(expected_price))
+                        and abs(paid_amount - expected_price) <= Decimal("1")
+                    )
+                except (InvalidOperation, ValueError, TypeError, OverflowError):
+                    price_matches = False
+                if not price_matches:
+                    finalize_reserved_transaction(
+                        reserved_payment_id,
+                        success=False,
+                        metadata=metadata,
+                    )
+                    reserved_payment_id = None
+                    logger.error(
+                        "CryptoBot webhook: Paid amount does not match a valid invoice price."
+                    )
+                    return "Bad Request", 400
+
+                metadata["payment_confirmation_verified"] = True
+                if not update_reserved_transaction_metadata(payment_id, metadata):
+                    # The unpersisted in-memory proof must not be written by a
+                    # cleanup path or used to start fulfillment.
+                    finalize_reserved_transaction(
+                        reserved_payment_id,
+                        success=False,
+                        payment_method="CryptoBot",
+                        expected_attempt_id=reserved_attempt_id,
+                    )
+                    reserved_payment_id = None
+                    logger.error(
+                        "CryptoBot webhook: Could not persist payment confirmation."
+                    )
+                    return "Service Unavailable", 503
 
                 bot = _bot_controller.get_bot_instance()
                 loop = current_app.config.get("EVENT_LOOP")
@@ -4896,7 +5799,10 @@ def create_webhook_app(bot_controller_instance):
         except Exception as e:
             if reserved_payment_id:
                 finalize_reserved_transaction(
-                    reserved_payment_id, success=False, payment_method="CryptoBot"
+                    reserved_payment_id,
+                    success=False,
+                    payment_method="CryptoBot",
+                    expected_attempt_id=reserved_attempt_id,
                 )
             logger.error(f"Error in cryptobot webhook handler: {e}", exc_info=True)
             return "Error", 500
@@ -4911,15 +5817,10 @@ def create_webhook_app(bot_controller_instance):
     def cryptobot_webhook_handler_with_token(token: str):
         configured_secret = get_setting("cryptobot_webhook_secret")
         if configured_secret and compare_digest(str(token), str(configured_secret)):
-            if get_setting("cryptobot_token"):
-                logger.warning(
-                    "CryptoBot Webhook: path secret accepted only as route compatibility; HMAC signature is still required."
-                )
-                return _cryptobot_webhook_handler_impl(path_secret_valid=False)
             logger.warning(
-                "CryptoBot Webhook: path-based secret is deprecated but temporarily accepted without HMAC because cryptobot_token is not configured."
+                "CryptoBot Webhook: path route is deprecated; HMAC signature is required."
             )
-            return _cryptobot_webhook_handler_impl(path_secret_valid=True)
+            return _cryptobot_webhook_handler_impl()
         return "Forbidden", 403
 
     @flask_app.route("/settings/toggle_global_plans", methods=["POST"])

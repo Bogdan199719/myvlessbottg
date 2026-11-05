@@ -1,3 +1,4 @@
+from shop_bot.modules.subscription_operations import serialize_user_operation
 import logging
 import uuid
 import qrcode
@@ -27,6 +28,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from shop_bot.bot import keyboards
 from shop_bot.modules import xui_api
+from shop_bot.modules.panel_jobs import run_panel_jobs
 from shop_bot.modules import mtg_api
 from shop_bot.data_manager.database import (
     get_user,
@@ -49,8 +51,10 @@ from shop_bot.data_manager.database import (
     get_referral_count,
     add_to_referral_balance,
     create_pending_transaction,
+    bind_cryptobot_invoice,
     reserve_pending_transaction,
     update_reserved_transaction_metadata,
+    is_reserved_transaction_fulfillment_allowed,
     apply_payment_accounting_once,
     finalize_reserved_transaction,
     mark_pending_transaction_status,
@@ -120,6 +124,31 @@ class _BestEffortProcessingMessage:
         return None
 
 
+def _is_payment_fulfillment_retry(metadata: dict | None) -> bool:
+    """Return whether user-visible fulfillment processing already started."""
+    if (metadata or {}).get("fulfillment_status_message_sent_at"):
+        return True
+    try:
+        return int((metadata or {}).get("fulfillment_target_expiry_ms") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _payment_attempt_is_current(metadata: dict | None) -> bool:
+    provider_payment_id = (metadata or {}).get("provider_payment_id")
+    if (
+        not provider_payment_id
+        and (
+            "processing_attempt_id" in (metadata or {})
+            or str((metadata or {}).get("payment_method") or "").lower() == "cryptobot"
+        )
+    ):
+        return False
+    return not provider_payment_id or is_reserved_transaction_fulfillment_allowed(
+        str(provider_payment_id), metadata
+    )
+
+
 def _build_subscription_link(domain: str | None, token: str | None) -> str | None:
     domain_value = (domain or "").strip()
     token_value = (token or "").strip()
@@ -128,6 +157,40 @@ def _build_subscription_link(domain: str | None, token: str | None) -> str | Non
     if not domain_value.startswith(("http://", "https://")):
         domain_value = f"https://{domain_value}"
     return f"{domain_value.rstrip('/')}/sub/{token_value}"
+
+
+def _subscription_clients_hint() -> str:
+    return (
+        "<blockquote>Одна ссылка для обоих приложений.\n"
+        "Выберите приложение кнопкой ниже — подписка откроется в нём автоматически."
+        "</blockquote>"
+    )
+
+
+def _device_subscription_guide(title: str, install_text: str) -> str:
+    return (
+        f"<b>{title}</b>\n\n"
+        f"<b>1. Установите приложение</b>\n{install_text}\n\n"
+        "<b>2. Выберите способ подключения</b>\n"
+        "• Нажмите <b>🔌 Happ</b> — приложение откроется и предложит добавить подписку.\n"
+        "• Нажмите <b>📲 Incy</b> — приложение откроется сразу на импорте подписки.\n\n"
+        "<b>3. Подтвердите импорт</b>\n"
+        "Разрешите открыть выбранное приложение и подтвердите добавление подписки.\n\n"
+        "<b>4. Подключитесь</b>\n"
+        "Дождитесь появления списка серверов, выберите сервер и включите VPN. "
+        "Если список не появился, обновите подписку внутри приложения.\n\n"
+        "<b>Если приложение не открылось:</b> зайдите в «Мой профиль» → "
+        "«Показать ссылку», скопируйте URL и добавьте его в приложении вручную "
+        "как подписку."
+    )
+
+
+def _active_subscription_token(user_id: int) -> str | None:
+    paid_keys = get_active_paid_keys(user_id)
+    trial_keys = get_active_trial_keys(user_id)
+    if not has_active_global_access(paid_keys, trial_keys):
+        return None
+    return get_or_create_subscription_token(user_id)
 
 
 def _build_payment_context(
@@ -450,6 +513,82 @@ def _plan_snapshot(plan: dict) -> dict:
     }
 
 
+def _calculate_plan_quote(plan: dict, user_data: dict | None) -> tuple[Decimal, bool]:
+    """Return an authoritative server-side RUB quote for a payment method."""
+    base_price = Decimal(str(plan["price"]))
+    final_price = base_price
+    user_data = user_data or {}
+    if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
+        try:
+            discount_percentage = Decimal(
+                str(get_setting("referral_discount") or "0")
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            discount_percentage = Decimal("0")
+        if Decimal("0") < discount_percentage < Decimal("100"):
+            discount_amount = (
+                base_price * discount_percentage / Decimal("100")
+            ).quantize(Decimal("0.01"))
+            final_price = base_price - discount_amount
+    return final_price, final_price < base_price
+
+
+def _validate_plan_selection(
+    plan: dict | None,
+    *,
+    host_name: str,
+    action: str,
+    key_id: int,
+    user_id: int,
+) -> tuple[bool, str]:
+    """Validate callback fields against authoritative plan/key records."""
+    if not plan:
+        return False, "Тариф не найден. Откройте список тарифов заново."
+    if action not in {"new", "extend"}:
+        return False, "Некорректное действие с тарифом."
+
+    plan_host = str(plan.get("host_name") or "")
+    service_type = str(plan.get("service_type") or "xui")
+    if service_type == "xui":
+        if host_name != "ALL" or plan_host != "ALL":
+            return False, "Этот VPN-тариф не относится к единой подписке."
+    elif service_type == "mtg":
+        if not host_name or host_name != plan_host:
+            return False, "Тариф не относится к выбранному прокси-серверу."
+    else:
+        return False, "Неизвестный тип услуги."
+
+    if action == "new":
+        if key_id != 0:
+            return False, "Некорректный идентификатор нового подключения."
+        return True, ""
+
+    key = get_key_by_id(key_id)
+    if not key or int(key.get("user_id") or 0) != int(user_id):
+        return False, "Ключ для продления не найден или принадлежит другому пользователю."
+    if str(key.get("service_type") or "xui") != service_type:
+        return False, "Тип ключа не совпадает с выбранным тарифом."
+    if service_type == "mtg" and str(key.get("host_name") or "") != host_name:
+        return False, "Ключ и тариф относятся к разным прокси-серверам."
+    return True, ""
+
+
+def _validate_payment_state_plan(
+    plan: dict | None, data: dict, user_id: int
+) -> tuple[bool, str]:
+    """Revalidate persisted FSM fields immediately before invoice creation."""
+    try:
+        return _validate_plan_selection(
+            plan,
+            host_name=str(data.get("host_name") or ""),
+            action=str(data.get("action") or ""),
+            key_id=int(data.get("key_id") or 0),
+            user_id=user_id,
+        )
+    except (TypeError, ValueError):
+        return False, "Некорректные параметры покупки."
+
+
 def _get_stars_transaction(payment_id: str) -> dict | None:
     try:
         with sqlite3.connect(DB_FILE) as conn:
@@ -738,15 +877,10 @@ def get_user_router() -> Router:
         privacy_url = get_setting("privacy_url")
         channel_url = get_setting("channel_url")
 
-        if not channel_url or not terms_url or not privacy_url:
-            set_terms_agreed(user_id)
-            await show_main_menu(message)
-            return
-
         is_subscription_forced = get_setting("force_subscription") == "true"
 
         show_welcome_screen = (is_subscription_forced and channel_url) or (
-            terms_url and privacy_url
+            terms_url or privacy_url
         )
 
         if not show_welcome_screen:
@@ -934,9 +1068,7 @@ def get_user_router() -> Router:
         await callback.message.answer(
             "🔗 <b>Ссылка-подписка:</b>\n"
             f"<code>{sub_link}</code>\n\n"
-            "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-            "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>",
+            f"{_subscription_clients_hint()}",
             reply_markup=keyboards.create_global_link_keyboard(sub_link, token),
             disable_web_page_preview=True,
         )
@@ -947,16 +1079,14 @@ def get_user_router() -> Router:
         await callback.message.edit_text(
             "<b>🌍 Что такое глобальная подписка</b>\n\n"
             "Это одна ссылка вида <code>https://.../sub/...</code>, в которой уже собраны все ваши серверы.\n"
-            "Её удобно добавлять в <a href='https://www.happ.su/main/ru'>Happ</a> как одну подписку.\n\n"
-            "<b>Как подключить:</b>\n"
-            "1. Нажмите кнопку <b>🔌 Подключить в Happ</b> рядом со ссылкой подписки.\n"
-            "2. Подтвердите добавление в Happ.\n"
-            "3. Нажмите <b>Обновить подписку</b>, если Happ попросит обновление.\n"
-            "4. Выберите любой сервер из списка и подключитесь.\n\n"
-            "<b>Запасной способ:</b> скопируйте ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
+            "Она одинаково подходит для <a href='https://www.happ.su/main/ru'>Happ</a> и <a href='https://incy.cc'>Incy</a>.\n\n"
+            "Нажмите <b>🔌 Happ</b> или <b>📲 Incy</b> — выбранное приложение сразу откроет добавление подписки.\n\n"
+            "После импорта выберите любой сервер и подключитесь.\n\n"
             "<b>Важно:</b> обычный ключ <code>vless://</code> добавляет один сервер,\n"
             "а ссылка <code>https://.../sub/...</code> добавляет сразу всю подписку целиком.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
         )
 
     @user_router.callback_query(F.data == "back_to_main_menu")
@@ -1085,6 +1215,7 @@ def get_user_router() -> Router:
             parts.append(
                 f"\n🔗 <b>{profile_link_label}:</b>\n<code>{profile_vpn_link}</code>"
             )
+            parts.append("\n🔌 <b>Подключить:</b>")
 
         final_text = "\n".join(parts)
 
@@ -1092,24 +1223,43 @@ def get_user_router() -> Router:
         profile_kb = InlineKeyboardBuilder()
 
         if is_global_active and subscription_token:
+            client_buttons = []
             happ_url = keyboards.build_happ_redirect_url(subscription_token)
             if happ_url:
-                profile_kb.button(
-                    text="🔌 Подключить в Happ",
-                    url=happ_url,
+                client_buttons.append(
+                    types.InlineKeyboardButton(text="🔌 Happ", url=happ_url)
                 )
-            profile_kb.button(
-                text="🔗 Ссылка подписки",
-                callback_data=f"global_link_{subscription_token}",
+            incy_url = keyboards.build_incy_redirect_url(subscription_token)
+            if incy_url:
+                client_buttons.append(
+                    types.InlineKeyboardButton(text="📲 Incy", url=incy_url)
+                )
+            if client_buttons:
+                profile_kb.row(*client_buttons)
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text="🔗 Показать ссылку",
+                    callback_data=f"global_link_{subscription_token}",
+                )
             )
         if active_paid_keys or active_trial_keys or xui_paid_keys or trial_keys:
-            profile_kb.button(text="📦 Мои подписки", callback_data="manage_keys")
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text="📦 Мои подписки", callback_data="manage_keys"
+                )
+            )
         if mtg_keys:
             label = "📡 Мой Proxy" if active_mtg_keys else "📡 Продлить Proxy"
-            profile_kb.button(text=label, callback_data="show_proxy_keys")
-        profile_kb.button(text="🏠 В меню", callback_data="back_to_main_menu")
-
-        profile_kb.adjust(1)
+            profile_kb.row(
+                types.InlineKeyboardButton(
+                    text=label, callback_data="show_proxy_keys"
+                )
+            )
+        profile_kb.row(
+            types.InlineKeyboardButton(
+                text="🏠 В меню", callback_data="back_to_main_menu"
+            )
+        )
         await callback.message.edit_text(
             final_text, reply_markup=profile_kb.as_markup()
         )
@@ -1352,7 +1502,10 @@ def get_user_router() -> Router:
         user_id = message.from_user.id
         user = get_user(user_id)
         balance = user.get("referral_balance", 0)
-        details = message.text.strip()
+        details = (message.text or "").strip()
+        if not details:
+            await message.answer("❌ Отправьте реквизиты текстовым сообщением.")
+            return
         if balance < 100:
             await message.answer("❌ Ваш баланс менее 100 руб. Вывод недоступен.")
             await state.clear()
@@ -1367,13 +1520,22 @@ def get_user_router() -> Router:
             return
         text = (
             f"💸 <b>Заявка на вывод реферальных средств</b>\n"
-            f"👤 Пользователь: @{user.get('username', 'N/A')} (ID: <code>{user_id}</code>)\n"
+            f"👤 Пользователь: @{html.quote(str(user.get('username') or 'N/A'))} "
+            f"(ID: <code>{user_id}</code>)\n"
             f"💰 Сумма: <b>{balance:.2f} RUB</b>\n"
-            f"📄 Реквизиты: <code>{details}</code>\n\n"
+            f"📄 Реквизиты: <code>{html.quote(details)}</code>\n\n"
             f"/approve_withdraw_{user_id} /decline_withdraw_{user_id}"
         )
-        await message.answer("Ваша заявка отправлена администратору. Ожидайте ответа.")
-        await _send_to_admins(message.bot, text, parse_mode="HTML")
+        sent_count = await _send_to_admins(message.bot, text, parse_mode="HTML")
+        if sent_count:
+            await message.answer(
+                "Ваша заявка отправлена администратору. Ожидайте ответа."
+            )
+        else:
+            await message.answer(
+                "❌ Не удалось доставить заявку администратору. "
+                "Пожалуйста, обратитесь в поддержку."
+            )
         await state.clear()
 
     @user_router.message(F.text.regexp(r"^/approve_withdraw_\d+(?:@\w+)?$"))
@@ -1664,9 +1826,16 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data == "get_trial")
     @registration_required
+    @serialize_user_operation(lambda callback, state: callback.from_user.id)
     async def trial_period_handler(callback: types.CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         user_db_data = get_user(user_id)
+        if not user_db_data or not user_db_data.get("agreed_to_terms"):
+            await callback.answer(
+                "Сначала подтвердите согласие с условиями через /start.",
+                show_alert=True,
+            )
+            return
         if get_setting("trial_enabled") != "true":
             await callback.answer("Пробный период сейчас недоступен.", show_alert=True)
             return
@@ -1692,13 +1861,14 @@ def get_user_router() -> Router:
 
         chosen_host = hosts[0]
 
+        # An expired Telegram callback must not consume the trial claim.
+        await callback.answer()
         if not claim_trial_if_unused(user_id):
             await callback.answer(
                 "Вы уже использовали бесплатный пробный период.", show_alert=True
             )
             return
 
-        await callback.answer()
         await process_trial_key_creation(callback.message, chosen_host["host_name"])
 
     async def process_trial_key_creation(message: types.Message, host_name: str):
@@ -1712,29 +1882,28 @@ def get_user_router() -> Router:
         if trial_days <= 0:
             trial_days = 1
 
-        await message.edit_text(
-            f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей подписки..."
-        )
-
         results: list[dict] = []
+        panel_mutated = False
         try:
+            await message.edit_text(
+                f"Отлично! Создаю для вас бесплатный пробный доступ на {trial_days} дней для всей подписки..."
+            )
             user_token = get_or_create_subscription_token(user_id)
             domain = get_setting("domain")
             hosts_to_process = get_all_hosts(only_enabled=True)
+            trial_keys_by_host = {
+                key.get("host_name"): key
+                for key in get_user_trial_keys(user_id)
+                if key.get("service_type", "xui") == "xui"
+                and key.get("host_name")
+            }
             target_expiry_ms = time_utils.get_timestamp_ms(
                 time_utils.get_msk_now() + timedelta(days=int(trial_days))
             )
 
             for host in hosts_to_process:
                 current_host_name = host["host_name"]
-                existing_trial_key = None
-                for key in get_user_trial_keys(user_id):
-                    if (
-                        key.get("service_type", "xui") == "xui"
-                        and key.get("host_name") == current_host_name
-                    ):
-                        existing_trial_key = key
-                        break
+                existing_trial_key = trial_keys_by_host.get(current_host_name)
 
                 email = (
                     existing_trial_key["key_email"]
@@ -1749,6 +1918,7 @@ def get_user_router() -> Router:
                 )
                 if not result:
                     continue
+                panel_mutated = True
 
                 expiry_datetime = time_utils.from_timestamp_ms(
                     result["expiry_timestamp_ms"]
@@ -1786,7 +1956,13 @@ def get_user_router() -> Router:
                 results.append(result)
 
             if not results:
-                release_trial_claim(user_id)
+                if not panel_mutated:
+                    release_trial_claim(user_id)
+                else:
+                    logger.error(
+                        "Trial panel access changed for user %s but no local key was persisted; claim retained for safe reconciliation.",
+                        user_id,
+                    )
                 await message.edit_text(
                     "❌ Не удалось создать пробный доступ. Ошибка на сервере."
                 )
@@ -1814,10 +1990,8 @@ def get_user_router() -> Router:
             if sub_link:
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.\n"
-                    "После окончания пробного периода можно будет продлить эту же глобальную подписку.</blockquote>"
+                    f"{_subscription_clients_hint()}\n\n"
+                    "После окончания пробного периода можно будет продлить эту же глобальную подписку."
                 )
             else:
                 final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена в админке."
@@ -1846,7 +2020,7 @@ def get_user_router() -> Router:
             await notify_admin_of_trial(message.bot, user_id, "ALL", trial_days)
 
         except Exception as e:
-            if not results:
+            if not results and not panel_mutated:
                 release_trial_claim(user_id)
             logger.error(
                 f"Error creating trial key for user {user_id} on host {host_name}: {e}",
@@ -1856,7 +2030,16 @@ def get_user_router() -> Router:
 
     @user_router.callback_query(F.data == "enter_promo_code")
     @registration_required
-    async def enter_promo_code_handler(callback: types.CallbackQuery, state: FSMContext):
+    async def enter_promo_code_handler(
+        callback: types.CallbackQuery, state: FSMContext
+    ):
+        user_data = get_user(callback.from_user.id)
+        if not user_data or not user_data.get("agreed_to_terms"):
+            await callback.answer(
+                "Сначала подтвердите согласие с условиями через /start.",
+                show_alert=True,
+            )
+            return
         if str(get_setting("enable_promo_codes") or "true").lower() != "true":
             await callback.answer("Промокоды сейчас недоступны.", show_alert=True)
             await show_main_menu(callback.message, edit_message=True)
@@ -1897,6 +2080,7 @@ def get_user_router() -> Router:
             return
 
         promo = None
+        promo_id = None
         promo_applied = False
         promo_fulfillment_started = False
         processing_message = None
@@ -1938,23 +2122,29 @@ def get_user_router() -> Router:
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
                 )
                 return
+            assert promo is not None
+            promo_id = int(promo["promo_id"])
+            promo_code = str(promo["code"])
+            promo_duration_days = int(promo["duration_days"])
 
             global_plans = get_plans_for_host("ALL", service_type="xui")
             if not global_plans:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await message.answer(
                     "❌ Администратор ещё не настроил глобальные VPN-тарифы.",
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
                 )
                 return
 
-            plan = sorted(global_plans, key=lambda item: int(item.get("months") or 0))[0]
+            plan = sorted(global_plans, key=lambda item: int(item.get("months") or 0))[
+                0
+            ]
             plan_id = int(plan["plan_id"])
-            duration_days = int(promo["duration_days"])
+            duration_days = promo_duration_days
 
             hosts = get_all_hosts(only_enabled=True)
             if not hosts:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await message.answer(
                     "❌ Сейчас нет доступных VPN-серверов.",
                     reply_markup=keyboards.create_back_to_menu_keyboard(),
@@ -1969,7 +2159,7 @@ def get_user_router() -> Router:
                 user_id=user_id, action="new", host_name="ALL", key_id=0
             )
             if prep_error:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await processing_message.edit_text(prep_error)
                 return
 
@@ -1980,10 +2170,10 @@ def get_user_router() -> Router:
                     user_id, duration_days, hosts_to_process, promo_metadata
                 )
                 target_expiry_ms = set_promo_fulfillment_target(
-                    int(promo["promo_id"]), user_id, calculated_target
+                    promo_id, user_id, calculated_target
                 )
             if not target_expiry_ms:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
                 await processing_message.edit_text(
                     "❌ Не удалось зафиксировать срок подписки по промокоду."
                 )
@@ -2027,7 +2217,7 @@ def get_user_router() -> Router:
                 )
                 return
 
-            if not mark_promo_code_applied(int(promo["promo_id"]), user_id):
+            if not mark_promo_code_applied(promo_id, user_id):
                 await processing_message.edit_text(
                     "❌ Доступ выдан, но применение промокода не зафиксировано. "
                     "Повторите ввод этого же кода позже."
@@ -2040,7 +2230,7 @@ def get_user_router() -> Router:
             log_transaction(
                 username=user_info.get("username", "N/A") if user_info else "N/A",
                 transaction_id=None,
-                payment_id=f"promo-{promo['promo_id']}-{user_id}-{uuid.uuid4()}",
+                payment_id=f"promo-{promo_id}-{user_id}-{uuid.uuid4()}",
                 user_id=user_id,
                 status="paid",
                 amount_rub=0,
@@ -2049,10 +2239,10 @@ def get_user_router() -> Router:
                 payment_method="Promo",
                 metadata=json.dumps(
                     {
-                        "promo_code": promo["code"],
+                        "promo_code": promo_code,
                         "duration_days": duration_days,
                         "plan_id": plan_id,
-                        "plan_name": f"Промокод {promo['code']} ({duration_days} дн.)",
+                        "plan_name": f"Промокод {promo_code} ({duration_days} дн.)",
                         "host_name": "ALL",
                     }
                 ),
@@ -2071,7 +2261,7 @@ def get_user_router() -> Router:
             )
             final_text = (
                 f"🎉 <b>Промокод применён!</b>\n"
-                f"<blockquote>🎟 {html.quote(promo['code'])}\n"
+                f"<blockquote>🎟 {html.quote(promo_code)}\n"
                 f"📅 Подписка активна до {new_expiry_date.strftime('%d.%m.%Y')}\n"
                 f"🔗 Доступно серверов: {len(results)}</blockquote>\n"
             )
@@ -2080,7 +2270,7 @@ def get_user_router() -> Router:
             if sub_link:
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Нажмите <b>🔌 Подключить в Happ</b> или скопируйте ссылку и добавьте её вручную.</blockquote>"
+                    f"{_subscription_clients_hint()}"
                 )
             else:
                 final_text += "\n⚠️ Не удалось сформировать ссылку подписки. Проверьте настройку домена."
@@ -2122,7 +2312,7 @@ def get_user_router() -> Router:
                         "price": 0,
                         "host_name": "ALL",
                         "plan_id": plan_id,
-                        "payment_method": f"Promo {promo['code']}",
+                        "payment_method": f"Promo {promo_code}",
                     },
                 )
             except Exception as e:
@@ -2130,7 +2320,7 @@ def get_user_router() -> Router:
 
         except Exception as e:
             if promo and not promo_applied and not promo_fulfillment_started:
-                release_promo_code_claim(int(promo["promo_id"]), user_id)
+                release_promo_code_claim(promo_id, user_id)
             logger.error(
                 f"Error applying promo code {code} for user {user_id}: {e}",
                 exc_info=True,
@@ -2248,23 +2438,19 @@ def get_user_router() -> Router:
 
         await callback.message.edit_text(
             "<b>📖 Инструкция по подключению</b>\n\n"
-            "<b>Рекомендуемое приложение:</b> <a href='https://www.happ.su/main/ru'>Happ</a>\n\n"
-            "<b>Если Happ недоступен:</b> используйте <a href='https://incy.cc'>Incy</a>. "
-            "Версии для поддерживаемых платформ собраны в <a href='https://github.com/INCY-DEV/incy-platforms'>официальном репозитории Incy</a>.\n\n"
+            "<b>Приложения:</b> <a href='https://www.happ.su/main/ru'>Happ</a> или <a href='https://incy.cc'>Incy</a>.\n\n"
             "<b>Что вы получаете в боте:</b>\n"
             "1. <code>vless://...</code> — один ключ доступа.\n"
             "2. <code>https://.../sub/...</code> — ссылка подписки со всеми серверами.\n\n"
-            "<b>Самый простой сценарий:</b>\n"
-            "1. Установите Happ на ваше устройство.\n"
-            "2. Если у вас есть ссылка подписки <code>https://.../sub/...</code>, нажмите <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Выберите сервер и включите подключение.\n\n"
-            "<b>Запасной способ:</b> скопируйте ключ или ссылку подписки, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n\n"
-            "<b>Подключение через Incy:</b> скопируйте ссылку подписки <code>https://.../sub/...</code>, "
-            "откройте Incy и добавьте подписку по URL. После импорта выберите сервер и включите подключение.\n\n"
+            "<b>Подключение:</b>\n"
+            "1. Установите Happ или Incy на ваше устройство.\n"
+            "2. Откройте профиль в боте и нажмите <b>🔌 Happ</b> или <b>📲 Incy</b>.\n"
+            "3. Подтвердите добавление подписки в приложении.\n"
+            "4. Выберите сервер и включите подключение.\n\n"
             "Выберите платформу ниже:",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2273,18 +2459,15 @@ def get_user_router() -> Router:
     async def howto_android_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Android</b>\n\n"
-            "1. Установите <a href='https://play.google.com/store/apps/details?id=com.happproxy'>Happ из Google Play</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится список серверов.\n\n"
-            "<b>Если Happ недоступен:</b> установите <a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Incy из Google Play</a> "
-            "или скачайте <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>APK с официального GitHub</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "📱 Подключение на Android",
+                "<a href='https://play.google.com/store/apps/details?id=com.happproxy'>Скачать Happ из Google Play</a>\n"
+                "<a href='https://play.google.com/store/apps/details?id=llc.itdev.incy'>Скачать Incy из Google Play</a>\n"
+                "Если Google Play недоступен: <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest/download/Incy.apk'>официальный APK Incy</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2293,18 +2476,14 @@ def get_user_router() -> Router:
     async def howto_ios_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на iOS (iPhone/iPad)</b>\n\n"
-            "1. Установите <a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Happ из App Store</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n\n"
-            "Для подписки <code>/sub/</code> в Happ появится готовый список серверов.\n\n"
-            "<b>Если Happ удалён из App Store:</b> установите <a href='https://apps.apple.com/ru/app/incy/id6756943388'>Incy из App Store</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL. "
-            "Подробнее — на <a href='https://incy.cc'>официальном сайте Incy</a>.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "📱 Подключение на iPhone/iPad",
+                "<a href='https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'>Скачать Happ из App Store</a>\n"
+                "<a href='https://apps.apple.com/ru/app/incy/id6756943388'>Скачать Incy из App Store</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2313,18 +2492,14 @@ def get_user_router() -> Router:
     async def howto_macos_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на macOS</b>\n\n"
-            "1. Установите Happ: <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>скачать dmg</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
-            "<b>Если Happ недоступен:</b> установите Incy из <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> "
-            "или скачайте сборку для macOS из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "🍎 Подключение на macOS",
+                "Happ: <a href='https://apps.apple.com/us/app/happ-proxy-utility/id6504287215'>App Store</a> или <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'>DMG</a>\n"
+                "Incy: <a href='https://apps.apple.com/ru/app/incy/id6756943388'>App Store</a> или <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальный релиз</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2333,17 +2508,14 @@ def get_user_router() -> Router:
     async def howto_windows_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Windows</b>\n\n"
-            "1. Установите <a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Happ для Windows</a>.\n"
-            "2. Для подписки нажмите в боте <b>🔌 Подключить в Happ</b>.\n"
-            "3. Подтвердите добавление в Happ.\n"
-            "4. Если Happ попросит — нажмите <b>Обновить подписку</b>.\n"
-            "5. Запасной способ: скопируйте ключ <code>vless://...</code> или ссылку <code>https://.../sub/...</code>, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-            "6. Выберите сервер и включите подключение.\n"
-            "7. При необходимости проверьте IP на <a href='https://2ip.ru'>2ip.ru</a>.\n\n"
-            "<b>Если Happ недоступен:</b> скачайте Incy для Windows из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов на GitHub</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            _device_subscription_guide(
+                "💻 Подключение на Windows",
+                "<a href='https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'>Скачать Happ для Windows</a>\n"
+                "<a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>Скачать Incy из официальных релизов</a>.",
+            ),
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2352,22 +2524,20 @@ def get_user_router() -> Router:
     async def howto_linux_handler(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
-            "<b>Подключение на Linux</b>\n\n"
-            "1. <b>Скачайте и распакуйте Nekoray:</b> Перейдите в <a href='https://github.com/MatsuriDayo/Nekoray/releases'>релизы Nekoray на GitHub</a> и скачайте архив для Linux. Распакуйте его в удобную папку.\n"
-            "2. <b>Запустите Nekoray:</b> Откройте терминал, перейдите в папку с Nekoray и выполните <code>./nekoray</code> (или используйте графический запуск, если доступен).\n"
-            "3. <b>Скопируйте в боте</b> либо ключ <code>vless://...</code>, либо ссылку подписки <code>https://.../sub/...</code>.\n"
-            "4. <b>Импортируйте:</b>\n"
-            "   • В Nekoray нажмите «Сервер» (Server).\n"
-            "   • Для <code>vless://</code> выберите «Импортировать из буфера обмена».\n"
-            "   • Для <code>/sub/</code> добавьте Subscription URL.\n"
-            "5. <b>Обновите подписку</b> (Server/Subscription Update).\n"
-            "6. Включите <b>TUN Mode</b>.\n"
-            "7. <b>Выберите сервер</b> и нажмите «Подключить».\n"
-            "8. <b>Проверьте IP</b> на <a href='https://whatismyipaddress.com/'>WhatIsMyIPAddress</a>.\n\n"
-            "<b>Резервный вариант — Incy:</b> если основной клиент установить не получается, "
-            "скачайте подходящую сборку из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>. "
-            "Скопируйте ссылку подписки <code>https://.../sub/...</code>, откройте Incy и добавьте подписку по URL.",
-            reply_markup=keyboards.create_howto_vless_keyboard(),
+            "<b>🐧 Подключение на Linux</b>\n\n"
+            "<b>1. Установите Incy</b>\n"
+            "Скачайте версию для Linux из <a href='https://github.com/INCY-DEV/incy-platforms/releases/latest'>официальных релизов Incy</a>.\n\n"
+            "<b>2. Добавьте подписку</b>\n"
+            "Нажмите <b>📲 Incy</b> ниже и разрешите браузеру открыть приложение.\n\n"
+            "<b>3. Подтвердите импорт</b>\n"
+            "В Incy подтвердите добавление подписки и дождитесь списка серверов.\n\n"
+            "<b>4. Подключитесь</b>\n"
+            "Выберите сервер и включите VPN. Если список не появился, обновите подписку в приложении.\n\n"
+            "<b>Если Incy не открылся:</b> зайдите в «Мой профиль» → «Показать ссылку», "
+            "скопируйте URL и добавьте его в Incy вручную как подписку.",
+            reply_markup=keyboards.create_howto_vless_keyboard(
+                _active_subscription_token(callback.from_user.id)
+            ),
             disable_web_page_preview=True,
         )
 
@@ -2522,9 +2692,7 @@ def get_user_router() -> Router:
         if service_type == "xui":
             await _show_global_purchase_plans(
                 callback,
-                keep_source_message=_is_subscription_reminder_message(
-                    callback.message
-                ),
+                keep_source_message=_is_subscription_reminder_message(callback.message),
             )
             return
 
@@ -2548,15 +2716,47 @@ def get_user_router() -> Router:
     async def plan_selection_handler(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
 
-        parts = callback.data.split("_")[1:]
-        action = parts[-2]
-        key_id = int(parts[-1])
-        plan_id = int(parts[-3])
-        host_name = "_".join(parts[:-3])
+        user_data = get_user(callback.from_user.id)
+        if not user_data or not user_data.get("agreed_to_terms"):
+            await callback.message.edit_text(
+                "❌ Сначала подтвердите согласие с условиями через /start."
+            )
+            await state.clear()
+            return
+
+        try:
+            parts = callback.data.split("_")[1:]
+            action = parts[-2]
+            key_id = int(parts[-1])
+            plan_id = int(parts[-3])
+            host_name = "_".join(parts[:-3])
+        except (IndexError, TypeError, ValueError):
+            await callback.message.edit_text(
+                "❌ Некорректный тариф. Откройте список тарифов заново."
+            )
+            await state.clear()
+            return
 
         # Determine service_type from plan to route payment fulfillment correctly
         _plan = get_plan_by_id(plan_id)
-        service_type = _plan.get("service_type", "xui") if _plan else "xui"
+        selection_valid, selection_error = _validate_plan_selection(
+            _plan,
+            host_name=host_name,
+            action=action,
+            key_id=key_id,
+            user_id=callback.from_user.id,
+        )
+        if not selection_valid:
+            logger.warning(
+                "Rejected invalid plan selection user=%s plan_id=%s action=%s",
+                callback.from_user.id,
+                plan_id,
+                action,
+            )
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+        service_type = str(_plan.get("service_type") or "xui")
 
         await state.update_data(
             action=action,
@@ -2600,15 +2800,7 @@ def get_user_router() -> Router:
             return
 
         await state.update_data(customer_email=None)
-        await callback.message.edit_text(
-            message_text,
-            reply_markup=keyboards.create_payment_method_keyboard(
-                payment_methods=payment_methods,
-                action=action,
-                key_id=key_id,
-            ),
-        )
-        await state.set_state(PaymentProcess.waiting_for_payment_method)
+        await show_payment_options(callback.message, state, message_text)
         logger.info(
             f"User {callback.from_user.id}: State set to waiting_for_payment_method"
         )
@@ -2681,7 +2873,11 @@ def get_user_router() -> Router:
         await state.update_data(customer_email=None)
         await _create_yookassa_payment(callback, state)
 
-    async def show_payment_options(message: types.Message, state: FSMContext):
+    async def show_payment_options(
+        message: types.Message,
+        state: FSMContext,
+        base_message: str = CHOOSE_PAYMENT_METHOD_MESSAGE,
+    ):
         data = await state.get_data()
         user_data = get_user(message.chat.id)
         plan = get_plan_by_id(data.get("plan_id"))
@@ -2692,28 +2888,22 @@ def get_user_router() -> Router:
             return
 
         price = Decimal(str(plan["price"]))
-        final_price = price
-        message_text = CHOOSE_PAYMENT_METHOD_MESSAGE
+        final_price, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
+        message_text = base_message
 
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
+        if referral_discount_applied:
             discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-
-            if discount_percentage > 0:
-                discount_amount = (price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                final_price = price - discount_amount
-
-                message_text = (
-                    f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
-                    f"Старая цена: <s>{price:.2f} RUB</s>\n"
-                    f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
-                ) + CHOOSE_PAYMENT_METHOD_MESSAGE
+            message_text = (
+                f"🎉 Как приглашенному пользователю, на вашу первую покупку предоставляется скидка {discount_percentage_str}%!\n"
+                f"Старая цена: <s>{price:.2f} RUB</s>\n"
+                f"<b>Новая цена: {final_price:.2f} RUB</b>\n\n"
+            ) + base_message
 
         await state.update_data(
             final_price=float(final_price),
-            referral_discount_applied=bool(final_price < price),
+            referral_discount_applied=referral_discount_applied,
         )
 
         methods = get_active_payment_methods(
@@ -2786,17 +2976,17 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
-        base_price = Decimal(str(plan["price"]))
-        price_rub = base_price
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await message_obj.answer(f"❌ {selection_error}")
+            await state.clear()
+            return
 
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
-            discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-            if discount_percentage > 0:
-                discount_amount = (base_price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                price_rub = base_price - discount_amount
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
 
         customer_email = data.get("customer_email")
         if not customer_email:
@@ -2826,7 +3016,6 @@ def get_user_router() -> Router:
         key_id = data.get("key_id")
         months = plan["months"]
         plan_snapshot = _plan_snapshot(plan)
-        referral_discount_applied = bool(price_rub < base_price)
 
         try:
             price_str_for_api = f"{price_rub:.2f}"
@@ -2872,7 +3061,9 @@ def get_user_router() -> Router:
             if receipt:
                 payment_payload["receipt"] = receipt
 
-            payment = Payment.create(payment_payload, uuid.uuid4())
+            payment = await asyncio.to_thread(
+                Payment.create, payment_payload, uuid.uuid4()
+            )
             payment_id = str(getattr(payment, "id", "") or "").strip()
             if not payment_id:
                 raise RuntimeError("YooKassa payment id is missing in API response")
@@ -3037,6 +3228,14 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+
         stars_rate_setting = get_setting("stars_rub_per_star")
         try:
             rub_per_star = (
@@ -3058,7 +3257,9 @@ def get_user_router() -> Router:
                 await state.clear()
                 return
 
-        price_rub = Decimal(str(data.get("final_price", plan["price"])))
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, get_user(user_id)
+        )
         stars_amount = int(
             (price_rub / rub_per_star).to_integral_value(rounding=ROUND_CEILING)
         )
@@ -3081,9 +3282,7 @@ def get_user_router() -> Router:
             "plan_id": data.get("plan_id"),
             "customer_email": data.get("customer_email"),
             "payment_method": "Telegram Stars",
-            "referral_discount_applied": bool(
-                data.get("referral_discount_applied")
-            ),
+            "referral_discount_applied": referral_discount_applied,
         }
 
         title = f"Подписка на {plan['months']} мес."
@@ -3157,9 +3356,7 @@ def get_user_router() -> Router:
         transaction = _get_stars_transaction(payment_id) if payment_id else None
         metadata = transaction.get("metadata_dict", {}) if transaction else {}
         payer_user_id = (
-            int(pre_checkout_query.from_user.id)
-            if pre_checkout_query.from_user
-            else 0
+            int(pre_checkout_query.from_user.id) if pre_checkout_query.from_user else 0
         )
         try:
             expected_user_id = int(metadata.get("user_id") or 0)
@@ -3180,7 +3377,11 @@ def get_user_router() -> Router:
             logger.warning(
                 "Stars: Rejected pre-checkout for payload=%s user_id=%s",
                 payment_id,
-                pre_checkout_query.from_user.id if pre_checkout_query.from_user else None,
+                (
+                    pre_checkout_query.from_user.id
+                    if pre_checkout_query.from_user
+                    else None
+                ),
             )
             await bot.answer_pre_checkout_query(
                 pre_checkout_query_id=pre_checkout_query.id,
@@ -3302,66 +3503,24 @@ def get_user_router() -> Router:
             await state.clear()
             return
 
-        if not plan:
-            await callback.message.answer("Произошла ошибка при выборе тарифа.")
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
             await state.clear()
             return
 
-        base_price = Decimal(str(plan["price"]))
-        price_rub = base_price
-
-        if user_data.get("referred_by") and user_data.get("total_spent", 0) == 0:
-            discount_percentage_str = get_setting("referral_discount") or "0"
-            discount_percentage = Decimal(discount_percentage_str)
-            if discount_percentage > 0:
-                discount_amount = (base_price * discount_percentage / 100).quantize(
-                    Decimal("0.01")
-                )
-                price_rub = base_price - discount_amount
+        price_rub, referral_discount_applied = _calculate_plan_quote(
+            plan, user_data
+        )
         months = plan["months"]
         plan_snapshot = _plan_snapshot(plan)
-        referral_discount_applied = bool(price_rub < base_price)
 
         payment_id = None
+        invoice_bound = False
         try:
-            exchange_rate = await get_usdt_rub_rate()
-
-            if not exchange_rate:
-                logger.warning(
-                    "Failed to get live exchange rate. Falling back to the manual setting or default."
-                )
-
-                # Fallback to setting if available, otherwise default to a safe high rate (e.g. 110)
-                # Ideally, you should have a setting for this. For now, we'll try to get it or hardcode.
-                manual_rate = get_setting("usdt_rub_rate")
-                if manual_rate:
-                    try:
-                        exchange_rate = Decimal(manual_rate)
-                    except (InvalidOperation, ValueError, TypeError) as rate_error:
-                        logger.warning(
-                            f"Invalid manual usdt_rub_rate setting '{manual_rate}': {rate_error}"
-                        )
-
-                if not exchange_rate:
-                    # Final fallback
-                    exchange_rate = Decimal("100.00")
-                    logger.warning("Using hardcoded fallback rate: 100.00 RUB/USDT")
-
-            if not exchange_rate:
-                await callback.message.edit_text(
-                    "❌ Не удалось получить курс валют. Попробуйте позже."
-                )
-                await state.clear()
-                return
-
-            margin = Decimal("1.03")
-            price_usdt = (price_rub / exchange_rate * margin).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            )
-
-            logger.info(
-                f"Creating Crypto Pay invoice for user {user_id}. Plan price: {price_rub} RUB. Converted to: {price_usdt} USDT."
-            )
+            logger.info("Creating Crypto Pay invoice in RUB.")
 
             crypto = CryptoPay(cryptobot_token)
             payment_id = str(uuid.uuid4())
@@ -3375,6 +3534,8 @@ def get_user_router() -> Router:
                 "plan_id": plan_id,
                 "customer_email": customer_email,
                 "payment_method": "CryptoBot",
+                "cryptobot_binding_version": 1,
+                "cryptobot_binding_state": "creating",
                 "referral_discount_applied": referral_discount_applied,
             }
             pending_id = create_pending_transaction(
@@ -3397,6 +3558,12 @@ def get_user_router() -> Router:
             if not invoice or not invoice.pay_url:
                 raise Exception("Failed to create invoice or pay_url is missing.")
 
+            if not await asyncio.to_thread(
+                bind_cryptobot_invoice, payment_id, getattr(invoice, "invoice_id", None)
+            ):
+                raise RuntimeError("Could not save CryptoBot invoice ownership")
+            invoice_bound = True
+
             await callback.message.edit_text(
                 "Нажмите на кнопку ниже для оплаты:",
                 reply_markup=keyboards.create_payment_keyboard(invoice.pay_url),
@@ -3404,7 +3571,7 @@ def get_user_router() -> Router:
             await state.clear()
 
         except Exception as e:
-            if payment_id:
+            if payment_id and not invoice_bound:
                 mark_pending_transaction_status(
                     payment_id,
                     "failed",
@@ -3415,7 +3582,7 @@ def get_user_router() -> Router:
                 exc_info=True,
             )
             await callback.message.edit_text(
-                f"❌ Не удалось создать счет для оплаты криптовалютой.\n\n<pre>Ошибка: {e}</pre>"
+                "❌ Не удалось создать счет для оплаты криптовалютой. Попробуйте позже."
             )
             await state.clear()
 
@@ -3446,8 +3613,17 @@ def get_user_router() -> Router:
         plan_id = data.get("plan_id")
         plan = get_plan_by_id(plan_id) if plan_id else None
 
-        base_price = Decimal(str(plan["price"])) if plan else Decimal("0")
-        final_price = Decimal(str(data.get("final_price", base_price)))
+        selection_valid, selection_error = _validate_payment_state_plan(
+            plan, data, user_id
+        )
+        if not selection_valid:
+            await callback.message.edit_text(f"❌ {selection_error}")
+            await state.clear()
+            return
+
+        final_price, referral_discount_applied = _calculate_plan_quote(
+            plan, get_user(user_id)
+        )
         price_rub = float(final_price)
 
         created = create_p2p_request(
@@ -3467,9 +3643,7 @@ def get_user_router() -> Router:
                     if plan
                     else None
                 ),
-                "referral_discount_applied": bool(
-                    data.get("referral_discount_applied")
-                ),
+                "referral_discount_applied": referral_discount_applied,
                 "submitted": False,
             },
         )
@@ -3584,9 +3758,7 @@ def get_user_router() -> Router:
             )
 
     @user_router.message(Command(commands=["decline_p2p"]))
-    async def admin_decline_p2p_handler(
-        message: types.Message, command: CommandObject
-    ):
+    async def admin_decline_p2p_handler(message: types.Message, command: CommandObject):
         if not _is_admin(message.from_user.id):
             return
         request_id = _p2p_request_id_from_command(message, command)
@@ -3798,7 +3970,8 @@ async def get_usdt_rub_rate() -> Decimal | None:
     params = {"symbol": "USDTRUB"}
 
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10, connect=3, sock_read=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, params=params) as response:
                 response.raise_for_status()
                 data = await response.json()
@@ -3835,6 +4008,8 @@ async def _create_mtg_proxy_after_payment(
         update_key_plan_id,
     )
 
+    if not _payment_attempt_is_current(metadata):
+        return False
     days = months * 30
     try:
         if action == "extend" and key_id:
@@ -3846,9 +4021,9 @@ async def _create_mtg_proxy_after_payment(
             proxy_name = existing_key["key_email"]
             node_id = int(existing_key["xui_client_uuid"])
             panel_details = await mtg_api.get_proxy_details(host_name, proxy_name)
-            panel_expiry_ms = int(
-                (panel_details or {}).get("expiry_timestamp_ms") or 0
-            )
+            if not _payment_attempt_is_current(metadata):
+                return False
+            panel_expiry_ms = int((panel_details or {}).get("expiry_timestamp_ms") or 0)
             if not panel_details or panel_expiry_ms <= 0:
                 logger.error(
                     "MTG panel expiry is unavailable for %s; refusing a relative renew",
@@ -3870,6 +4045,8 @@ async def _create_mtg_proxy_after_payment(
                 new_expiry_ms = await mtg_api.renew_proxy_for_user(
                     host_name, proxy_name, node_id, days, current_expiry_ms
                 )
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if not new_expiry_ms:
                     await processing_message.edit_text(
                         "❌ Не удалось продлить прокси. Обратитесь в поддержку."
@@ -3940,6 +4117,8 @@ async def _create_mtg_proxy_after_payment(
                     return False
             else:
                 result = await mtg_api.get_proxy_details(host_name, proxy_name)
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if result and not all(
                     (
                         result.get("node_id") is not None,
@@ -3956,6 +4135,8 @@ async def _create_mtg_proxy_after_payment(
                     result = await mtg_api.create_proxy_for_user(
                         host_name, proxy_name, days
                     )
+                if not _payment_attempt_is_current(metadata):
+                    return False
                 if not result:
                     await processing_message.edit_text(
                         "❌ Не удалось создать прокси. Обратитесь в поддержку."
@@ -4009,6 +4190,8 @@ async def _create_mtg_proxy_after_payment(
                 float(reward),
                 metadata,
             )
+            if accounting_applied_now is None:
+                return False
             if not accounting_applied_now and not metadata.get("accounting_applied"):
                 logger.error(
                     "Could not atomically apply MTG accounting for payment %s",
@@ -4061,9 +4244,7 @@ async def _create_mtg_proxy_after_payment(
                 metadata=json.dumps(
                     {
                         "plan_id": plan_id,
-                        "plan_name": (
-                            metadata.get("plan_name", "Unknown")
-                        ),
+                        "plan_name": (metadata.get("plan_name", "Unknown")),
                         "host_name": host_name,
                         "service_type": "mtg",
                         "customer_email": metadata.get("customer_email"),
@@ -4305,13 +4486,19 @@ async def _execute_payment_for_hosts(
     hosts_to_process: list[tuple[str, str]],
     key_id: int,
     target_expiry_ms: int | None = None,
+    preserve_longer_expiry: bool = True,
+    metadata: dict | None = None,
 ) -> tuple[list[dict], int | None]:
     """Create/extend keys on all target hosts and update DB."""
     results: list[dict] = []
     primary_key_id: int | None = None
 
-    for h_name, h_email in hosts_to_process:
+    async def process_host(item):
+        nonlocal primary_key_id
+        h_name, h_email = item
         try:
+            if metadata is not None and not _payment_attempt_is_current(metadata):
+                return
             existing_key_db = None
             if purchase_host_name == "ALL" or action == "new":
                 # Reuse existing key on the same host to preserve trial/global clients.
@@ -4325,6 +4512,7 @@ async def _execute_payment_for_hosts(
                     email=h_email,
                     target_expiry_ms=int(target_expiry_ms),
                     telegram_id=str(user_id),
+                    preserve_longer_expiry=preserve_longer_expiry,
                 )
             else:
                 res = await xui_api.create_or_update_key_on_host(
@@ -4333,8 +4521,10 @@ async def _execute_payment_for_hosts(
                     days_to_add=days_to_add,
                     telegram_id=str(user_id),
                 )
+            if metadata is not None and not _payment_attempt_is_current(metadata):
+                return
             if not res:
-                continue
+                return
 
             if existing_key_db:
                 expiry_datetime = time_utils.from_timestamp_ms(
@@ -4356,7 +4546,7 @@ async def _execute_payment_for_hosts(
                         h_name,
                         existing_key_db["key_id"],
                     )
-                    continue
+                    return
                 results.append(res)
                 if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(existing_key_db["key_id"])
@@ -4376,12 +4566,9 @@ async def _execute_payment_for_hosts(
                         h_name,
                         res.get("email"),
                     )
-                    continue
+                    return
                 results.append(res)
-                if (
-                    purchase_host_name != "ALL"
-                    and primary_key_id is None
-                ):
+                if purchase_host_name != "ALL" and primary_key_id is None:
                     primary_key_id = int(new_key_id)
             elif action == "extend" and purchase_host_name != "ALL":
                 expiry_datetime = time_utils.from_timestamp_ms(
@@ -4397,18 +4584,26 @@ async def _execute_payment_for_hosts(
                         h_name,
                         key_id,
                     )
-                    continue
+                    return
                 results.append(res)
                 if primary_key_id is None:
                     primary_key_id = int(key_id)
         except Exception as e:
             logger.error(f"Failed to process key on host {h_name}: {e}")
 
+    await run_panel_jobs(hosts_to_process, lambda item: item[0], process_host)
+    host_order = {name: index for index, (name, _email) in enumerate(hosts_to_process)}
+    results.sort(key=lambda result: host_order[result["host_name"]])
     return results, primary_key_id
 
 
+@serialize_user_operation(lambda bot, metadata: (metadata or {}).get("user_id"))
 async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
     pending_flag_set = False
+    attempt_owner = metadata.get("processing_attempt_id")
+    if not _payment_attempt_is_current(metadata):
+        return False
+    is_fulfillment_retry = _is_payment_fulfillment_retry(metadata)
     try:
         logger.info(
             "Processing successful payment for user %s provider_payment_id=%s plan_id=%s action=%s",
@@ -4422,7 +4617,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
         # ========== RACE CONDITION PROTECTION ==========
         # Atomically acquire the per-user processing flag.
-        if not set_pending_payment(user_id, True):
+        if not set_pending_payment(user_id, True, owner=attempt_owner):
             logger.warning(
                 f"Payment already being processed for user {user_id}. Ignoring duplicate webhook."
             )
@@ -4442,12 +4637,17 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         # Additional safety check for keys
         if action in ["extend", "new"] and not host_name:
             logger.error(
-                f"Missing host_name in metadata for action {action}: {metadata}"
+                "Missing host_name in payment metadata provider_payment_id=%s plan_id=%s action=%s",
+                metadata.get("provider_payment_id"),
+                plan_id,
+                action,
             )
             await bot.send_message(
                 user_id,
                 "❌ Произошла ошибка при обработке платежа: не указан сервер. Обратитесь в поддержку.",
             )
+            set_pending_payment(user_id, False, owner=attempt_owner)
+            pending_flag_set = False
             return False
 
         # The invoice snapshot is authoritative: changing/deleting a plan after
@@ -4466,6 +4666,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 user_id,
                 "❌ Не удалось определить тип оплаченной услуги. Обратитесь в поддержку.",
             )
+            set_pending_payment(user_id, False, owner=attempt_owner)
+            pending_flag_set = False
             return False
         metadata.setdefault("service_type", str(service_type))
         metadata.setdefault(
@@ -4475,10 +4677,14 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
     except (ValueError, TypeError) as e:
         logger.error(
-            f"FATAL: Could not parse metadata. Error: {e}. Metadata: {metadata}"
+            "FATAL: Could not parse payment metadata provider_payment_id=%s plan_id=%s action=%s: %s",
+            metadata.get("provider_payment_id"),
+            metadata.get("plan_id"),
+            metadata.get("action"),
+            e,
         )
-        if "user_id" in metadata:
-            set_pending_payment(int(metadata["user_id"]), False)
+        if pending_flag_set:
+            set_pending_payment(user_id, False, owner=attempt_owner)
         return False
     except Exception as e:
         logger.error(
@@ -4486,8 +4692,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             exc_info=True,
         )
         _err_user_id = metadata.get("user_id")
+        if pending_flag_set:
+            set_pending_payment(user_id, False, owner=attempt_owner)
         if _err_user_id:
-            set_pending_payment(int(_err_user_id), False)
             try:
                 await bot.send_message(
                     int(_err_user_id),
@@ -4505,20 +4712,43 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         except Exception as e:
             logger.warning(f"Could not delete payment message: {e}")
 
-    try:
-        processing_message = await bot.send_message(
-            chat_id=user_id,
-            text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
-        )
-    except Exception as e:
-        logger.warning(
-            "Payment fulfillment for user %s will continue without a processing message: %s",
+    processing_message = _BestEffortProcessingMessage()
+    if is_fulfillment_retry:
+        logger.info(
+            "Suppressing duplicate user status message for payment fulfillment retry user=%s payment=%s.",
             user_id,
-            e,
+            metadata.get("provider_payment_id"),
         )
-        processing_message = _BestEffortProcessingMessage()
+    else:
+        metadata["fulfillment_status_message_sent_at"] = (
+            time_utils.get_msk_now().isoformat()
+        )
+        provider_payment_id = metadata.get("provider_payment_id")
+        if provider_payment_id and not update_reserved_transaction_metadata(
+            str(provider_payment_id), metadata
+        ):
+            logger.warning(
+                "Could not persist user notification checkpoint for payment %s.",
+                provider_payment_id,
+            )
+            if not _payment_attempt_is_current(metadata):
+                set_pending_payment(user_id, False, owner=attempt_owner)
+                return False
+        try:
+            processing_message = await bot.send_message(
+                chat_id=user_id,
+                text=f'✅ Оплата получена! Обрабатываю ваш запрос на сервере "{host_name}"...',
+            )
+        except Exception as e:
+            logger.warning(
+                "Payment fulfillment for user %s will continue without a processing message: %s",
+                user_id,
+                e,
+            )
 
     try:
+        if not _payment_attempt_is_current(metadata):
+            return False
         # ── MTG Proxy branch ──────────────────────────────────────────────
         if service_type == "mtg":
             target_expiry_ms = _target_expiry_ms_for_service_payment(
@@ -4594,6 +4824,10 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
             hosts_to_process=hosts_to_process,
             key_id=key_id,
             target_expiry_ms=target_expiry_ms,
+            preserve_longer_expiry=not bool(
+                metadata.get("fulfillment_target_corrected_at")
+            ),
+            metadata=metadata,
         )
 
         if not results:
@@ -4604,7 +4838,9 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         if host_name == "ALL" and len(results) != len(hosts_to_process):
             successful_hosts = {r.get("host_name") for r in results}
             failed_hosts = [
-                host for host, _email in hosts_to_process if host not in successful_hosts
+                host
+                for host, _email in hosts_to_process
+                if host not in successful_hosts
             ]
             logger.error(
                 "Global payment fulfillment incomplete for user %s: %s/%s hosts, failed=%s",
@@ -4613,10 +4849,14 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 len(hosts_to_process),
                 failed_hosts,
             )
-            await processing_message.edit_text(
-                "✅ Оплата получена, но не все серверы выданы. "
-                "Я повторю выдачу автоматически; если доступ не появится в ближайшее время, обратитесь в поддержку."
-            )
+            try:
+                await processing_message.delete()
+            except Exception as e:
+                logger.warning(
+                    "Could not remove incomplete global payment status for user %s: %s",
+                    user_id,
+                    e,
+                )
             return False
 
         price = float(metadata.get("price"))
@@ -4640,6 +4880,8 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
                 float(reward),
                 metadata,
             )
+            if accounting_applied_now is None:
+                return False
             if not accounting_applied_now and not metadata.get("accounting_applied"):
                 logger.error(
                     "Could not atomically apply accounting for payment %s.",
@@ -4789,9 +5031,7 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
 
                 final_text += (
                     f"\n🌍 <b>Ссылка-подписка:</b>\n<code>{sub_link}</code>\n\n"
-                    "<blockquote>Основной способ: нажмите <b>🔌 Подключить в Happ</b>.\n"
-                    "Запасной способ: скопируйте ссылку, откройте Happ, нажмите <b>+</b> и добавьте из буфера обмена.\n"
-                    "После добавления Happ может попросить нажать <b>Обновить подписку</b>.</blockquote>"
+                    f"{_subscription_clients_hint()}"
                 )
 
             # Report failures if any
@@ -4864,4 +5104,4 @@ async def process_successful_payment(bot: Bot, metadata: dict) -> bool:
         return False
     finally:
         if pending_flag_set:
-            set_pending_payment(user_id, False)
+            set_pending_payment(user_id, False, owner=attempt_owner)

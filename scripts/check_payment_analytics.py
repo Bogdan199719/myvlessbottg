@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -21,7 +20,13 @@ from shop_bot.utils import time_utils  # noqa: E402
 def _copy_db_to_temp() -> tuple[tempfile.TemporaryDirectory, Path]:
     temp_dir = tempfile.TemporaryDirectory()
     temp_db = Path(temp_dir.name) / "users.db"
-    shutil.copy2(ROOT / "users.db", temp_db)
+    # The service uses WAL. Copying only users.db can omit committed schema
+    # and payments that are still in users.db-wal. Read a consistent snapshot
+    # without changing the source database.
+    source_uri = (ROOT / "users.db").resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(source_uri, uri=True) as source:
+        with sqlite3.connect(temp_db) as destination:
+            source.backup(destination)
     return temp_dir, temp_db
 
 

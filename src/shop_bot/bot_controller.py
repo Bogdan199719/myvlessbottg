@@ -1,7 +1,9 @@
 import asyncio
 import logging
-import requests
+import threading
+from functools import wraps
 
+import requests
 from yookassa import Configuration
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -13,10 +15,20 @@ from shop_bot.bot.middlewares import BanMiddleware, SafeCallbackMiddleware
 from shop_bot.bot import handlers, support_handlers
 from shop_bot.bot.support_handlers import get_support_router
 from shop_bot.utils.admin_ids import parse_admin_telegram_ids
+from shop_bot.utils.runtime_health import RuntimeHealth
 
 logger = logging.getLogger(__name__)
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_STARS_RUB_RATE = 1.6
+
+
+def _serialize_lifecycle(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lifecycle_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _fetch_bot_username_sync(token: str) -> str:
@@ -44,7 +56,9 @@ def _parse_float(value, default: float = 0.0) -> float:
 
 class BotController:
     def __init__(self):
+        self.runtime_health = RuntimeHealth()
         self._loop = None
+        self._lifecycle_lock = threading.RLock()
 
         self.shop_bot = None
         self.shop_dp = None
@@ -97,9 +111,17 @@ class BotController:
                     retry_delay = 5
         finally:
             logger.info("BotController: Polling for '%s' has gracefully stopped.", name)
-            if bot:
-                await bot.close()
-            self._reset_bot_state(name)
+            try:
+                if bot:
+                    await bot.close()
+            except Exception:
+                logger.error(
+                    "BotController: Failed to close '%s' session.",
+                    name,
+                    exc_info=True,
+                )
+            finally:
+                self._reset_bot_state(name, expected_bot=bot)
 
     def _is_bot_marked_running(self, name: str) -> bool:
         if name == "ShopBot":
@@ -108,14 +130,18 @@ class BotController:
             return self.support_is_running
         return False
 
-    def _reset_bot_state(self, name: str) -> None:
+    def _reset_bot_state(self, name: str, expected_bot=None) -> None:
         if name == "ShopBot":
+            if expected_bot is not None and self.shop_bot is not expected_bot:
+                return
             self.shop_is_running = False
             self.shop_task = None
             self.shop_bot = None
             self.shop_dp = None
             return
         if name == "SupportBot":
+            if expected_bot is not None and self.support_bot is not expected_bot:
+                return
             self.support_is_running = False
             self.support_task = None
             self.support_bot = None
@@ -152,8 +178,11 @@ class BotController:
 
         return yookassa_enabled, stars_enabled, cryptobot_enabled, stars_rub_per_star
 
+    @_serialize_lifecycle
     def start_shop_bot(self):
-        if self.shop_is_running:
+        if self.shop_is_running or (
+            self.shop_task is not None and not self.shop_task.done()
+        ):
             return {"status": "error", "message": "Бот уже запущен."}
 
         if not self._loop or not self._loop.is_running():
@@ -172,6 +201,7 @@ class BotController:
                 "message": "Невозможно запустить: не все обязательные настройки Telegram заполнены (токен и ID админа).",
             }
 
+        self.runtime_health.expect_bot("ShopBot", True)
         try:
             self.shop_bot = Bot(
                 token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -189,6 +219,9 @@ class BotController:
                         "Не удалось получить username бота: запрос к Bot API превысил лимит ожидания."
                     ) from exc
 
+            self.shop_bot.session.middleware(
+                self.runtime_health.api_middleware("ShopBot")
+            )
             self.shop_dp = Dispatcher()
             self.shop_dp.update.middleware(SafeCallbackMiddleware())
             self.shop_dp.update.middleware(BanMiddleware())
@@ -218,6 +251,7 @@ class BotController:
             self.shop_task = asyncio.run_coroutine_threadsafe(
                 self._start_polling(self.shop_bot, self.shop_dp, "ShopBot"), self._loop
             )
+            self.runtime_health.track_bot("ShopBot", self.shop_task)
             logger.info("BotController: Start command sent to event loop.")
             return {
                 "status": "success",
@@ -225,12 +259,16 @@ class BotController:
             }
 
         except Exception as e:
+            self.runtime_health.bot_start_failed("ShopBot")
             logger.error("Failed to start bot: %s", e, exc_info=True)
             self._reset_bot_state("ShopBot")
             return {"status": "error", "message": f"Ошибка при запуске: {e}"}
 
+    @_serialize_lifecycle
     def start_support_bot(self):
-        if self.support_is_running:
+        if self.support_is_running or (
+            self.support_task is not None and not self.support_task.done()
+        ):
             return {"status": "error", "message": "Бот-Саппорт уже запущен."}
 
         if not self._loop or not self._loop.is_running():
@@ -248,9 +286,13 @@ class BotController:
                 "message": "Токен для Бота-Саппорта и Айди группы не указаны.",
             }
 
+        self.runtime_health.expect_bot("SupportBot", True)
         try:
             self.support_bot = Bot(
                 token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+            )
+            self.support_bot.session.middleware(
+                self.runtime_health.api_middleware("SupportBot")
             )
             self.support_dp = Dispatcher()
             self.support_dp.update.middleware(SafeCallbackMiddleware())
@@ -266,15 +308,18 @@ class BotController:
                 self._start_polling(self.support_bot, self.support_dp, "SupportBot"),
                 self._loop,
             )
+            self.runtime_health.track_bot("SupportBot", self.support_task)
             return {
                 "status": "success",
                 "message": "Команда на запуск бота отправлена.",
             }
         except Exception as e:
+            self.runtime_health.bot_start_failed("SupportBot")
             self._reset_bot_state("SupportBot")
             logger.error("Failed to start Support Bot: %s", e, exc_info=True)
             return {"status": "error", "message": f"Error starting Support Bot: {e}"}
 
+    @_serialize_lifecycle
     def stop_shop_bot(self):
         if not self.shop_is_running:
             return {"status": "error", "message": "Бот не запущен."}
@@ -285,6 +330,7 @@ class BotController:
                 "message": "Критическая ошибка: компоненты бота недоступны.",
             }
 
+        self.runtime_health.expect_bot("ShopBot", False)
         self.shop_is_running = False
 
         logger.info("BotController: Sending graceful stop signal...")
@@ -292,6 +338,7 @@ class BotController:
 
         return {"status": "success", "message": "Команда на остановку бота отправлена."}
 
+    @_serialize_lifecycle
     def stop_support_bot(self):
         if not self.support_is_running:
             return {"status": "error", "message": "Бот не запущен."}
@@ -302,6 +349,7 @@ class BotController:
                 "message": "Критическая ошибка: компоненты бота недоступны.",
             }
 
+        self.runtime_health.expect_bot("SupportBot", False)
         self.support_is_running = False
 
         logger.info("BotController: Sending graceful stop signal...")

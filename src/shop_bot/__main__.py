@@ -10,6 +10,9 @@ from shop_bot.webhook_server.restore_manager import (
     apply_pending_restore,
     quarantine_pending_restore,
 )
+from shop_bot.utils.logging_utils import SensitiveUrlFilter
+from shop_bot.utils.runtime_alerts import runtime_watchdog
+from shop_bot.utils.process_lock import acquire_instance_lock, InstanceAlreadyRunning
 
 load_dotenv()
 
@@ -18,6 +21,11 @@ load_dotenv()
 _APP_ROOT = Path(__file__).resolve().parents[2]
 _ENV_FILE = _APP_ROOT / ".env"
 _DB_FILE = Path(os.getenv("DB_PATH", Path.cwd() / "users.db"))
+try:
+    _INSTANCE_LOCK = acquire_instance_lock(_DB_FILE, _APP_ROOT)
+except InstanceAlreadyRunning:
+    logging.getLogger(__name__).critical("Application startup refused: another instance is running")
+    raise SystemExit(73)
 try:
     _pending_env = _APP_ROOT / ".restore_pending" / ".env"
     if _pending_env.exists():
@@ -39,7 +47,11 @@ except Exception:
     )
 
 from shop_bot.webhook_server.app import create_webhook_app
-from shop_bot.data_manager.scheduler import periodic_subscription_check
+from shop_bot.data_manager.scheduler import (
+    periodic_payment_check,
+    periodic_notification_check,
+    periodic_subscription_check,
+)
 from shop_bot.data_manager import database
 from shop_bot.modules import xui_api
 from shop_bot.bot_controller import BotController
@@ -86,6 +98,8 @@ def _configure_logging() -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(SensitiveUrlFilter())
     logging.getLogger("aiogram.dispatcher").addFilter(
         _RateLimitedDispatcherNoiseFilter(interval_seconds=60)
     )
@@ -125,18 +139,15 @@ def _register_signal_handlers(
 
 
 def _run_flask_server(flask_app, logger: logging.Logger) -> None:
-    try:
-        from waitress import serve
+    from waitress import serve
 
-        logger.info(
-            "Starting production server (waitress) on http://%s:%s", APP_HOST, APP_PORT
-        )
-        serve(flask_app, host=APP_HOST, port=APP_PORT, _quiet=True)
-    except Exception as e:
-        logger.warning(
-            "Waitress failed to start (%s). Falling back to Flask built-in server.", e
-        )
-        flask_app.run(host=APP_HOST, port=APP_PORT, threaded=True, use_reloader=False)
+    logger.info(
+        "Starting production server (waitress) on http://%s:%s", APP_HOST, APP_PORT
+    )
+    # Production must fail fast if Waitress cannot start.  Silently falling
+    # back would leave the service looking healthy on Flask's development
+    # server with different reliability and security properties.
+    serve(flask_app, host=APP_HOST, port=APP_PORT, _quiet=True)
 
 
 def _log_bot_autostart_result(
@@ -175,10 +186,18 @@ def main():
     database.initialize_db()
     logger.info("Database initialization check complete.")
 
+    recovered = database.recover_pre_fulfillment_yookassa_on_startup()
+    if recovered:
+        logger.warning(
+            "Startup: returned %s interrupted early YooKassa order(s) to the retry queue.",
+            recovered,
+        )
+
     bot_controller = BotController()
     flask_app = create_webhook_app(bot_controller)
 
     async def shutdown(sig: signal.Signals, loop: asyncio.AbstractEventLoop):
+        bot_controller.runtime_health.close()
         logger.info("Received signal: %s. Shutting down...", sig.name)
         if bot_controller.get_status()["is_running"]:
             bot_controller.stop()
@@ -190,6 +209,9 @@ def main():
         loop = asyncio.get_running_loop()
         bot_controller.set_loop(loop)
         flask_app.config["EVENT_LOOP"] = loop
+        bot_controller.runtime_health.create_task(
+            "heartbeat", bot_controller.runtime_health.heartbeat()
+        )
 
         _register_signal_handlers(loop, shutdown, logger)
 
@@ -208,10 +230,14 @@ def main():
         try:
             logger.info("Attempting to auto-start Telegram Bot and Support Bot...")
             _log_bot_autostart_result(
-                logger, "Telegram Bot", bot_controller.start_shop_bot()
+                logger,
+                "Telegram Bot",
+                await asyncio.to_thread(bot_controller.start_shop_bot),
             )
             _log_bot_autostart_result(
-                logger, "Support Bot", bot_controller.start_support_bot()
+                logger,
+                "Support Bot",
+                await asyncio.to_thread(bot_controller.start_support_bot),
             )
         except Exception as e:
             logger.error("Error during bot auto-start: %s", e, exc_info=True)
@@ -254,7 +280,19 @@ def main():
 
         logger.info("Application is running. Bots are auto-started if configured.")
 
-        asyncio.create_task(periodic_subscription_check(bot_controller))
+        bot_controller.runtime_health.create_task(
+            "subscriptions", periodic_subscription_check(bot_controller)
+        )
+        bot_controller.runtime_health.create_task(
+            "payments", periodic_payment_check(bot_controller)
+        )
+
+        bot_controller.runtime_health.create_task(
+            "notifications", periodic_notification_check(bot_controller)
+        )
+        bot_controller.runtime_health.create_task(
+            "runtime_watchdog", runtime_watchdog(bot_controller)
+        )
 
         await asyncio.Future()
 

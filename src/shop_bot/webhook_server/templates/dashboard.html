@@ -3,18 +3,19 @@
 {% block content %}
 
 {% set summary = analytics.summary %}
+{% set purchase_kind = analytics.purchase_kind|default('all') %}
 
 <div class="dashboard-page-head analytics-head">
 	<div>
 		<h1>Аналитика</h1>
-		<p>Пользователи, выручка, подписки и платежи {{ analytics.period_label }}.</p>
+		<p>Выручка и заказы {{ analytics.period_label }}. Доступ — на текущий момент, история — за всё время.</p>
 	</div>
 	<div class="analytics-head-actions">
 		{% for option in period_options %}
 		<a class="button button-small {{ 'button-primary' if option.is_active else 'button-secondary' }}" href="{{ url_for('dashboard_page', period=option.period) }}">{{ option.label }}</a>
 		{% endfor %}
-		<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Пользователи CSV</a>
-		<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Платежи CSV</a>
+		<a class="button button-small button-secondary" href="{{ url_for('export_users_csv') }}">Все пользователи CSV</a>
+		<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Все платежи CSV</a>
 	</div>
 </div>
 
@@ -29,10 +30,10 @@
 		<strong>{{ summary.period_orders }}</strong>
 		<small>сегодня: {{ summary.today_orders }}, клиентов: {{ summary.period_paid_transaction_users }}, промокодов: {{ summary.period_free_promos }}</small>
 	</div>
-	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
+	<a href="{{ url_for('users_page', status='paid') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Активные оплаченные подписки</span>
 		<strong>{{ summary.active_paid_subscriptions }}</strong>
-		<small>активных клиентов; уникальных оплативших за всю историю: {{ summary.paid_transaction_users }}</small>
+		<small>клиентов с действующим платным доступом сейчас</small>
 	</a>
 	<a href="{{ url_for('users_page') }}" class="analytics-kpi-card">
 		<span class="kpi-label">Пользователи</span>
@@ -42,12 +43,12 @@
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">Средний чек</span>
 		<strong>{{ "%.0f"|format(summary.avg_order) }} ₽</strong>
-		<small>конверсия в оплату: {{ summary.conversion_percent }}%</small>
+		<small>оплачивали среди текущих профилей: {{ summary.current_user_conversion_percent }}%</small>
 	</div>
 	<div class="analytics-kpi-card">
 		<span class="kpi-label">За всё время</span>
 		<strong>{{ "%.0f"|format(summary.all_time_revenue) }} ₽</strong>
-		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных промокодов: {{ summary.all_time_free_promos }}</small>
+		<small>денежных оплат: {{ summary.all_time_orders }}, бесплатных активаций: {{ summary.all_time_free_promos }}</small>
 	</div>
 </section>
 
@@ -70,7 +71,7 @@
 	<div class="section-head">
 		<div>
 			<h3>Параметры расчёта</h3>
-			<span class="panel-note">Налог {{ profit.settings.vlad_tax_percent|round(2) }}% со всей выручки, затем минус серверы и делёж прибыли: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%</span>
+				<span class="panel-note">Все деньги сначала получает Влад: налог {{ profit.settings.vlad_tax_percent|round(2) }}% удерживается со всей выручки, затем вычитаются серверы и остаток делится: Богдан {{ profit.settings.bogdan_share_percent|round(2) }}%, Влад {{ profit.settings.vlad_share_percent|round(2) }}%.</span>
 		</div>
 		<form class="profit-settings-form" action="{{ url_for('update_profit_settings_route') }}" method="post">
 			<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -79,7 +80,7 @@
 				<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ profit.settings.vlad_tax_percent }}">
 			</label>
 			<label>
-				<span>Серверы, ₽</span>
+				<span>Серверы по умолчанию при закрытии, ₽</span>
 				<input type="number" name="server_cost_rub" min="0" step="0.01" value="{{ profit.settings.server_cost_rub }}">
 			</label>
 			<button type="submit" class="button button-small button-secondary">Сохранить</button>
@@ -141,6 +142,10 @@
 				<span>Вручную по</span>
 				<input class="form-control" type="datetime-local" name="custom_period_end" value="{{ profit.now_input }}">
 			</label>
+			<label>
+				<span>Серверы за этот период, ₽</span>
+				<input class="form-control" type="number" name="server_cost_rub" min="0" step="0.01" value="{{ profit.settings.server_cost_rub }}">
+			</label>
 			<input class="form-control" type="text" name="note" placeholder="Заметка к фиксации">
 			<div class="profit-preview" id="profitDistributionPreview" aria-live="polite">
 				<div><span>Период</span><strong data-profit-preview="period">—</strong></div>
@@ -168,6 +173,7 @@
 						<th>Период</th>
 						<th>Статус</th>
 						<th>Выручка</th>
+						<th>Сверка с журналом</th>
 						<th>Богдан</th>
 						<th>Влад чистыми</th>
 						<th>Правка</th>
@@ -184,14 +190,25 @@
 							</td>
 							<td><span class="profit-status profit-status-{{ row.status }}">{{ row.status_label }}</span></td>
 							<td><strong>{{ "%.0f"|format(row.revenue_rub) }} ₽</strong></td>
+							<td>
+								{% if row.is_reconciled %}
+								<span class="profit-status profit-status-paid">сходится</span>
+								{% else %}
+								<span class="profit-status profit-status-void">расхождение {{ "%+.2f"|format(row.reconciliation_delta_rub) }} ₽</span>
+								<small>журнал: {{ "%.2f"|format(row.journal_revenue_rub) }} ₽</small>
+								{% endif %}
+							</td>
 						<td>{{ "%.0f"|format(row.bogdan_profit_rub) }} ₽</td>
 						<td>{{ "%.0f"|format(row.vlad_net_rub) }} ₽</td>
 						<td>
+							{% if row.status == 'active' %}
+							<details class="profit-row-edit">
+								<summary class="button button-tiny button-secondary">Изменить</summary>
 							<form class="profit-edit-form" action="{{ url_for('update_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<input type="text" name="period_start" value="{{ row.period_start or '' }}" placeholder="начало">
 								<input type="text" name="period_end" value="{{ row.period_end }}" placeholder="конец">
-								<input type="number" name="revenue_rub" min="0" step="0.01" value="{{ row.revenue_rub }}">
+								<span class="panel-note">Выручка пересчитывается из журнала оплат при сохранении.</span>
 								<input type="hidden" name="bogdan_share_percent" value="{{ row.bogdan_share_percent }}">
 								<input type="hidden" name="vlad_share_percent" value="{{ row.vlad_share_percent }}">
 								<input type="number" name="vlad_tax_percent" min="0" max="100" step="0.01" value="{{ row.vlad_tax_percent }}">
@@ -199,6 +216,10 @@
 								<input type="text" name="note" value="{{ row.note or '' }}" placeholder="заметка">
 								<button type="submit" class="button button-tiny button-secondary">Сохранить</button>
 							</form>
+							</details>
+							{% else %}
+							<span class="panel-note">закрыто</span>
+							{% endif %}
 						</td>
 						<td>
 							{% if row.status == 'active' %}
@@ -207,11 +228,6 @@
 								<button type="submit" class="button button-tiny button-success">Выплачено</button>
 							</form>
 							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить эту фиксацию? Платежи не удалятся, период снова попадёт в расчёт к распределению.">
-								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-								<button type="submit" class="button button-tiny button-warning">Отменить</button>
-							</form>
-							{% elif row.status == 'paid' %}
-							<form action="{{ url_for('void_profit_distribution_route', distribution_id=row.distribution_id) }}" method="post" data-confirm="Отменить выплаченную фиксацию? Период снова попадёт в расчёт к распределению.">
 								<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 								<button type="submit" class="button button-tiny button-warning">Отменить</button>
 							</form>
@@ -233,7 +249,7 @@
 			<span class="panel-note">пользователи, оплаты, выручка</span>
 		</div>
 		<div class="analytics-chart analytics-chart-large">
-			<canvas id="analyticsTrendChart"></canvas>
+			<canvas id="analyticsTrendChart" role="img" aria-label="Динамика новых пользователей, оплат и выручки за выбранный период">График динамики. Суммарные показатели доступны в карточках выше.</canvas>
 		</div>
 	</section>
 
@@ -243,7 +259,7 @@
 			<span class="panel-note">оплаченные платежи {{ analytics.period_label }}</span>
 		</div>
 		<div class="analytics-chart analytics-chart-donut">
-			<canvas id="paymentMethodsChart"></canvas>
+			<canvas id="paymentMethodsChart" role="img" aria-label="Выручка по методам оплаты за выбранный период">Данные по методам оплаты приведены в списке ниже.</canvas>
 		</div>
 		{% if analytics.payment_methods %}
 		<div class="analytics-list">
@@ -290,43 +306,45 @@
 			<h2>Подписки и доступ</h2>
 			<a class="button button-small button-secondary" href="{{ url_for('users_page') }}">Пользователи</a>
 		</div>
+		<p class="panel-note">Клиенты, а не ключи. Рассчитано {{ analytics.checked_at }} МСК. Текущий доступ и история указаны отдельно.</p>
 		<div class="subscription-state-grid">
-			<div class="subscription-state-item is-active">
+			<a class="subscription-state-item is-active" href="{{ url_for('users_page', status='paid') }}">
 				<span>Активные оплаченные подписки</span>
 				<strong>{{ summary.active_paid_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item is-expired">
+			</a>
+			<a class="subscription-state-item is-expired" href="{{ url_for('users_page', status='paid_expired') }}">
 				<span>Истекшие платные подписки</span>
 				<strong>{{ summary.expired_paid_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item">
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='free') }}">
 				<span>Активный бесплатный доступ</span>
 				<strong>{{ summary.active_free_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item is-trial">
+			</a>
+			<a class="subscription-state-item is-trial" href="{{ url_for('users_page', status='trial') }}">
 				<span>Активные пробные подписки</span>
 				<strong>{{ summary.active_trial_subscriptions }}</strong>
-			</div>
-			<div class="subscription-state-item">
-				<span>Пробник взяли всего</span>
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_used') }}">
+				<span>Брали пробник · текущие профили</span>
 				<strong>{{ summary.trial_used_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
-				<span>Пробники истекли</span>
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='trial_expired') }}">
+				<span>После пробника без доступа сейчас</span>
 				<strong>{{ summary.expired_trial_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
-				<span>Уникальные оплатившие клиенты</span>
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('users_page', status='paid_ever') }}">
+				<span>Оплачивали за всю историю</span>
 				<strong>{{ summary.paid_transaction_users }}</strong>
-			</div>
-			<div class="subscription-state-item">
+				<small>Профили в списке: {{ summary.existing_paid_transaction_users }}; без профиля: {{ summary.archived_paid_transaction_users }}. Открыть список.</small>
+			</a>
+			<a class="subscription-state-item" href="{{ url_for('dashboard_page', period=analytics.period, purchases='money', _anchor='completed-purchases') }}">
 				<span>Денежные оплаты</span>
 				<strong>{{ summary.all_time_orders }}</strong>
-			</div>
-			<div class="subscription-state-item is-trial">
-				<span>Бесплатные промокоды</span>
+			</a>
+			<a class="subscription-state-item is-trial" href="{{ url_for('dashboard_page', period=analytics.period, purchases='promo', _anchor='completed-purchases') }}">
+				<span>Бесплатные активации по промокоду</span>
 				<strong>{{ summary.all_time_free_promos }}</strong>
-			</div>
+			</a>
 		</div>
 	</section>
 
@@ -369,13 +387,18 @@
 		{% endif %}
 	</section>
 
-	<section class="analytics-panel analytics-panel-wide paid-transactions-panel">
+	<section id="completed-purchases" class="analytics-panel analytics-panel-wide paid-transactions-panel">
 		<div class="section-head">
 			<div>
-				<h2>Все завершённые покупки</h2>
-				<span class="panel-note">денежные оплаты и бесплатные промокоды, последние сверху; всего {{ analytics.paid_transactions|length }}</span>
+				<h2>{{ {'all': 'Все завершённые покупки', 'money': 'Денежные оплаты', 'promo': 'Бесплатные активации по промокоду'}[purchase_kind] }}</h2>
+				<span class="panel-note">За всю историю, последние сверху; показано {{ analytics.paid_transactions|length }} из {{ summary.matching_completed_transactions|default(summary.completed_transactions) }}</span>
 			</div>
-			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">CSV</a>
+			<a class="button button-small button-secondary" href="{{ url_for('export_transactions_csv') }}">Все платежи CSV</a>
+		</div>
+		<div class="analytics-head-actions" aria-label="Фильтр завершённых покупок">
+			{% for kind, label in [('all', 'Все'), ('money', 'Денежные оплаты'), ('promo', 'Бесплатные активации')] %}
+			<a class="button button-small {{ 'button-primary' if purchase_kind == kind else 'button-secondary' }}" href="{{ url_for('dashboard_page', period=analytics.period, purchases=kind, _anchor='completed-purchases') }}">{{ label }}</a>
+			{% endfor %}
 		</div>
 		{% if analytics.paid_transactions %}
 		<div class="table-scroll paid-transactions-scroll">
@@ -435,4 +458,7 @@
 
 <script nonce="{{ csp_nonce() }}" id="chart-data" type="application/json">{{ analytics | tojson }}</script>
 
+{% endblock %}
+{% block page_scripts %}
+<script nonce="{{ csp_nonce() }}" src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
 {% endblock %}

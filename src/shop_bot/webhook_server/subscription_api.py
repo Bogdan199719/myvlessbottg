@@ -29,6 +29,7 @@ subscription_bp = Blueprint("subscription", __name__)
 _XTLS_SYNC_INTERVAL_SECONDS = 300
 _last_xtls_sync_by_host: dict[str, float] = {}
 _SUBSCRIPTION_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+_SUBSCRIPTION_EXECUTOR_SLOTS = threading.BoundedSemaphore(4)
 _TRAFFIC_TIMEOUT_SECONDS = 2
 _XTLS_SYNC_TIMEOUT_SECONDS = 5
 _FALLBACK_TIMEOUT_SECONDS = 5
@@ -38,6 +39,15 @@ _INVALID_TOKEN_LOG_INTERVAL_SECONDS = 60
 _INVALID_TOKEN_MAX_TRACKED_IPS = 2048
 _invalid_token_hits_by_ip: dict[str, list[float]] = {}
 _invalid_token_last_log_by_ip: dict[str, float] = {}
+
+
+def _safe_subscription_header_name(value: object) -> str:
+    """Return a short header-safe display value without control characters."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:100] or "AresVPN"
+
+
 _invalid_token_lock = threading.Lock()
 
 
@@ -186,6 +196,13 @@ def _build_telegram_renew_url(bot_username: str | None) -> str | None:
     return f"https://t.me/{username}?start=renew"
 
 
+def _build_telegram_bot_url(bot_username: str | None) -> str | None:
+    username = str(bot_username or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    return f"https://t.me/{username}"
+
+
 def _subscription_update_interval_hours(value: str | None) -> int:
     try:
         interval = int(str(value or "").strip())
@@ -247,11 +264,58 @@ def redirect_to_happ(token):
     return Response(status=302, headers={"Location": deeplink_url})
 
 
+@subscription_bp.route("/incy/<token>", methods=["GET"])
+def redirect_to_incy(token):
+    user = get_user_by_token(token)
+    if not user:
+        if _record_invalid_token_request("Incy deeplink", token):
+            abort(429, "Too many invalid subscription requests")
+        abort(404, "Subscription not found")
+    if user.get("is_banned"):
+        logger.warning(
+            "Blocked Incy deeplink for banned subscription (token prefix: %s)",
+            _token_prefix(token),
+        )
+        abort(403, "Subscription is disabled")
+
+    subscription_url = _build_subscription_link(get_setting("domain"), token)
+    if not subscription_url:
+        logger.error(
+            "Failed to build Incy deeplink (token prefix: %s): domain or token missing",
+            _token_prefix(token),
+        )
+        abort(500, "Subscription domain is not configured")
+
+    deeplink_url = f"incy://import/{subscription_url}"
+    logger.info("Redirecting to Incy deeplink (token prefix: %s)", _token_prefix(token))
+    return Response(status=302, headers={"Location": deeplink_url})
+
+
 def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
+    if not _SUBSCRIPTION_EXECUTOR_SLOTS.acquire(blocking=False):
+        logger.warning(
+            "Subscription: background worker capacity exhausted for %s",
+            getattr(func, "__name__", "callable"),
+        )
+        return None
+
     try:
         future = _SUBSCRIPTION_EXECUTOR.submit(func, *args, **kwargs)
+    except Exception as e:
+        _SUBSCRIPTION_EXECUTOR_SLOTS.release()
+        logger.error(
+            "Subscription: failed to submit %s: %s",
+            getattr(func, "__name__", "callable"),
+            e,
+            exc_info=True,
+        )
+        return None
+
+    future.add_done_callback(lambda _future: _SUBSCRIPTION_EXECUTOR_SLOTS.release())
+    try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
+        future.cancel()
         logger.warning(
             f"Subscription: timeout calling {getattr(func, '__name__', 'callable')} after {timeout_seconds}s"
         )
@@ -394,7 +458,9 @@ def get_subscription(token):
             h.get("host_name") for h in enabled_host_rows if h.get("host_name")
         }
         selector_groups_by_host = {
-            h["host_name"]: str(h.get("host_url") or h["host_name"])
+            h["host_name"]: host_selector.panel_group_key(
+                h.get("host_url"), h["host_name"]
+            )
             for h in enabled_host_rows
             if h.get("host_name")
         }
@@ -633,8 +699,11 @@ def get_subscription(token):
                         f"Failed to fetch stats for key {key.get('key_id')}: {e}"
                     )
 
-        subscription_name = get_setting("subscription_name") or "AresVPN"
-        filename = f"{subscription_name}.txt"
+        subscription_name = _safe_subscription_header_name(
+            get_setting("subscription_name") or "AresVPN"
+        )
+        filename_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", subscription_name)
+        filename = f"{filename_stem.strip('._') or 'AresVPN'}.txt"
 
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -662,13 +731,12 @@ def get_subscription(token):
         if userinfo_parts:
             headers["Subscription-Userinfo"] = "; ".join(userinfo_parts)
 
-        support_url = _safe_external_url(get_setting("support_user"))
-        if support_url:
-            headers["Support-Url"] = support_url
+        bot_username = get_setting("telegram_bot_username")
+        bot_url = _build_telegram_bot_url(bot_username)
+        if bot_url:
+            headers["Support-Url"] = bot_url
 
-        renew_url = _build_telegram_renew_url(
-            get_setting("telegram_bot_username")
-        )
+        renew_url = _build_telegram_renew_url(bot_username)
         if renew_url:
             headers["Profile-Web-Page-Url"] = renew_url
 
